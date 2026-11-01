@@ -1,0 +1,4 @@
+secrets/
+*.key
+.playwright-cli/
+*.code-workspace

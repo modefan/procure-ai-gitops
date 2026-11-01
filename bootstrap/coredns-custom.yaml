@@ -1,0 +1,15 @@
+# k3s's CoreDNS imports /etc/coredns/custom/*.override into its main server block from this ConfigMap (kube-system/coredns-custom).
+# Tokens carry iss = https://auth.procure.localtest.me/realms/procure, and *.localtest.me resolves to 127.0.0.1, which inside a pod is
+# the pod itself. So inside the cluster that one name answers with the Traefik service: pods reach Keycloak through the same ingress,
+# hostname and certificate as the browser (plan 07 ruling 8). `answer auto` rewrites the answer back to the asked name.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  procure.override: |
+    rewrite stop {
+      name exact auth.procure.localtest.me. traefik.kube-system.svc.cluster.local.
+      answer auto
+    }
