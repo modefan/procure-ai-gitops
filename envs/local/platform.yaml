@@ -1,0 +1,23 @@
+# Values of the procure-platform chart (procure-ai deploy/charts/procure-platform) for the local k3d cluster `procure`.
+# No secrets here: the chart references the Secrets bootstrap/new-secrets.ps1 creates. The image tag is not set here either: it is the
+# app revision (release.yaml, plan 07 Task 6), or `--set global.imageTag=local-<sha7>` for images built on the PC and imported with
+# `deploy/scripts/build-images.ps1 -Tag local-<sha7> -ImportTo procure`.
+global:
+  # "" while the images are imported into k3d; ghcr.io/modefan once CI publishes them (Task 6).
+  imageRegistry: ""
+
+storageClassName: local-path
+ingressClassName: traefik
+
+hosts:
+  app: procure.localtest.me
+  keycloak: auth.procure.localtest.me
+  dashboard: dashboard.procure.localtest.me
+  mailpit: mail.procure.localtest.me
+
+postgres:
+  storage: 5Gi
+mongo:
+  storage: 2Gi
+rabbitmq:
+  storage: 1Gi
