@@ -3,8 +3,10 @@
 .SYNOPSIS
     Checks the cluster bootstrap after new-cluster.ps1, new-local-ca.ps1 and new-secrets.ps1 have run once.
 .DESCRIPTION
-    1. A second run of new-local-ca.ps1 and new-secrets.ps1 changes nothing: kubectl apply reports "unchanged" for every object and the
-       CA files keep their hashes.
+    1. A second run of new-local-ca.ps1 and new-secrets.ps1 changes nothing: every object they manage (label
+       app.kubernetes.io/managed-by=procure-bootstrap) keeps its resourceVersion (server-side apply reports no "unchanged"), and the
+       CA files keep their hashes. No Secret in procure or observability carries the last-applied-configuration annotation
+       (client-side apply would copy the Secret's data into it).
     2. Every Secret (with its keys), the procure-ca ConfigMap, the default TLSStore and the namespaces exist.
     3. A pod in `procure` resolves auth.procure.localtest.me to the Traefik ClusterIP (CoreDNS rewrite).
     4. Traefik serves the local CA's wildcard certificate on https://procure.localtest.me (port 443 on the PC).
@@ -37,7 +39,23 @@ function Get-CaHashes {
 $before = Get-CaHashes
 foreach ($file in $caFiles) { if ($before[$file] -eq '<missing>') { Fail "CA file $file is missing in $LocalCaDir" } }
 
-$applyLines = [System.Collections.Generic.List[string]]::new()
+$managedKinds = 'secrets,configmaps,tlsstores.traefik.io'
+function Get-ManagedVersions {
+    $versions = [ordered]@{}
+    foreach ($ns in 'procure', 'observability') {
+        $json = & kubectl --context $KubeContext -n $ns get $managedKinds -l app.kubernetes.io/managed-by=procure-bootstrap -o json 2>$null
+        if ($LASTEXITCODE -ne 0) { Fail "kubectl get $managedKinds in $ns failed"; continue }
+        foreach ($item in ($json | ConvertFrom-Json -AsHashtable).items) {
+            $versions["$($item.kind)/$ns/$($item.metadata.name)"] = $item.metadata.resourceVersion
+        }
+    }
+    $versions
+}
+$versionsBefore = Get-ManagedVersions
+# 12 Secrets (10 from new-secrets.ps1, procure-tls and mongo-tls), the TLSStore and procure-ca in two namespaces.
+if ($versionsBefore.Count -lt 15) { Fail "expected at least 15 bootstrap-managed objects, found $($versionsBefore.Count)" }
+
+$applied = 0
 foreach ($script in 'new-local-ca.ps1', 'new-secrets.ps1') {
     try {
         $output = & (Join-Path $bootstrap $script) 6>&1 2>&1 | ForEach-Object { "$_" }
@@ -45,13 +63,29 @@ foreach ($script in 'new-local-ca.ps1', 'new-secrets.ps1') {
         Fail "second run of $script threw: $($_.Exception.Message)"
         continue
     }
-    $lines = @($output | Where-Object { $_ -match '^\S+/\S+ (created|configured|unchanged)' })
-    if ($lines.Count -eq 0) { Fail "second run of $script applied no objects (expected kubectl apply result lines)" }
-    $lines | ForEach-Object { $applyLines.Add("${script}: $_") }
+    $lines = @($output | Where-Object { $_ -match '^\S+/\S+ serverside-applied' })
+    if ($lines.Count -eq 0) { Fail "second run of $script applied no objects (expected server-side apply result lines)" }
+    $applied += $lines.Count
+    $output | Where-Object { $_ -match 'annotation .* removed' } | ForEach-Object { Fail "second run of ${script} still had to migrate: $_" }
 }
-$changed = @($applyLines | Where-Object { $_ -notmatch ' unchanged$' })
-if ($changed.Count -gt 0) { $changed | ForEach-Object { Fail "second run changed an object: $_" } }
-else { Pass "second run: all $($applyLines.Count) applied objects unchanged" }
+$versionsAfter = Get-ManagedVersions
+$changed = @($versionsBefore.Keys | Where-Object { $versionsAfter[$_] -ne $versionsBefore[$_] })
+$added = @($versionsAfter.Keys | Where-Object { -not $versionsBefore.Contains($_) })
+if ($changed -or $added) {
+    $changed | ForEach-Object { Fail "second run changed $_ (resourceVersion $($versionsBefore[$_]) -> $($versionsAfter[$_]))" }
+    $added | ForEach-Object { Fail "second run created $_" }
+} else {
+    Pass "second run: $applied applies, all $($versionsBefore.Count) managed objects kept their resourceVersion"
+}
+
+foreach ($ns in 'procure', 'observability') {
+    $json = & kubectl --context $KubeContext -n $ns get secrets -o json 2>$null
+    $annotated = @(($json | ConvertFrom-Json -AsHashtable).items | Where-Object {
+        $_.metadata.ContainsKey('annotations') -and $_.metadata.annotations -and
+        $_.metadata.annotations.ContainsKey('kubectl.kubernetes.io/last-applied-configuration') } | ForEach-Object { $_.metadata.name })
+    if ($annotated) { Fail "secrets in $ns carry last-applied-configuration: $($annotated -join ', ')" }
+    else { Pass "no secret in $ns carries last-applied-configuration" }
+}
 
 $after = Get-CaHashes
 foreach ($file in $caFiles) {

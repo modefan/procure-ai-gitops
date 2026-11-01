@@ -13,7 +13,7 @@ param()
 . (Join-Path $PSScriptRoot 'common.ps1')
 Assert-DockerRunning
 
-$cluster = & k3d cluster list -o json | ConvertFrom-Json | Where-Object name -eq $ClusterName
+$cluster = Get-K3dCluster
 if (-not $cluster) { Write-Host "No k3d cluster '$ClusterName'."; return }
 if ($PSCmdlet.ShouldProcess("k3d cluster '$ClusterName' and all its volumes", 'Delete')) {
     & k3d cluster delete $ClusterName

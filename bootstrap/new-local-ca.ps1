@@ -21,11 +21,25 @@ param()
 Assert-ClusterReachable
 $openssl = Get-OpenSsl
 
-if (-not (Test-Path $LocalCaDir)) {
-    New-Item -ItemType Directory -Path $LocalCaDir -Force | Out-Null
-    # Only the current user (and nobody inheriting from the profile) may read the keys.
-    & icacls $LocalCaDir /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
+if (-not (Test-Path $LocalCaDir)) { New-Item -ItemType Directory -Path $LocalCaDir -Force | Out-Null }
+# Every run: only the current user (nobody inheriting from the profile) may read the keys. The folder gets one protected rule,
+# the files inherit it (/reset drops anything set on a file itself). /grant:r replaces, so a correct ACL stays as it is; the files'
+# contents are not touched.
+$icacls = & icacls $LocalCaDir /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" 2>&1
+if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict $LocalCaDir to $($env:USERNAME): $($icacls -join ' ')" }
+foreach ($file in Get-ChildItem -LiteralPath $LocalCaDir -File) {
+    $icacls = & icacls $file.FullName /reset 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed on $($file.FullName): $($icacls -join ' ')" }
 }
+foreach ($item in @(Get-Item -LiteralPath $LocalCaDir) + @(Get-ChildItem -LiteralPath $LocalCaDir -File)) {
+    $acl = Get-Acl -LiteralPath $item.FullName
+    $rules = @($acl.Access)
+    $others = @($rules | Where-Object { $_.IdentityReference.Value -notlike "*\$($env:USERNAME)" })
+    if ($rules.Count -eq 0 -or $others) {
+        throw "ACL of $($item.FullName) is not 'current user only' (other identities: $(($others | ForEach-Object IdentityReference) -join ', '))"
+    }
+}
+if (-not (Get-Acl -LiteralPath $LocalCaDir).AreAccessRulesProtected) { throw "$LocalCaDir still inherits permissions from the profile." }
 
 function Invoke-OpenSsl {
     $out = & $openssl @args 2>&1
@@ -106,7 +120,7 @@ Write-Host (Invoke-Apply ([ordered]@{
     apiVersion = 'traefik.io/v1alpha1'
     kind       = 'TLSStore'
     # Traefik only uses the store named "default"; it becomes the certificate for every ingress without its own.
-    metadata   = [ordered]@{ name = 'default'; namespace = 'procure' }
+    metadata   = [ordered]@{ name = 'default'; namespace = 'procure'; labels = [ordered]@{ 'app.kubernetes.io/managed-by' = 'procure-bootstrap' } }
     spec       = [ordered]@{ defaultCertificate = [ordered]@{ secretName = 'procure-tls' } }
 }))
 Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name mongo-tls -Type 'kubernetes.io/tls' -FileData ([ordered]@{

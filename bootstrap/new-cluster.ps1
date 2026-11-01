@@ -24,8 +24,7 @@ function Assert-PortsFree {
     }
 }
 
-$clusters = & k3d cluster list -o json | ConvertFrom-Json
-$cluster = $clusters | Where-Object name -eq $ClusterName
+$cluster = Get-K3dCluster
 if (-not $cluster) {
     Assert-PortsFree
     Write-Host "Creating k3d cluster '$ClusterName' ($K3sImage, 1 server, 10 GB)..."
@@ -34,7 +33,7 @@ if (-not $cluster) {
         --servers 1 --agents 0 `
         --servers-memory 10g `
         -p '80:80@loadbalancer' -p '443:443@loadbalancer' `
-        --kubeconfig-update-default --kubeconfig-switch-context `
+        --kubeconfig-update-default --kubeconfig-switch-context=false `
         --wait --timeout 300s
     if ($LASTEXITCODE -ne 0) { throw "k3d cluster create $ClusterName failed." }
 } elseif ($cluster.serversRunning -lt $cluster.serversCount) {
@@ -49,9 +48,12 @@ if (-not $cluster) {
 Assert-ClusterReachable
 
 # CoreDNS rewrite: auth.procure.localtest.me -> Traefik, so pods reach Keycloak by the issuer's URL (plan 07 ruling 8).
-$result = Invoke-Kubectl apply -f (Join-Path $PSScriptRoot 'coredns-custom.yaml')
-Write-Host $result
-if ($result -notmatch ' unchanged$') {
+$corednsData = { & kubectl --context $KubeContext -n kube-system get configmap coredns-custom -o jsonpath='{.data}' 2>$null }
+$before = & $corednsData
+Write-Host (Invoke-ServerSideApply -Path (Join-Path $PSScriptRoot 'coredns-custom.yaml') -Description 'ConfigMap kube-system/coredns-custom')
+$removed = Remove-LastAppliedAnnotation -Kind ConfigMap -Name coredns-custom -Namespace kube-system
+if ($removed) { Write-Host $removed }
+if ($before -ne (& $corednsData)) {
     # CoreDNS mounts coredns-custom as an optional volume and reloads it within a minute; a restart makes it immediate.
     Invoke-Kubectl -n kube-system rollout restart deployment/coredns | Out-Null
     Invoke-Kubectl -n kube-system rollout status deployment/coredns --timeout=180s | Out-Null
@@ -72,4 +74,5 @@ while ($true) {
     Start-Sleep -Seconds 5
 }
 Invoke-Kubectl -n kube-system rollout status deployment/traefik --timeout=300s | Out-Null
+# The scripts pass --context; k3d adds the context to the kubeconfig but does not make it the current one.
 Write-Host "Cluster '$ClusterName' is ready (context $KubeContext). Next: new-local-ca.ps1, new-secrets.ps1."
