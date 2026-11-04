@@ -97,33 +97,33 @@ function Invoke-Gh([string] $what) {
     if ($LASTEXITCODE -ne 0) { throw "$what failed: $out" }
     ($out | ForEach-Object { "$_" }) -join "`n"
 }
-$environment = 'gitops'
+$ghEnvironment = 'gitops'
 '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' |
-    & $gh api -X PUT "repos/$appRepo/environments/$environment" --input - 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "creating Environment $environment on $appRepo failed." }
-$policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$environment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
+    & $gh api -X PUT "repos/$appRepo/environments/$ghEnvironment" --input - 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "creating Environment $ghEnvironment on $appRepo failed." }
+$policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
 if ($policies -notmatch '(^|\s)branch:main(\s|$)') {
-    Invoke-Gh 'adding the main branch policy' api -X POST "repos/$appRepo/environments/$environment/deployment-branch-policies" -f name=main -f type=branch | Out-Null
+    Invoke-Gh 'adding the main branch policy' api -X POST "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" -f name=main -f type=branch | Out-Null
 }
-$policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$environment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
-if ($policies.Trim() -ne 'branch:main') { throw "Environment $environment on $appRepo allows '$policies'; expected only branch:main. Fix it on GitHub (Settings, Environments)." }
-Write-Host "Environment $environment on $appRepo (deployment branches: main only)"
+$policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
+if ($policies.Trim() -ne 'branch:main') { throw "Environment $ghEnvironment on $appRepo allows '$policies'; expected only branch:main. Fix it on GitHub (Settings, Environments)." }
+Write-Host "Environment $ghEnvironment on $appRepo (deployment branches: main only)"
 
-$envSecrets = Invoke-Gh 'gh secret list --env' secret list -R $appRepo --env $environment --json name
+$envSecrets = Invoke-Gh 'gh secret list --env' secret list -R $appRepo --env $ghEnvironment --json name
 $hasCiSecret = @(($envSecrets | ConvertFrom-Json) | Where-Object name -eq 'GITOPS_DEPLOY_KEY').Count -gt 0
 if ($ciKeyNew -or $SetCiSecret -or -not $hasCiSecret) {
     # The value goes through stdin, never a command line or the console.
-    $out = Get-Content -Raw (Join-Path $DeployKeyDir 'ci-gitops-write') | & $gh secret set GITOPS_DEPLOY_KEY -R $appRepo --env $environment 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "gh secret set GITOPS_DEPLOY_KEY -R $appRepo --env $environment failed: $out" }
-    Write-Host "Environment secret GITOPS_DEPLOY_KEY set ($appRepo, $environment)"
+    $out = Get-Content -Raw (Join-Path $DeployKeyDir 'ci-gitops-write') | & $gh secret set GITOPS_DEPLOY_KEY -R $appRepo --env $ghEnvironment 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "gh secret set GITOPS_DEPLOY_KEY -R $appRepo --env $ghEnvironment failed: $out" }
+    Write-Host "Environment secret GITOPS_DEPLOY_KEY set ($appRepo, $ghEnvironment)"
 } else {
-    Write-Host "Environment secret GITOPS_DEPLOY_KEY exists ($appRepo, $environment)"
+    Write-Host "Environment secret GITOPS_DEPLOY_KEY exists ($appRepo, $ghEnvironment)"
 }
 # A repository-level copy (before the Environment existed) would be readable from every branch: remove it.
 $repoSecrets = Invoke-Gh 'gh secret list' secret list -R $appRepo --json name
 if (@(($repoSecrets | ConvertFrom-Json) | Where-Object name -eq 'GITOPS_DEPLOY_KEY').Count -gt 0) {
     Invoke-Gh 'gh secret delete GITOPS_DEPLOY_KEY' secret delete GITOPS_DEPLOY_KEY -R $appRepo | Out-Null
-    Write-Host "Repository secret GITOPS_DEPLOY_KEY removed from $appRepo (it is in Environment $environment now)"
+    Write-Host "Repository secret GITOPS_DEPLOY_KEY removed from $appRepo (it is in Environment $ghEnvironment now)"
 }
 
 # --- 2. Argo CD ----------------------------------------------------------------------------------------------------------------------

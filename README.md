@@ -38,7 +38,8 @@ Hostnames (all `*.localtest.me`, which resolves to 127.0.0.1): `procure.localtes
 ## GitOps: how a commit gets deployed
 
 ```
-procure-ai push to main -> CI -> publish.yml: images ghcr.io/modefan/procure-ai-<name>:<sha>, commit "Deploy procure-ai <sha7>" here
+procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure-ai-<name>:<sha> (platform images only when infra/
+  changed, tag = tree hash of infra/<name>), commit "Deploy procure-ai <sha7>" here
   -> Argo CD (polls every 2-3 min) -> root Application renders apps/ with envs/local/{apps,release}.yaml
        wave -2 argocd         Argo CD manages itself (chart argo-cd, values argocd/values.yaml)
        wave -1 platform       procure-ai deploy/charts/procure-platform @ appRevision + envs/local/platform.yaml
@@ -46,12 +47,19 @@ procure-ai push to main -> CI -> publish.yml: images ghcr.io/modefan/procure-ai-
        wave  0 procure-ai     procure-ai deploy/charts/procure-ai @ appRevision + envs/local/procure-ai.yaml
 ```
 
-- `envs/local/release.yaml` holds `appRevision`, the full procure-ai commit SHA: the charts are read at that commit and the images
-  carry it as tag. To roll back, set an older revision here (its images must still be in GHCR; the retention workflow keeps 15).
+- `envs/local/release.yaml` holds `appRevision`, the full procure-ai commit SHA (the charts are read at that commit and the app images
+  carry it as tag), and `platformImageTags` (postgres, keycloak, debezium: the git tree hash of `infra/<name>`, so a deploy that changes
+  only app code leaves Postgres, Keycloak and Debezium running). To roll back, set older values here (the images must still be in GHCR;
+  retention keeps the newest 15 versions per image and every tag of the last 15 releases).
+- App Deployments roll with `maxSurge: 0` (envs/local/procure-ai.yaml): the node has no room for surge pods during a deploy.
+- CI writes here with the write deploy key, which is the secret `GITOPS_DEPLOY_KEY` of procure-ai's Environment `gitops` (deployment
+  branches: main only); install-argocd.ps1 creates the Environment and sets the secret.
 - Every Application syncs automatically (prune, self-heal, server-side apply, retries).
 - The platform turns Healthy only after the apps' migrations ran (each Debezium waits for its service's publication). So the root
   does not wait for the platform's health before the apps' wave: Application `platform` carries `procure-ai/wave-gate: synced`, and the
-  Application health check in `argocd/values.yaml` lets the next wave start once it is Synced and its sync succeeded.
+  Application health check in `argocd/values.yaml` lets the next wave start once it is Synced and its sync of the target revision
+  succeeded (for every Application, a sync of an older revision does not count, so deploys are ordered too).
+  `tests/Test-ApplicationHealth.ps1` runs the check (Lua, `winget install DEVCOM.Lua`) against `tests/health/application-health-cases.lua`.
 - Argo CD UI: https://argocd.procure.localtest.me, user `admin`, password in Secret `argocd/argocd-initial-admin-secret`
   (`kubectl --context k3d-procure -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}'`, base64).
 - Chart checks for `apps/`: `helm unittest apps` and `helm template root apps -f envs/local/apps.yaml -f envs/local/release.yaml |
