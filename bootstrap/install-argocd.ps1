@@ -65,8 +65,13 @@ function Initialize-DeployKey([string] $name, [string] $repo, [bool] $write, [st
     $publicKey = ($public -split '\s+')[0..1] -join ' '
     $listed = Get-DeployKeys $repo | Where-Object { (($_.key -split '\s+')[0..1] -join ' ') -eq $publicKey }
     if ($listed) {
-        if ([bool]$listed.readOnly -eq $write) {
-            throw "Deploy key $name is on $repo with the wrong access (read-only: $($listed.readOnly)). Delete it on GitHub and run this script again."
+        $listed = @($listed)[0]
+        # gh 2.103 accepts --json readOnly but prints the API's field name read_only.
+        $field = @('readOnly', 'read_only') | Where-Object { $listed.PSObject.Properties[$_] } | Select-Object -First 1
+        $readOnly = if ($field) { [bool] $listed.$field } else { $null }
+        if ($null -eq $readOnly) { throw "gh repo deploy-key list -R $repo returned no read-only flag (fields: $($listed.PSObject.Properties.Name -join ', '))." }
+        if ($readOnly -eq $write) {
+            throw "Deploy key $name is on $repo with the wrong access (read-only: $readOnly). Delete it on GitHub and run this script again."
         }
     } else {
         $addArgs = @('repo', 'deploy-key', 'add', "$path.pub", '-R', $repo, '--title', $title)
