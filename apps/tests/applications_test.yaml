@@ -140,3 +140,45 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: appRevision must be a full 40-character commit SHA
+
+  - it: platform image tags go to the platform and the apps (postgres for the migrations), the app tag stays appRevision
+    set:
+      platformImageTags:
+        postgres: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        keycloak: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        debezium: cccccccccccccccccccccccccccccccccccccccc
+    asserts:
+      - equal:
+          path: spec.sources[0].helm.valuesObject.global
+          value:
+            imageTag: 0123456789abcdef0123456789abcdef01234567
+            imageTags:
+              postgres: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              keycloak: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+              debezium: cccccccccccccccccccccccccccccccccccccccc
+        documentSelector: { path: metadata.name, value: platform }
+      - equal:
+          path: spec.sources[0].helm.valuesObject.global.imageTags.postgres
+          value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        documentSelector: { path: metadata.name, value: procure-ai }
+
+  - it: a revision made of digits only stays a string
+    set:
+      appRevision: "1234567890123456789012345678901234567890"
+    asserts:
+      - equal:
+          path: spec.sources[0].targetRevision
+          value: "1234567890123456789012345678901234567890"
+        documentSelector: { path: metadata.name, value: procure-ai }
+      - equal:
+          path: spec.sources[0].helm.valuesObject.global.imageTag
+          value: "1234567890123456789012345678901234567890"
+        documentSelector: { path: metadata.name, value: procure-ai }
+
+  - it: a malformed platform image tag fails the render
+    set:
+      platformImageTags:
+        postgres: latest
+    asserts:
+      - failedTemplate:
+          errorPattern: platformImageTags.postgres must be a 40-character git tree hash

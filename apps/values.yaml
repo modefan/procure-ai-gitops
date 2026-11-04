@@ -2,6 +2,9 @@
 
 # The procure-ai commit (full SHA) whose charts and images are deployed. Written by procure-ai's publish workflow. Required.
 appRevision: ""
+# Tags of the platform images (postgres, keycloak, debezium): the git tree hash of infra/<name> at the commit that last changed it, also
+# written by the publish workflow. Empty: they take appRevision like the app images.
+platformImageTags: {}
 # The environment folder under envs/ that holds the values files (platform.yaml, procure-ai.yaml, observability.yaml).
 env: local
 

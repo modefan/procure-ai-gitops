@@ -52,6 +52,12 @@ function Stop-Test([string] $message) {
 $release = Get-Content -Raw (Join-Path $repoRoot "envs/$Environment/release.yaml")
 if ($release -notmatch '(?m)^appRevision:\s*"?([0-9a-f]{40})"?\s*$') { throw "envs/$Environment/release.yaml has no full appRevision." }
 $appRevision = $Matches[1]
+# Platform images are tagged by their build context (release.yaml platformImageTags); without a tag they take appRevision.
+$platformImages = @('postgres', 'keycloak', 'debezium')
+$platformTags = @{}
+foreach ($name in $platformImages) {
+    $platformTags[$name] = if ($release -match "(?m)^\s+${name}:\s*`"?([0-9a-f]{40})`"?\s*$") { $Matches[1] } else { $appRevision }
+}
 $apps = Get-Content -Raw (Join-Path $repoRoot "envs/$Environment/apps.yaml")
 $expectedApps = @('root', 'argocd', 'platform', 'procure-ai')
 if ($apps -match '(?ms)^observability:\s*\n\s+(#[^\n]*\n\s+)*enabled:\s*true') { $expectedApps += 'observability' }
@@ -187,6 +193,8 @@ function Get-AppState {
     $state
 }
 
+$suiteStart = Get-Date
+$importTime = [TimeSpan]::Zero
 # --- 1. From nothing --------------------------------------------------------------------------------------------------------------
 Assert-DockerRunning
 Measure-Memory
@@ -202,11 +210,13 @@ foreach ($script in 'new-cluster.ps1', 'new-local-ca.ps1', 'new-secrets.ps1') {
 
 if ($LocalImages -and -not $WatchOnly) {
     Write-Step "Importing the local images ghcr.io/modefan/procure-ai-*:$appRevision"
-    $images = $imageNames | ForEach-Object { "ghcr.io/modefan/procure-ai-${_}:$appRevision" }
+    $images = $imageNames | ForEach-Object { "ghcr.io/modefan/procure-ai-${_}:$(if ($platformTags.ContainsKey($_)) { $platformTags[$_] } else { $appRevision })" }
     $missing = @($images | Where-Object { & docker image inspect $_ --format '{{.Id}}' 2>$null | Out-Null; $LASTEXITCODE -ne 0 })
-    if ($missing) { Stop-Test "not in the local Docker engine: $($missing -join ', ') (build them: deploy/scripts/build-images.ps1 -Tag $appRevision -Registry ghcr.io/modefan)" }
+    if ($missing) { Stop-Test "not in the local Docker engine: $($missing -join ', ') (build them in a procure-ai checkout of that revision: deploy/scripts/build-images.ps1 -Tag $appRevision -Registry ghcr.io/modefan -ContentTagPlatform)" }
+    $importStart = Get-Date
     & k3d image import @images --cluster $ClusterName
     if ($LASTEXITCODE -ne 0) { Stop-Test 'k3d image import failed.' }
+    $importTime = (Get-Date) - $importStart
     Measure-Memory
 }
 
@@ -216,7 +226,9 @@ if (-not $WatchOnly) {
     Write-Step 'install-argocd.ps1'
     & (Join-Path $bootstrap 'install-argocd.ps1') -Environment $Environment
 }
-$deadline = $start.AddMinutes($TimeoutMinutes)
+# Review Focus 1: "from a deleted cluster ... within 15 minutes": the clock starts with the delete; the time spent importing local images
+# (a stand-in for pulls from GHCR that only -LocalImages needs) is not counted. -WatchOnly: from the start of the watch.
+$deadline = $suiteStart.AddMinutes($TimeoutMinutes) + $importTime
 
 Write-Step "Waiting until every Application is Synced and Healthy and every pod Ready (until $($deadline.ToString('HH:mm:ss')))"
 $lastReport = ''
@@ -252,7 +264,22 @@ while ($true) {
     Start-Sleep -Seconds 15
 }
 $script:convergedAfter = (Get-Date) - $start
-Write-Host ("Converged after {0:mm\:ss}." -f $script:convergedAfter) -ForegroundColor Green
+$convergedFromStart = (Get-Date) - $suiteStart - $importTime
+Write-Host ("Converged {0:mm\:ss} after install-argocd.ps1 (or the watch) started, {1:mm\:ss} after the start of the run (image import of {2:mm\:ss} not counted)." -f $script:convergedAfter, $convergedFromStart, $importTime) -ForegroundColor Green
+
+# --- Wave order: the apps synced this revision only after the platform's sync of it finished (the wave gate, argocd/values.yaml). ----
+$json = Invoke-Kubectl -n argocd get applications platform procure-ai -o json | Out-String | ConvertFrom-Json
+$byName = @{}; foreach ($a in $json.items) { $byName[$a.metadata.name] = $a }
+foreach ($name in 'platform', 'procure-ai') {
+    $revision = @($byName[$name].status.sync.revisions)[0]
+    if ($revision -ne $appRevision) { Stop-Test "$name is synced at $revision, expected appRevision $appRevision" }
+}
+$platformDone = [datetimeoffset] $byName['platform'].status.operationState.finishedAt
+$appsStarted = [datetimeoffset] $byName['procure-ai'].status.operationState.startedAt
+if ($appsStarted -lt $platformDone) {
+    Stop-Test "procure-ai's sync started at $($appsStarted.ToLocalTime().ToString('HH:mm:ss')), before the platform's sync finished at $($platformDone.ToLocalTime().ToString('HH:mm:ss'))"
+}
+Write-Host "Wave order ok: platform's sync finished $($platformDone.ToLocalTime().ToString('HH:mm:ss')), procure-ai's started $($appsStarted.ToLocalTime().ToString('HH:mm:ss')) (both at $($appRevision.Substring(0, 7)))."
 
 # --- 3. Stable: nothing restarts or drops out of Ready -------------------------------------------------------------------------------
 function Get-RestartCounts($pods) {

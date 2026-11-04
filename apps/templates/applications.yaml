@@ -1,6 +1,11 @@
 {{- if not (regexMatch "^[0-9a-f]{40}$" (toString .Values.appRevision)) }}
 {{- fail (printf "appRevision must be a full 40-character commit SHA of procure-ai, got %q" (toString .Values.appRevision)) }}
 {{- end }}
+{{- range $name, $tag := .Values.platformImageTags }}
+{{- if not (regexMatch "^[0-9a-f]{40}$" (toString $tag)) }}
+{{- fail (printf "platformImageTags.%s must be a 40-character git tree hash, got %q" $name (toString $tag)) }}
+{{- end }}
+{{- end }}
 {{- with .Values.argocd }}
 {{- if .enabled }}
 {{- $sources := list

@@ -6,6 +6,14 @@ global:
   # procure-ai's publish workflow pushes the images here (private, pulled with Secret ghcr-pull). For images built on the PC, tag them
   # with this registry and import them into k3d (deploy/scripts/build-images.ps1 -Registry ghcr.io/modefan -ImportTo procure).
   imageRegistry: ghcr.io/modefan
+  # A deploy replaces each app's single pod instead of starting a second one next to it first: the 10 GB node has no room for ~12 surge
+  # pods (plus the migration Jobs) on top of the running system. maxSurge 0 / maxUnavailable 1 rather than Recreate: the same for one
+  # replica, and still one pod at a time if an app ever runs more. Cost: each API is unavailable for its few seconds of restart.
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   hosts:
     app: procure.localtest.me
     keycloak: auth.procure.localtest.me

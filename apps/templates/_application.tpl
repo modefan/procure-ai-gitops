@@ -48,7 +48,7 @@ environment's values file from this repo ($values) and the image tag = appRevisi
 {{- $root := .root }}
 {{- $revision := required "appRevision is required (envs/<env>/release.yaml)" $root.Values.appRevision }}
 - repoURL: {{ $root.Values.repos.app }}
-  targetRevision: {{ $revision }}
+  targetRevision: {{ $revision | quote }}
   path: {{ .app.path }}
   helm:
     releaseName: {{ .app.releaseName }}
@@ -56,7 +56,14 @@ environment's values file from this repo ($values) and the image tag = appRevisi
       - $values/envs/{{ $root.Values.env }}/{{ .valuesFile }}
     valuesObject:
       global:
-        imageTag: {{ $revision }}
+        imageTag: {{ $revision | quote }}
+        {{- with $root.Values.platformImageTags }}
+        # The platform images' own tags (hash of their build context), so an app-only deploy leaves them running.
+        imageTags:
+          {{- range $name, $tag := . }}
+          {{ $name }}: {{ $tag | quote }}
+          {{- end }}
+        {{- end }}
 - repoURL: {{ $root.Values.repos.gitops }}
   targetRevision: {{ $root.Values.repos.gitopsRevision }}
   ref: values
