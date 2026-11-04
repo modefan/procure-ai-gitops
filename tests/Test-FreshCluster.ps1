@@ -188,6 +188,7 @@ function Get-AppState {
             Health    = if ($s -and $s.PSObject.Properties['health']) { $s.health.status } else { '' }
             Operation = if ($s -and $s.PSObject.Properties['operationState']) { $s.operationState.phase } else { '' }
             Message   = if ($s -and $s.PSObject.Properties['operationState'] -and $s.operationState.PSObject.Properties['message']) { $s.operationState.message } else { '' }
+            Revision  = if ($s -and $s.PSObject.Properties['sync'] -and $s.sync.PSObject.Properties['revisions']) { @($s.sync.revisions)[0] } else { '' }
         }
     }
     $state
@@ -243,6 +244,9 @@ while ($true) {
         if (-not $a) { $notDone += "$name (missing)"; continue }
         if ($a.Sync -ne 'Synced' -or $a.Health -ne 'Healthy' -or $a.Operation -ne 'Succeeded') {
             $notDone += "$name ($($a.Sync)/$($a.Health)/$($a.Operation))"
+        } elseif ($name -in 'platform', 'procure-ai', 'observability' -and $a.Revision -ne $appRevision) {
+            # Not yet at the release's revision (a deploy Argo CD has not picked up yet).
+            $notDone += "$name (at $("$($a.Revision)".Substring(0, [Math]::Min(7, "$($a.Revision)".Length))), not $($appRevision.Substring(0, 7)))"
         }
     }
     $notReady = @($pods | Where-Object { -not (Test-PodReady $_) -and $_.status.phase -ne 'Failed' } |
