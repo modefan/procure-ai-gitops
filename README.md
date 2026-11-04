@@ -59,3 +59,4 @@ procure-ai push to main -> CI -> publish.yml: images ghcr.io/modefan/procure-ai-
   (the Application schema from the CRDs catalog).
 - `tests/Test-FreshCluster.ps1 -LocalImages` checks a revision before CI published it: build the images in a procure-ai checkout of
   that revision with `deploy/scripts/build-images.ps1 -Tag <appRevision> -Registry ghcr.io/modefan`; the test imports them into k3d.
+  `-WatchOnly` skips the delete and bootstrap and only checks the running cluster (after a deploy).

@@ -25,6 +25,9 @@
 param(
     [string] $Environment = 'local',
     [switch] $LocalImages,
+    # Skip the delete and bootstrap: only wait for, watch and smoke-check the running cluster (e.g. after a deploy, or to see the
+    # failure checks work).
+    [switch] $WatchOnly,
     [int] $TimeoutMinutes = 15,
     [int] $StableSeconds = 120,
     [int] $CrashLoopMinutes = 4,
@@ -187,6 +190,7 @@ function Get-AppState {
 # --- 1. From nothing --------------------------------------------------------------------------------------------------------------
 Assert-DockerRunning
 Measure-Memory
+if (-not $WatchOnly) {
 Write-Step "Deleting cluster '$ClusterName' (all its data) and bootstrapping envs/$Environment at appRevision $appRevision"
 & (Join-Path $bootstrap 'remove-cluster.ps1') -Confirm:$false
 foreach ($script in 'new-cluster.ps1', 'new-local-ca.ps1', 'new-secrets.ps1') {
@@ -194,8 +198,9 @@ foreach ($script in 'new-cluster.ps1', 'new-local-ca.ps1', 'new-secrets.ps1') {
     & (Join-Path $bootstrap $script)
     Measure-Memory
 }
+}
 
-if ($LocalImages) {
+if ($LocalImages -and -not $WatchOnly) {
     Write-Step "Importing the local images ghcr.io/modefan/procure-ai-*:$appRevision"
     $images = $imageNames | ForEach-Object { "ghcr.io/modefan/procure-ai-${_}:$appRevision" }
     $missing = @($images | Where-Object { & docker image inspect $_ --format '{{.Id}}' 2>$null | Out-Null; $LASTEXITCODE -ne 0 })
@@ -206,9 +211,11 @@ if ($LocalImages) {
 }
 
 # --- 2. Argo CD takes over ---------------------------------------------------------------------------------------------------------
-Write-Step 'install-argocd.ps1'
 $start = Get-Date
-& (Join-Path $bootstrap 'install-argocd.ps1') -Environment $Environment
+if (-not $WatchOnly) {
+    Write-Step 'install-argocd.ps1'
+    & (Join-Path $bootstrap 'install-argocd.ps1') -Environment $Environment
+}
 $deadline = $start.AddMinutes($TimeoutMinutes)
 
 Write-Step "Waiting until every Application is Synced and Healthy and every pod Ready (until $($deadline.ToString('HH:mm:ss')))"
