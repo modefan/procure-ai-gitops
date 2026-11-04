@@ -1,0 +1,9 @@
+apiVersion: v2
+name: procure-apps
+description: >-
+  App of apps for procure-ai: one Argo CD Application per part of the system (Argo CD itself, the platform, observability, the apps), in
+  sync waves. The charts come from the procure-ai repo at appRevision (envs/<env>/release.yaml, bumped by procure-ai's publish workflow);
+  the values come from this repo (multi-source Applications, plan 07 ruling 4). Rendered by the root Application that
+  bootstrap/install-argocd.ps1 creates.
+type: application
+version: 0.1.0

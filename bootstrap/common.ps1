@@ -21,6 +21,9 @@ $script:SystemReservedMemory = '256Mi'
 $script:EvictionHardMemory = '1Gi'
 # Outside every repo; listed by name in DEMO PASSWORDS.txt.
 $script:LocalCaDir = Join-Path $env:USERPROFILE '.procure-ai\local-ca'
+# Argo CD's read-only deploy keys and CI's write key for this repo (plan 07 ruling 6); outside every repo, listed by name in DEMO
+# PASSWORDS.txt.
+$script:DeployKeyDir = Join-Path $env:USERPROFILE '.procure-ai\deploy-keys'
 # The AppHost's UserSecretsId (src/AppHost/ProcureAi.AppHost/ProcureAi.AppHost.csproj): the one source of the secrets.
 $script:AppHostUserSecretsId = 'procure-ai-apphost'
 
@@ -156,4 +159,34 @@ function Get-NodeBudget {
 function Get-ExpectedKeptBack {
     # Capacity minus allocatable the kubelet arguments of new-cluster.ps1 produce.
     (ConvertTo-Bytes $script:KubeReservedMemory) + (ConvertTo-Bytes $script:SystemReservedMemory) + (ConvertTo-Bytes $script:EvictionHardMemory)
+}
+
+function Set-CurrentUserOnlyAcl([string] $Dir) {
+    # Creates $Dir if needed. Every run: only the current user (nobody inheriting from the profile) may read the keys in it. The folder
+    # gets one protected rule, the files inherit it (/reset drops anything set on a file itself). /grant:r replaces, so a correct ACL
+    # stays as it is; the files' contents are not touched.
+    if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Path $Dir -Force | Out-Null }
+    $icacls = & icacls $Dir /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict $Dir to $($env:USERNAME): $($icacls -join ' ')" }
+    foreach ($file in Get-ChildItem -LiteralPath $Dir -File) {
+        $icacls = & icacls $file.FullName /reset 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed on $($file.FullName): $($icacls -join ' ')" }
+    }
+    foreach ($item in @(Get-Item -LiteralPath $Dir) + @(Get-ChildItem -LiteralPath $Dir -File)) {
+        $acl = Get-Acl -LiteralPath $item.FullName
+        $rules = @($acl.Access)
+        $others = @($rules | Where-Object { $_.IdentityReference.Value -notlike "*\$($env:USERNAME)" })
+        if ($rules.Count -eq 0 -or $others) {
+            throw "ACL of $($item.FullName) is not 'current user only' (other identities: $(($others | ForEach-Object IdentityReference) -join ', '))"
+        }
+    }
+    if (-not (Get-Acl -LiteralPath $Dir).AreAccessRulesProtected) { throw "$Dir still inherits permissions from the profile." }
+}
+
+function Get-Gh {
+    $cmd = Get-Command gh -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $default = 'C:\Program Files\GitHub CLI\gh.exe'
+    if (Test-Path $default) { return $default }
+    throw 'gh (GitHub CLI) not found.'
 }

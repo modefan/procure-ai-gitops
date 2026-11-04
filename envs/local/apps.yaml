@@ -1,0 +1,5 @@
+# Values of the app of apps (apps/) for the local k3d cluster `procure`. The revision is in release.yaml.
+env: local
+observability:
+  # Plan 07 Task 7 adds deploy/charts/procure-observability and envs/local/observability.yaml, then turns this on.
+  enabled: false

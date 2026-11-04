@@ -1,0 +1,74 @@
+# procure-apps: the Applications of one environment. envs/<env>/release.yaml sets appRevision; envs/<env>/apps.yaml the rest.
+
+# The procure-ai commit (full SHA) whose charts and images are deployed. Written by procure-ai's publish workflow. Required.
+appRevision: ""
+# The environment folder under envs/ that holds the values files (platform.yaml, procure-ai.yaml, observability.yaml).
+env: local
+
+# Where Argo CD reads from (SSH, read-only deploy keys: bootstrap/install-argocd.ps1 creates the repository Secrets).
+repos:
+  app: git@github.com:modefan/procure-ai.git
+  gitops: git@github.com:modefan/procure-ai-gitops.git
+  # The branch of this repo whose values are deployed.
+  gitopsRevision: main
+
+destination:
+  server: https://kubernetes.default.svc
+
+project: default
+
+# Every Application syncs on its own: prune what left git, undo manual changes, server-side apply (large CRDs, no
+# last-applied-configuration). Retries matter on a fresh cluster, where a first sync can fail while a dependency is still starting.
+syncPolicy:
+  automated:
+    prune: true
+    selfHeal: true
+  syncOptions:
+    - ServerSideApply=true
+  retry:
+    limit: 10
+    backoff:
+      duration: 20s
+      factor: 2
+      maxDuration: 3m
+
+# Argo CD manages itself after bootstrap/install-argocd.ps1 installed it with the same chart and values (argocd/values.yaml).
+argocd:
+  enabled: true
+  namespace: argocd
+  wave: -2
+  chartRepo: https://argoproj.github.io/argo-helm
+  chart: argo-cd
+  # Argo CD v3.5.7. bootstrap/install-argocd.ps1 reads this line for the first install, so both always match.
+  chartVersion: 10.11.7
+  releaseName: argocd
+
+# The infrastructure (procure-ai deploy/charts/procure-platform).
+platform:
+  enabled: true
+  namespace: procure
+  wave: -1
+  path: deploy/charts/procure-platform
+  releaseName: platform
+  # The platform turns Healthy only after the apps' migrations ran (each Debezium waits for its service's publication), so the apps
+  # (next wave) must not wait for the platform's health, or neither ever starts. The wave gate "synced" lets the next wave start once
+  # this Application's sync succeeded (argocd/values.yaml, health check of argoproj.io/Application); its own health still shows the truth.
+  waveGate: synced
+
+# Logs, traces and metrics (procure-ai deploy/charts/procure-observability, plan 07 Task 7). Off until that chart exists.
+observability:
+  enabled: false
+  namespace: observability
+  wave: -1
+  path: deploy/charts/procure-observability
+  releaseName: observability
+  waveGate: ""
+
+# The apps (procure-ai deploy/charts/procure-ai): migrations (Sync hooks), APIs, gateway, web, demo data.
+procureAi:
+  enabled: true
+  namespace: procure
+  wave: 0
+  path: deploy/charts/procure-ai
+  releaseName: procure-ai
+  waveGate: ""

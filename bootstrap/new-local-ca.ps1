@@ -21,25 +21,7 @@ param()
 Assert-ClusterReachable
 $openssl = Get-OpenSsl
 
-if (-not (Test-Path $LocalCaDir)) { New-Item -ItemType Directory -Path $LocalCaDir -Force | Out-Null }
-# Every run: only the current user (nobody inheriting from the profile) may read the keys. The folder gets one protected rule,
-# the files inherit it (/reset drops anything set on a file itself). /grant:r replaces, so a correct ACL stays as it is; the files'
-# contents are not touched.
-$icacls = & icacls $LocalCaDir /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" 2>&1
-if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict $LocalCaDir to $($env:USERNAME): $($icacls -join ' ')" }
-foreach ($file in Get-ChildItem -LiteralPath $LocalCaDir -File) {
-    $icacls = & icacls $file.FullName /reset 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed on $($file.FullName): $($icacls -join ' ')" }
-}
-foreach ($item in @(Get-Item -LiteralPath $LocalCaDir) + @(Get-ChildItem -LiteralPath $LocalCaDir -File)) {
-    $acl = Get-Acl -LiteralPath $item.FullName
-    $rules = @($acl.Access)
-    $others = @($rules | Where-Object { $_.IdentityReference.Value -notlike "*\$($env:USERNAME)" })
-    if ($rules.Count -eq 0 -or $others) {
-        throw "ACL of $($item.FullName) is not 'current user only' (other identities: $(($others | ForEach-Object IdentityReference) -join ', '))"
-    }
-}
-if (-not (Get-Acl -LiteralPath $LocalCaDir).AreAccessRulesProtected) { throw "$LocalCaDir still inherits permissions from the profile." }
+Set-CurrentUserOnlyAcl $LocalCaDir
 
 function Invoke-OpenSsl {
     $out = & $openssl @args 2>&1

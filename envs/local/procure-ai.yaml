@@ -3,8 +3,9 @@
 # plan 07 Task 6), or `--set global.imageTag=local-<sha7>` for images built on the PC and imported with
 # `deploy/scripts/build-images.ps1 -Tag local-<sha7> -ImportTo procure`.
 global:
-  # "" while the images are imported into k3d; ghcr.io/modefan once CI publishes them (Task 6).
-  imageRegistry: ""
+  # procure-ai's publish workflow pushes the images here (private, pulled with Secret ghcr-pull). For images built on the PC, tag them
+  # with this registry and import them into k3d (deploy/scripts/build-images.ps1 -Registry ghcr.io/modefan -ImportTo procure).
+  imageRegistry: ghcr.io/modefan
   hosts:
     app: procure.localtest.me
     keycloak: auth.procure.localtest.me

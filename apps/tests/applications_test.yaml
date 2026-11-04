@@ -1,0 +1,131 @@
+suite: applications
+templates:
+  - templates/applications.yaml
+set:
+  appRevision: 0123456789abcdef0123456789abcdef01234567
+  observability:
+    enabled: true
+tests:
+  - it: applications have the sync waves
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "-2"
+        documentSelector: { path: metadata.name, value: argocd }
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "-1"
+        documentSelector: { path: metadata.name, value: platform }
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "-1"
+        documentSelector: { path: metadata.name, value: observability }
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "0"
+        documentSelector: { path: metadata.name, value: procure-ai }
+
+  - it: the platform does not hold the apps back until it is Healthy (wave gate synced; carry-over from Task 5)
+    asserts:
+      - equal:
+          path: metadata.annotations["procure-ai/wave-gate"]
+          value: synced
+        documentSelector: { path: metadata.name, value: platform }
+      - notExists:
+          path: metadata.annotations["procure-ai/wave-gate"]
+        documentSelector: { path: metadata.name, value: procure-ai }
+
+  - it: procure-ai chart source uses appRevision
+    asserts:
+      - equal:
+          path: spec.sources[0]
+          value:
+            repoURL: git@github.com:modefan/procure-ai.git
+            targetRevision: 0123456789abcdef0123456789abcdef01234567
+            path: deploy/charts/procure-ai
+            helm:
+              releaseName: procure-ai
+              valueFiles:
+                - $values/envs/local/procure-ai.yaml
+              valuesObject:
+                global:
+                  imageTag: 0123456789abcdef0123456789abcdef01234567
+        documentSelector: { path: metadata.name, value: procure-ai }
+      - equal:
+          path: spec.sources[0].targetRevision
+          value: 0123456789abcdef0123456789abcdef01234567
+        documentSelector: { path: metadata.name, value: platform }
+      - equal:
+          path: spec.sources[0].helm.valuesObject.global.imageTag
+          value: 0123456789abcdef0123456789abcdef01234567
+        documentSelector: { path: metadata.name, value: platform }
+      - equal:
+          path: spec.sources[0].path
+          value: deploy/charts/procure-platform
+        documentSelector: { path: metadata.name, value: platform }
+
+  - it: values come from the gitops repo ref
+    asserts:
+      - equal:
+          path: spec.sources[1]
+          value:
+            repoURL: git@github.com:modefan/procure-ai-gitops.git
+            targetRevision: main
+            ref: values
+        documentSelector: { path: metadata.name, value: procure-ai }
+      - equal:
+          path: spec.sources[1]
+          value:
+            repoURL: git@github.com:modefan/procure-ai-gitops.git
+            targetRevision: main
+            ref: values
+        documentSelector: { path: metadata.name, value: platform }
+      - equal:
+          path: spec.sources[0].helm.valueFiles
+          value: [$values/envs/local/platform.yaml]
+        documentSelector: { path: metadata.name, value: platform }
+      - equal:
+          path: spec.sources[0].helm.valueFiles
+          value: [$values/envs/local/observability.yaml]
+        documentSelector: { path: metadata.name, value: observability }
+      - equal:
+          path: spec.sources
+          value:
+            - repoURL: https://argoproj.github.io/argo-helm
+              chart: argo-cd
+              targetRevision: 10.11.7
+              helm:
+                releaseName: argocd
+                valueFiles: [$values/argocd/values.yaml]
+            - repoURL: git@github.com:modefan/procure-ai-gitops.git
+              targetRevision: main
+              ref: values
+        documentSelector: { path: metadata.name, value: argocd }
+
+  - it: every Application syncs automatically with prune, selfHeal, server-side apply and retries
+    asserts:
+      - equal:
+          path: spec.syncPolicy.automated
+          value: { prune: true, selfHeal: true }
+      - contains:
+          path: spec.syncPolicy.syncOptions
+          content: ServerSideApply=true
+      - isNotNull:
+          path: spec.syncPolicy.retry.limit
+
+  - it: observability is left out until its chart exists
+    set:
+      observability:
+        enabled: false
+    asserts:
+      - hasDocuments:
+          count: 3
+
+  - it: a short or missing appRevision fails the render
+    set:
+      appRevision: 36dfd83
+    asserts:
+      - failedTemplate:
+          errorPattern: appRevision must be a full 40-character commit SHA

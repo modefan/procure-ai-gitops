@@ -1,0 +1,91 @@
+# Values of the official argo-cd Helm chart (version in apps/values.yaml, argocd.chartVersion) for the local k3d cluster `procure`.
+# bootstrap/install-argocd.ps1 installs Argo CD with these values; after that the `argocd` Application (wave -2) manages Argo CD itself
+# with the same chart and values, so a change here is deployed by a push to this repo.
+# Small on purpose: the node has 10 GB for everything (CLAUDE.md "My PC is shared"); one replica of each component, no Dex (the admin
+# user is enough for a local cluster), no notifications, no ApplicationSet controller.
+
+global:
+  domain: argocd.procure.localtest.me
+
+dex:
+  enabled: false
+notifications:
+  enabled: false
+# The chart has no switch for the ApplicationSet controller: no replicas (its CRD stays installed, unused).
+applicationSet:
+  replicas: 0
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { cpu: 100m, memory: 128Mi }
+
+configs:
+  params:
+    # TLS ends at Traefik (the local CA's wildcard certificate); the server speaks plain http behind it.
+    server.insecure: true
+  cm:
+    # How often Argo CD looks for new commits (the publish workflow's revision bump): every 2 minutes, plus up to 1 minute jitter.
+    timeout.reconciliation: 120s
+    # Health of an Application as a resource of the root Application (app of apps). Argo CD has no built-in check for it, so without
+    # this the root would not wait for one wave of Applications before the next. An Application reports its own health, with one
+    # exception: with annotation procure-ai/wave-gate: synced it counts as Healthy for the wave order as soon as its last sync
+    # succeeded and it is Synced, even while its pods are still Progressing. The platform needs that: it becomes Healthy only after the
+    # apps' migrations (next wave) created the publications its Debezium servers wait for. Degraded, Missing and failed syncs still hold
+    # the next wave back. Test-FreshCluster.ps1 proves the order converges on a fresh cluster.
+    resource.customizations.health.argoproj.io_Application: |
+      hs = {}
+      hs.status = "Progressing"
+      hs.message = ""
+      if obj.status ~= nil then
+        if obj.status.health ~= nil then
+          hs.status = obj.status.health.status
+          if obj.status.health.message ~= nil then
+            hs.message = obj.status.health.message
+          end
+        end
+        local gate = obj.metadata.annotations ~= nil and obj.metadata.annotations["procure-ai/wave-gate"] == "synced"
+        if gate and hs.status == "Progressing" and obj.status.sync ~= nil and obj.status.sync.status == "Synced"
+            and obj.status.operationState ~= nil and obj.status.operationState.phase == "Succeeded" then
+          hs.status = "Healthy"
+          hs.message = "Synced; still progressing (wave gate 'synced': the next wave may start)"
+        end
+      end
+      return hs
+
+controller:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+repoServer:
+  # Renders the Helm charts (the umbrella has 13 subcharts) and clones the repos.
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: "1", memory: 384Mi }
+  copyutil:
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+
+server:
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 192Mi }
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hostname: argocd.procure.localtest.me
+    # No secretName: Traefik serves its default certificate (the local CA's wildcard, bootstrap/new-local-ca.ps1).
+    tls: false
+    extraTls:
+      - hosts:
+          - argocd.procure.localtest.me
+
+redis:
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 96Mi }
+
+redisSecretInit:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { cpu: 100m, memory: 64Mi }

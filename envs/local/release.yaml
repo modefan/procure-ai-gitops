@@ -1,0 +1,4 @@
+# The procure-ai commit deployed to this environment: its charts (deploy/charts) and its images (ghcr.io/modefan/procure-ai-<name>:<sha>).
+# Written by procure-ai's publish workflow (.github/workflows/publish.yml) after CI passed and the images were pushed. Set it by hand
+# only to roll back or pin a revision whose images exist in GHCR (the retention workflow keeps the newest 15 per image).
+appRevision: 36dfd83f652c8059efdf3f179c93e30820258544
