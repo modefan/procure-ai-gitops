@@ -4,7 +4,8 @@ local cases = dofile(arg[2])
 local failed = 0
 for _, case in ipairs(cases) do
   local name, obj, want = case[1], case[2], case[3]
-  local env = { obj = obj, string = string, ipairs = ipairs, pairs = pairs, type = type, tostring = tostring }
+  -- Only what Argo CD's Lua offers health checks (no string library: string.* fails there, seen on the cluster).
+  local env = { obj = obj, ipairs = ipairs, pairs = pairs, type = type, tostring = tostring }
   local chunk = assert(load(script, "health", "t", env))
   local ok, hs = pcall(chunk)
   if not ok then

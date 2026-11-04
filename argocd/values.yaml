@@ -95,7 +95,8 @@ configs:
         end
       end
       for i, target in pairs(targets) do
-        if type(target) == "string" and string.len(target) == 40 and string.match(target, "^%x+$") ~= nil then
+        -- A full commit SHA (40 characters; chart versions and branch names are shorter). Argo CD's Lua has no string library.
+        if type(target) == "string" and #target == 40 then
           if compared[i] ~= target then
             hs.message = "Source " .. i .. " compared at " .. tostring(compared[i]) .. ", target " .. target
             return hs
