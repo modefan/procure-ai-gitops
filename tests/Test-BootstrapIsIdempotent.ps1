@@ -10,6 +10,7 @@
     2. Every Secret (with its keys), the procure-ca ConfigMap, the default TLSStore and the namespaces exist.
     3. A pod in `procure` resolves auth.procure.localtest.me to the Traefik ClusterIP (CoreDNS rewrite).
     4. Traefik serves the local CA's wildcard certificate on https://procure.localtest.me (port 443 on the PC).
+    0. (first) The node is capped at 8 CPUs and the kubelet keeps memory back (reservations + eviction threshold) from what k3d gives it.
     Prints names only, never values. Exit code 1 on any failure.
 #>
 [CmdletBinding()]
@@ -25,6 +26,14 @@ if (-not (Test-ClusterReachable)) {
     Fail "cluster '$ClusterName' is not reachable (context $KubeContext); run bootstrap/new-cluster.ps1, new-local-ca.ps1, new-secrets.ps1 first"
     exit 1
 }
+
+# --- 0. Node budget: 8 CPUs, kubelet reservations and eviction (new-cluster.ps1) ------------------------------------------------------
+$budget = Get-NodeBudget
+if ($budget.Cpus -ne $NodeCpus) { Fail "node CPUs $($budget.Cpus), expected $NodeCpus (docker update --cpus)" } else { Pass "node capped at $NodeCpus CPUs" }
+$keptBack = $budget.MemoryCapacity - $budget.MemoryAllocatable
+if ($budget.MemoryCapacity -gt 10.5GB) { Fail "kubelet sees $([math]::Round($budget.MemoryCapacity / 1GB, 2)) GiB, not the node's $NodeMemory cap" }
+if ($keptBack -lt (Get-ExpectedKeptBack)) { Fail "kubelet keeps back $([math]::Round($keptBack / 1MB)) MiB, expected $([math]::Round((Get-ExpectedKeptBack) / 1MB)) MiB" }
+else { Pass "kubelet keeps back $([math]::Round($keptBack / 1MB)) MiB of $([math]::Round($budget.MemoryCapacity / 1GB, 2)) GiB (reserved + eviction-hard)" }
 
 # --- 1. Second run changes nothing -------------------------------------------------------------------------------------------------
 $caFiles = @('ca.key', 'ca.crt', 'procure.key', 'procure.crt', 'mongo.key', 'mongo.crt', 'mongo.pem')

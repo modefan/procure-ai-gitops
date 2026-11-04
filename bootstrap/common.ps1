@@ -9,6 +9,16 @@ $script:KubeContext = "k3d-$script:ClusterName"
 # Pinned k3s image (the default of k3d 5.9.0). Change it here and recreate the cluster to move to a new Kubernetes version.
 $script:K3sImage = 'rancher/k3s:v1.35.5-k3s1'
 $script:Namespaces = @('procure', 'observability', 'argocd')
+# The node's budget (CLAUDE.md "My PC is shared"): memory capped by k3d (--servers-memory), CPUs by `docker update --cpus` on every
+# run of new-cluster.ps1. The kubelet keeps memory back for k3s itself (API server, kubelet, containerd run in the node's process)
+# and evicts pods when less than EvictionHard is free, so a memory-hungry workload loses pods instead of starving the control plane.
+# Measured (plan 07 Task 5): with ~1 GiB still "available" to the kubelet (working set 8.98 of 10 GiB) the API server already timed out,
+# so pods are evicted below 1 GiB free.
+$script:NodeMemory = '10g'
+$script:NodeCpus = 8
+$script:KubeReservedMemory = '1Gi'
+$script:SystemReservedMemory = '256Mi'
+$script:EvictionHardMemory = '1Gi'
 # Outside every repo; listed by name in DEMO PASSWORDS.txt.
 $script:LocalCaDir = Join-Path $env:USERPROFILE '.procure-ai\local-ca'
 # The AppHost's UserSecretsId (src/AppHost/ProcureAi.AppHost/ProcureAi.AppHost.csproj): the one source of the secrets.
@@ -120,4 +130,30 @@ function Get-OpenSsl {
     $git = 'C:\Program Files\Git\usr\bin\openssl.exe'
     if (Test-Path $git) { return $git }
     throw 'openssl not found (install Git for Windows, which ships it, or put openssl on PATH).'
+}
+
+function ConvertTo-Bytes([string] $quantity) {
+    # Kubernetes memory quantities as the API returns them (Ki, Mi, Gi or plain bytes).
+    if ($quantity -match '^(\d+)(Ki|Mi|Gi)?$') {
+        $factor = switch ($Matches[2]) { 'Ki' { 1KB } 'Mi' { 1MB } 'Gi' { 1GB } default { 1 } }
+        return [int64] $Matches[1] * $factor
+    }
+    throw "Unexpected memory quantity '$quantity'."
+}
+
+function Get-NodeBudget {
+    # What the node really has: docker's CPU cap of the server container, the kubelet's memory capacity and allocatable.
+    $nanoCpus = & docker inspect -f '{{.HostConfig.NanoCpus}}' "k3d-$script:ClusterName-server-0" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "docker inspect k3d-$script:ClusterName-server-0 failed: $nanoCpus" }
+    $node = (Invoke-Kubectl get nodes -o json | Out-String | ConvertFrom-Json).items[0]
+    [pscustomobject]@{
+        Cpus              = [double] $nanoCpus / 1e9
+        MemoryCapacity    = ConvertTo-Bytes $node.status.capacity.memory
+        MemoryAllocatable = ConvertTo-Bytes $node.status.allocatable.memory
+    }
+}
+
+function Get-ExpectedKeptBack {
+    # Capacity minus allocatable the kubelet arguments of new-cluster.ps1 produce.
+    (ConvertTo-Bytes $script:KubeReservedMemory) + (ConvertTo-Bytes $script:SystemReservedMemory) + (ConvertTo-Bytes $script:EvictionHardMemory)
 }

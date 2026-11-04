@@ -1,9 +1,12 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Creates (or starts) the local k3d cluster `procure`: 1 server, 0 agents, 10 GB, ports 80/443 on the PC, CoreDNS rewrite, namespaces.
+    Creates (or starts) the local k3d cluster `procure`: 1 server, 0 agents, 10 GB and 8 CPUs, kubelet memory reservations and eviction,
+    ports 80/443 on the PC, CoreDNS rewrite, namespaces.
 .DESCRIPTION
-    Safe to run again: an existing cluster is started if stopped, and the CoreDNS rewrite and namespaces are re-applied.
+    Safe to run again: an existing cluster is started if stopped, its CPU cap is set again (docker update, a no-op when unchanged), and the
+    CoreDNS rewrite and namespaces are re-applied. The kubelet reservations are k3s arguments, fixed when the cluster is created: an older
+    cluster without them is reported, and remove-cluster.ps1 + this script recreate it (local data only).
     Before creating or starting, ports 80 and 443 on the PC must be free (k3d's load balancer binds them).
     Never run the cluster and an Aspire AppHost at the same time (CLAUDE.md "My PC is shared"); stop it with `k3d cluster stop procure`.
 #>
@@ -27,11 +30,14 @@ function Assert-PortsFree {
 $cluster = Get-K3dCluster
 if (-not $cluster) {
     Assert-PortsFree
-    Write-Host "Creating k3d cluster '$ClusterName' ($K3sImage, 1 server, 10 GB)..."
+    Write-Host "Creating k3d cluster '$ClusterName' ($K3sImage, 1 server, $NodeMemory, $NodeCpus CPUs)..."
     & k3d cluster create $ClusterName `
         --image $K3sImage `
         --servers 1 --agents 0 `
-        --servers-memory 10g `
+        --servers-memory $NodeMemory `
+        --k3s-arg "--kubelet-arg=kube-reserved=memory=$KubeReservedMemory@server:0" `
+        --k3s-arg "--kubelet-arg=system-reserved=memory=$SystemReservedMemory@server:0" `
+        --k3s-arg "--kubelet-arg=eviction-hard=memory.available<$EvictionHardMemory@server:0" `
         -p '80:80@loadbalancer' -p '443:443@loadbalancer' `
         --kubeconfig-update-default --kubeconfig-switch-context=false `
         --wait --timeout 300s
@@ -45,7 +51,20 @@ if (-not $cluster) {
     Write-Host "k3d cluster '$ClusterName' is already running."
 }
 
+# The CPU cap (k3d has no flag for it): docker's limit on the server container, set on every run (no-op when unchanged; it survives
+# stop/start).
+$out = & docker update --cpus $NodeCpus "k3d-$ClusterName-server-0" 2>&1
+if ($LASTEXITCODE -ne 0) { throw "docker update --cpus $NodeCpus k3d-$ClusterName-server-0 failed: $out" }
+
 Assert-ClusterReachable
+
+$budget = Get-NodeBudget
+if ($budget.Cpus -ne $NodeCpus) { throw "The node has $($budget.Cpus) CPUs, expected $NodeCpus." }
+$keptBack = $budget.MemoryCapacity - $budget.MemoryAllocatable
+if ($keptBack -lt (Get-ExpectedKeptBack)) {
+    throw "The kubelet keeps back $([math]::Round($keptBack / 1MB)) MiB, expected $([math]::Round((Get-ExpectedKeptBack) / 1MB)) MiB (kube-reserved, system-reserved, eviction-hard): this cluster was created without them. Recreate it: remove-cluster.ps1, then this script, new-local-ca.ps1 and new-secrets.ps1."
+}
+Write-Host "Node budget: $($budget.Cpus) CPUs, memory $([math]::Round($budget.MemoryCapacity / 1GB, 2)) GiB, allocatable $([math]::Round($budget.MemoryAllocatable / 1GB, 2)) GiB."
 
 # CoreDNS rewrite: auth.procure.localtest.me -> Traefik, so pods reach Keycloak by the issuer's URL (plan 07 ruling 8).
 $corednsData = { & kubectl --context $KubeContext -n kube-system get configmap coredns-custom -o jsonpath='{.data}' 2>$null }
