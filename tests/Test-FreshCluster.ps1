@@ -56,7 +56,7 @@ $appRevision = $Matches[1]
 $platformImages = @('postgres', 'keycloak', 'debezium')
 $platformTags = @{}
 foreach ($name in $platformImages) {
-    $platformTags[$name] = if ($release -match "(?m)^\s+${name}:\s*`"?([0-9a-f]{40})`"?\s*$") { $Matches[1] } else { $appRevision }
+    $platformTags[$name] = if ($release -match "(?m)^\s+`"?${name}`"?:\s*`"?([0-9a-f]{40})`"?\s*$") { $Matches[1] } else { $appRevision }
 }
 $apps = Get-Content -Raw (Join-Path $repoRoot "envs/$Environment/apps.yaml")
 $expectedApps = @('root', 'argocd', 'platform', 'procure-ai')
