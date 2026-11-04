@@ -1,0 +1,26 @@
+# Values of the procure-ai umbrella chart (procure-ai deploy/charts/procure-ai) for the local k3d cluster `procure`.
+# No secrets here: the chart references the Secrets bootstrap/new-secrets.ps1 creates. The image tag is the app revision (release.yaml,
+# plan 07 Task 6), or `--set global.imageTag=local-<sha7>` for images built on the PC and imported with
+# `deploy/scripts/build-images.ps1 -Tag local-<sha7> -ImportTo procure`.
+global:
+  # "" while the images are imported into k3d; ghcr.io/modefan once CI publishes them (Task 6).
+  imageRegistry: ""
+  hosts:
+    app: procure.localtest.me
+    keycloak: auth.procure.localtest.me
+  # The demo: seeded data, one-click demo login, the nightly reset and the "behind the scenes" panel are on.
+  demo:
+    seed: true
+    reset: true
+    devPanel: true
+    login: true
+
+# The web app's runtime config.json for this environment (the chart's defaults, with the dev panel on and the cluster's dashboard).
+web:
+  configJson:
+    logger:
+      consoleLevel: info
+    observability:
+      dashboardUrl: https://dashboard.procure.localtest.me
+    devPanel:
+      enabled: true
