@@ -32,6 +32,15 @@ syncPolicy:
       factor: 2
       maxDuration: 3m
 
+# Fields the API server adds that the charts do not set, so Argo CD's diff would show every StatefulSet with a PVC template as
+# OutOfSync forever (and the automated sync would rerun its hooks again and again).
+ignoreDifferences:
+  - group: apps
+    kind: StatefulSet
+    jqPathExpressions:
+      - .spec.volumeClaimTemplates[]?.apiVersion
+      - .spec.volumeClaimTemplates[]?.kind
+
 # Argo CD manages itself after bootstrap/install-argocd.ps1 installed it with the same chart and values (argocd/values.yaml).
 argocd:
   enabled: true

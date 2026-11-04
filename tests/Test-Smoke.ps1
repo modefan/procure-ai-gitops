@@ -24,7 +24,7 @@ $failures = [System.Collections.Generic.List[string]]::new()
 function Fail([string] $message) { $failures.Add($message); Write-Host "FAIL: $message" -ForegroundColor Red }
 function Pass([string] $message) { Write-Host "ok:   $message" -ForegroundColor Green }
 
-# Git for Windows' curl uses OpenSSL and honours --cacert like on Linux; the Windows curl.exe (Schannel) is the fallback.
+# Git for Windows' curl, else Windows' curl.exe. Both use Schannel here: --cacert pins the local CA, --ssl-no-revoke because it has no CRL.
 $curl = @('C:\Program Files\Git\mingw64\bin\curl.exe', "$env:SystemRoot\System32\curl.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $curl) { throw 'curl not found.' }
 $caFile = Join-Path $LocalCaDir 'ca.crt'
@@ -38,7 +38,7 @@ function Invoke-Curl {
     # Returns @{ Status; Body }. Extra curl arguments after the URL.
     param([Parameter(Mandatory)] [string] $Url, [string[]] $Extra = @())
     $bodyFile = Join-Path $work 'body.txt'
-    $status = & $curl -sS --max-time 20 --cacert $caFile -o $bodyFile -w '%{http_code}' -b $jar -c $jar @Extra $Url 2>&1
+    $status = & $curl -sS --max-time 20 --ssl-no-revoke --cacert $caFile -o $bodyFile -w '%{http_code}' -b $jar -c $jar @Extra $Url 2>&1
     $code = if ("$status" -match '(\d{3})$') { [int] $Matches[1] } else { 0 }
     $body = if (Test-Path $bodyFile) { Get-Content -Raw $bodyFile } else { '' }
     if ($code -eq 0) { $body = "$status" }

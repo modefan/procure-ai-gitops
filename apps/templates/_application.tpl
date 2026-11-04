@@ -31,6 +31,10 @@ spec:
     namespace: {{ $app.namespace }}
   sources:
     {{- toYaml .sources | nindent 4 }}
+  {{- with $root.Values.ignoreDifferences }}
+  ignoreDifferences:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   syncPolicy:
     {{- toYaml $root.Values.syncPolicy | nindent 4 }}
 {{- end }}
