@@ -26,29 +26,61 @@ configs:
     # How often Argo CD looks for new commits (the publish workflow's revision bump): every 2 minutes, plus up to 1 minute jitter.
     timeout.reconciliation: 120s
     # Health of an Application as a resource of the root Application (app of apps). Argo CD has no built-in check for it, so without
-    # this the root would not wait for one wave of Applications before the next. An Application reports its own health, with one
-    # exception: with annotation procure-ai/wave-gate: synced it counts as Healthy for the wave order as soon as its last sync
-    # succeeded and it is Synced, even while its pods are still Progressing. The platform needs that: it becomes Healthy only after the
-    # apps' migrations (next wave) created the publications its Debezium servers wait for. Degraded, Missing and failed syncs still hold
-    # the next wave back. Test-FreshCluster.ps1 proves the order converges on a fresh cluster.
+    # this the root would not wait for one wave of Applications before the next. An Application counts as Progressing until its sync
+    # has finished (Argo CD itself may call a just-created Application Healthy before its first sync started; a failed sync is retried
+    # by the Application's own retry policy, so it is Progressing too, with the reason). After a successful sync it reports its own
+    # health, with one exception: with annotation procure-ai/wave-gate: synced it counts as Healthy for the wave order as soon as it is
+    # Synced, even while its pods are still Progressing. The platform needs that: it becomes Healthy only after the apps' migrations
+    # (next wave) created the publications its Debezium servers wait for. Test-FreshCluster.ps1 proves the order converges.
     resource.customizations.health.argoproj.io_Application: |
       hs = {}
       hs.status = "Progressing"
-      hs.message = ""
-      if obj.status ~= nil then
-        if obj.status.health ~= nil then
-          hs.status = obj.status.health.status
-          if obj.status.health.message ~= nil then
-            hs.message = obj.status.health.message
-          end
-        end
-        local gate = obj.metadata.annotations ~= nil and obj.metadata.annotations["procure-ai/wave-gate"] == "synced"
-        if gate and hs.status == "Progressing" and obj.status.sync ~= nil and obj.status.sync.status == "Synced"
-            and obj.status.operationState ~= nil and obj.status.operationState.phase == "Succeeded" then
-          hs.status = "Healthy"
-          hs.message = "Synced; still progressing (wave gate 'synced': the next wave may start)"
+      hs.message = "Waiting for the first sync"
+      if obj.status == nil then
+        return hs
+      end
+      local health = nil
+      local healthMessage = ""
+      if obj.status.health ~= nil then
+        health = obj.status.health.status
+        if obj.status.health.message ~= nil then
+          healthMessage = obj.status.health.message
         end
       end
+      local op = nil
+      local opMessage = ""
+      if obj.status.operationState ~= nil then
+        op = obj.status.operationState.phase
+        if obj.status.operationState.message ~= nil then
+          opMessage = obj.status.operationState.message
+        end
+      end
+      local sync = nil
+      if obj.status.sync ~= nil then
+        sync = obj.status.sync.status
+      end
+      if op ~= "Succeeded" then
+        if op ~= nil then
+          hs.message = "Sync " .. op .. ": " .. opMessage
+        end
+        return hs
+      end
+      if sync ~= "Synced" then
+        hs.message = "Sync status " .. tostring(sync)
+        return hs
+      end
+      local gate = obj.metadata.annotations ~= nil and obj.metadata.annotations["procure-ai/wave-gate"] == "synced"
+      if gate and health ~= "Degraded" then
+        hs.status = "Healthy"
+        hs.message = "Synced (wave gate 'synced': the next wave may start); own health " .. tostring(health)
+        return hs
+      end
+      if health == nil or health == "Missing" or health == "Unknown" then
+        hs.message = "Health " .. tostring(health)
+        return hs
+      end
+      hs.status = health
+      hs.message = healthMessage
       return hs
 
 controller:
