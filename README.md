@@ -68,3 +68,14 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
 - `tests/Test-FreshCluster.ps1 -LocalImages` checks a revision before CI published it: build the images in a procure-ai checkout of
   that revision with `deploy/scripts/build-images.ps1 -Tag <appRevision> -Registry ghcr.io/modefan`; the test imports them into k3d.
   `-WatchOnly` skips the delete and bootstrap and only checks the running cluster (after a deploy).
+- `tests/Test-Smoke.ps1` (also the last step of Test-FreshCluster): gateway and Keycloak through Traefik, demo login, seeded data with the
+  admin key, the observability Application, the dashboard's Keycloak sign-in (Tom refused, the admin with `dashboard-viewer` let in) and
+  its telemetry API answering 404.
+- `tests/Test-Upgrade.ps1` (plan 07 Review Focus 2): deploys two throwaway procure-ai revisions by a helm parameter on the root
+  Application (branches `test-upgrade/*`, only requests-api built, the other app images retagged in the node): one with an empty
+  migration (every `<name>-migrate` Job reruns and finishes before the new pods start) and one whose Requests migration fails (the old
+  pods keep serving, the sync does not succeed). Always restores `release.yaml`'s revision and deletes the branches. `-BaseRevision`
+  starts the test revisions from another commit that changes no app code.
+- `tests/Test-RestartKeepsData.ps1` (Review Focus 3): row, document and replication-slot counts before and after `k3d cluster
+  stop/start` and deleted postgres-0 / mongo-0 pods, then a new request must reach the data change log within 30 s.
+- The procure-ai end-to-end suite runs against the cluster too: see procure-ai `docs/kubernetes.md`.

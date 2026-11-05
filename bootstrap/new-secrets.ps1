@@ -34,15 +34,6 @@ param(
 . (Join-Path $PSScriptRoot 'common.ps1')
 Assert-ClusterReachable
 
-function Read-UserSecrets {
-    $raw = & dotnet user-secrets list --json --id $AppHostUserSecretsId 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "dotnet user-secrets list --id $AppHostUserSecretsId failed." }
-    $text = ($raw | ForEach-Object { "$_" }) -join "`n"
-    $begin = $text.IndexOf('//BEGIN'); $end = $text.IndexOf('//END')
-    if ($begin -lt 0 -or $end -lt $begin) { throw 'Unexpected output from dotnet user-secrets list --json.' }
-    $text.Substring($begin + 7, $end - $begin - 7) | ConvertFrom-Json -AsHashtable
-}
-
 $secrets = Read-UserSecrets
 
 # New in plan 07: generated once, stored in the AppHost user secrets first (stdin JSON merges into the store, no value on a command line).

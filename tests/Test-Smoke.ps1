@@ -12,6 +12,9 @@
     6. The dashboard's root at https://dashboard.procure.localtest.me redirects to Keycloak's authorization endpoint for client
        aspire-dashboard, after Keycloak accepted the pushed authorization request (OIDC on, forwarded headers trusted, redirect URI and
        scopes valid).
+    7. The dashboard's telemetry API (/api/telemetry/...) answers 404: it is switched off.
+    8. Signed in at Keycloak (username page, password page, form_post), Tom (no dashboard-viewer role) does not get the dashboard, the
+       admin (client role dashboard-viewer) does. The demo password comes from the AppHost user secrets and reaches curl in a file.
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
     from pwsh). The admin key goes to curl in a header file that only the current user can read, never on a command line; nothing
     secret is printed. Exit code 1 on any failure.
@@ -58,6 +61,45 @@ function Get-JarCookie([string] $name) {
         if ($fields.Count -ge 7 -and $fields[5] -eq $name) { return $fields[6] }
     }
     $null
+}
+
+function Invoke-DashboardSignIn {
+    # A fresh browser (own cookie jar) opens the dashboard and signs in at Keycloak as $User. Keycloak's login is two pages (username, then
+    # password) and answers with an auto-submitting form_post page to the dashboard's callback. Returns @{ Status; Url; Body; Error } of
+    # the dashboard page it ends on.
+    param([Parameter(Mandatory)] [string] $User, [Parameter(Mandatory)] [string] $PasswordFile)
+    $userJar = Join-Path $work "dashboard-$($User.Split('@')[0]).txt"
+    $page = Join-Path $work 'dashboard-page.html'
+    function Step([string[]] $curlArgs) {
+        $written = & $curl -sS --max-time 20 --ssl-no-revoke --cacert $caFile -c $userJar -b $userJar -o $page -w '%{http_code} %{url_effective}' @curlArgs 2>&1
+        $parts = "$written" -split ' ', 2
+        [pscustomobject]@{ Status = [int]($parts[0] -replace '\D', '0'); Url = if ($parts.Count -gt 1) { $parts[1] } else { '' }; Body = if (Test-Path $page) { Get-Content -Raw $page } else { '' } }
+    }
+    function Get-FormAction([string] $html) {
+        $m = [regex]::Match($html, '<form[^>]*\saction="([^"]+)"', 'IgnoreCase')
+        if ($m.Success) { [Net.WebUtility]::HtmlDecode($m.Groups[1].Value) } else { $null }
+    }
+    $r = Step @('-L', '--max-redirs', '10', "https://$DashboardHost/")
+    $action = Get-FormAction $r.Body
+    if ($r.Status -ne 200 -or -not $r.Url.StartsWith("https://$KeycloakHost/") -or -not $action) {
+        return [pscustomobject]@{ Error = "no Keycloak login page ($($r.Status) at $($r.Url))" }
+    }
+    $r = Step @('-X', 'POST', '--data-urlencode', "username=$User", $action)
+    $action = Get-FormAction $r.Body
+    if ($r.Status -ne 200 -or -not $action -or $r.Body -notmatch 'name="password"') {
+        return [pscustomobject]@{ Error = "no password page after the username ($($r.Status))" }
+    }
+    $r = Step @('-X', 'POST', '--data-urlencode', "username=$User", '--data-urlencode', "password@$PasswordFile", $action)
+    $action = Get-FormAction $r.Body
+    $fields = @([regex]::Matches($r.Body, '<input[^>]*\sname="([^"]+)"[^>]*\svalue="([^"]*)"', 'IgnoreCase') |
+        ForEach-Object { '--data-urlencode'; "$($_.Groups[1].Value)=$([Net.WebUtility]::HtmlDecode($_.Groups[2].Value))" })
+    if (-not $action -or -not $action.StartsWith("https://$DashboardHost/") -or $r.Body -notmatch '(?i)name="code"') {
+        return [pscustomobject]@{ Error = "Keycloak did not hand back an authorization code (wrong password?) ($($r.Status) at $($r.Url))" }
+    }
+    # The callback sets the dashboard's cookie and redirects to where the visit started; follow it.
+    $r = Step (@('-L', '--max-redirs', '10', '-X', 'POST') + $fields + @($action))
+    $r = Step @('-L', '--max-redirs', '10', "https://$DashboardHost/")
+    [pscustomobject]@{ Status = $r.Status; Url = $r.Url; Body = $r.Body; Error = $null }
 }
 
 try {
@@ -142,6 +184,38 @@ try {
     } else {
         $shown = if ($location) { $location.Substring(0, [Math]::Min(300, $location.Length)) } else { '(no Location header)' }
         Fail "https://$DashboardHost/ ended with $status at $url, Location: $shown"
+    }
+
+    # --- 7. The dashboard's telemetry API is off ---------------------------------------------------------------------------------------
+    # Dashboard__Api__Disabled: the API (/api/telemetry/..., its own auth mode) must not answer at all, signed in or not.
+    foreach ($path in '/api/telemetry/logs', '/api/telemetry/traces') {
+        $r = Invoke-Curl "https://$DashboardHost$path"
+        if ($r.Status -eq 404) { Pass "https://$DashboardHost$path answers 404 (dashboard API off)" }
+        else { Fail "https://$DashboardHost$path answered $($r.Status), expected 404 (the dashboard API must be off)" }
+    }
+
+    # --- 8. Only dashboard-viewer gets in --------------------------------------------------------------------------------------------
+    # Signs in at Keycloak as a browser does (username page, password page, form_post back to the dashboard) and opens the dashboard: Tom
+    # (no dashboard-viewer role) must not see it, the admin (the only demo user with it) must. The password goes to curl from a file in the
+    # current-user-only work folder (--data-urlencode password@file), never on a command line.
+    $passwordFile = Join-Path $work 'password.txt'
+    $demoPassword = (Read-UserSecrets)['Parameters:keycloak-demo-password']
+    if (-not $demoPassword) { Fail 'AppHost user secret Parameters:keycloak-demo-password is missing' }
+    else {
+        [IO.File]::WriteAllText($passwordFile, $demoPassword)
+        $demoPassword = $null
+        foreach ($case in @(@{ User = 'tom@acme.test'; Allowed = $false }, @{ User = 'admin@acme.test'; Allowed = $true })) {
+            $result = Invoke-DashboardSignIn -User $case.User -PasswordFile $passwordFile
+            $seesDashboard = $result.Status -eq 200 -and $result.Url.StartsWith("https://$DashboardHost/") -and $result.Body.Contains('name="aspire-version"')
+            if ($result.Error) { Fail "dashboard sign-in as $($case.User): $($result.Error)" }
+            elseif ($case.Allowed -and $seesDashboard) { Pass "$($case.User) (dashboard-viewer) signs in and sees the dashboard" }
+            elseif (-not $case.Allowed -and -not $seesDashboard -and $result.Status -in 401, 403, 404 -and $result.Url.StartsWith("https://$DashboardHost/")) {
+                Pass "$($case.User) (no dashboard-viewer) signs in at Keycloak but the dashboard refuses: $($result.Status) at $($result.Url)"
+            } else {
+                Fail "dashboard sign-in as $($case.User): ended with $($result.Status) at $($result.Url) (expected $(if ($case.Allowed) { 'the dashboard' } else { 'a refusal' }))"
+            }
+        }
+        Remove-Item $passwordFile -Force
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

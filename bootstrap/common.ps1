@@ -190,3 +190,13 @@ function Get-Gh {
     if (Test-Path $default) { return $default }
     throw 'gh (GitHub CLI) not found.'
 }
+
+# The AppHost user secrets (the one source of every secret, plan 07 Global Constraints) as a hashtable key -> value. Never print it.
+function Read-UserSecrets {
+    $raw = & dotnet user-secrets list --json --id $AppHostUserSecretsId 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "dotnet user-secrets list --id $AppHostUserSecretsId failed." }
+    $text = ($raw | ForEach-Object { "$_" }) -join "`n"
+    $begin = $text.IndexOf('//BEGIN'); $end = $text.IndexOf('//END')
+    if ($begin -lt 0 -or $end -lt $begin) { throw 'Unexpected output from dotnet user-secrets list --json.' }
+    $text.Substring($begin + 7, $end - $begin - 7) | ConvertFrom-Json -AsHashtable
+}
