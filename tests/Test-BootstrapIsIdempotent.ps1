@@ -7,6 +7,9 @@
        app.kubernetes.io/managed-by=procure-bootstrap) keeps its resourceVersion (server-side apply reports no "unchanged"), and the
        CA files keep their hashes. No Secret in procure or observability carries the last-applied-configuration annotation
        (client-side apply would copy the Secret's data into it).
+    1b. new-secrets.ps1 keeps a key it no longer writes (merge, the default) and removes it only with -Prune: a key written by the
+       script's own field manager is added to procure-redis (the shape an older revision of the script left), a normal run must keep it
+       with its value, a -Prune run must remove it and leave every other key as it was (plan 08 Task 6).
     2. Every Secret (with its keys), the procure-ca ConfigMap, the default TLSStore and the namespaces exist.
     3. A pod in `procure` resolves auth.procure.localtest.me to the Traefik ClusterIP (CoreDNS rewrite).
     4. Traefik serves the local CA's wildcard certificate on https://procure.localtest.me (port 443 on the PC).
@@ -108,6 +111,51 @@ foreach ($file in $caFiles) {
     if ($before[$file] -ne $after[$file]) { Fail "CA file $file changed on the second run" }
 }
 if (-not ($caFiles | Where-Object { $before[$_] -ne $after[$_] })) { Pass 'CA files kept their hashes' }
+
+# --- 1b. Stale keys: kept by default, removed with -Prune ---------------------------------------------------------------------------
+# The key is applied server-side by the bootstrap's own field manager with every live key of the Secret, exactly as a run of an older
+# new-secrets.ps1 that still wrote it would have left it; so a plain run of the script would remove it if it did not merge. Values never
+# leave this process; only key names are printed.
+$staleKey = 'stale-check'
+function Get-SecretData([string] $name) {
+    $json = & kubectl --context $KubeContext -n procure get secret $name -o json 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    ($json | Out-String | ConvertFrom-Json -AsHashtable).data
+}
+$redisBefore = Get-SecretData 'procure-redis'
+if (-not $redisBefore) { Fail 'secret procure/procure-redis is missing (stale-key check skipped)' }
+else {
+    $withStale = [ordered]@{}
+    foreach ($key in $redisBefore.Keys) { $withStale[$key] = $redisBefore[$key] }
+    $withStale[$staleKey] = ConvertTo-Base64 'written by an older bootstrap'
+    try {
+        Invoke-ServerSideApply -Json ((New-SecretObject -Namespace procure -Name procure-redis -EncodedData $withStale) | ConvertTo-Json -Depth 20 -Compress) `
+            -Description 'Secret procure-redis with a stale key' | Out-Null
+        $output = & (Join-Path $bootstrap 'new-secrets.ps1') 6>&1 2>&1 | ForEach-Object { "$_" }
+        $merged = Get-SecretData 'procure-redis'
+        if ($merged[$staleKey] -ne $withStale[$staleKey]) { Fail "a normal new-secrets.ps1 run removed or changed the stale key $staleKey (it must keep keys the live pods may still use)" }
+        elseif (-not ($output | Where-Object { $_ -match "procure-redis.*stale key\(s\) kept.*$staleKey" })) { Fail "new-secrets.ps1 kept $staleKey but did not report it" }
+        else { Pass "a normal run keeps the stale key $staleKey with its value and reports it" }
+        $output = & (Join-Path $bootstrap 'new-secrets.ps1') -Prune 6>&1 2>&1 | ForEach-Object { "$_" }
+        $pruned = Get-SecretData 'procure-redis'
+        $otherKeysSame = @($redisBefore.Keys | Where-Object { $pruned[$_] -ne $redisBefore[$_] }).Count -eq 0
+        if ($pruned.Contains($staleKey)) { Fail "new-secrets.ps1 -Prune did not remove the stale key $staleKey" }
+        elseif (@($pruned.Keys).Count -ne @($redisBefore.Keys).Count -or -not $otherKeysSame) { Fail "new-secrets.ps1 -Prune changed procure-redis beyond the stale key (keys now: $(@($pruned.Keys) -join ', '))" }
+        elseif (-not ($output | Where-Object { $_ -match "procure-redis.*stale key\(s\) pruned.*$staleKey" })) { Fail "new-secrets.ps1 -Prune removed $staleKey but did not report it" }
+        else { Pass "-Prune removes the stale key $staleKey and leaves procure-redis's own keys as they were" }
+    } catch {
+        Fail "stale-key check: $($_.Exception.Message)"
+    } finally {
+        # Never leave the test key behind (a failed check, an interrupted run).
+        $after = Get-SecretData 'procure-redis'
+        if ($after -and $after.Contains($staleKey)) {
+            $restore = [ordered]@{}
+            foreach ($key in $redisBefore.Keys) { $restore[$key] = $redisBefore[$key] }
+            Invoke-ServerSideApply -Json ((New-SecretObject -Namespace procure -Name procure-redis -EncodedData $restore) | ConvertTo-Json -Depth 20 -Compress) `
+                -Description 'Secret procure-redis without the stale key' | Out-Null
+        }
+    }
+}
 
 # --- 2. Objects and keys exist ----------------------------------------------------------------------------------------------------
 foreach ($ns in $Namespaces) {

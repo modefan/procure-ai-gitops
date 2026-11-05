@@ -101,14 +101,17 @@ function ConvertTo-Base64 {
 }
 
 function New-SecretObject {
-    # $Data: ordered key -> string value. $FileData: ordered key -> path of a file whose bytes become the value.
+    # $Data: ordered key -> string value. $FileData: ordered key -> path of a file whose bytes become the value. $EncodedData: key -> value
+    # already in base64 (a live Secret's data, kept as is).
     param(
         [Parameter(Mandatory)] [string] $Namespace,
         [Parameter(Mandatory)] [string] $Name,
         [System.Collections.IDictionary] $Data = [ordered]@{},
         [System.Collections.IDictionary] $FileData = [ordered]@{},
+        [System.Collections.IDictionary] $EncodedData = [ordered]@{},
         [string] $Type = 'Opaque')
     $encoded = [ordered]@{}
+    foreach ($key in $EncodedData.Keys) { $encoded[$key] = $EncodedData[$key] }
     foreach ($key in $Data.Keys) { $encoded[$key] = ConvertTo-Base64 $Data[$key] }
     foreach ($key in $FileData.Keys) { $encoded[$key] = [Convert]::ToBase64String([IO.File]::ReadAllBytes($FileData[$key])) }
     [ordered]@{

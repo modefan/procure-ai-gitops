@@ -6,9 +6,14 @@
     Reads `dotnet user-secrets` of the AppHost (UserSecretsId procure-ai-apphost). Values that are new in plan 07 or plan 08 and not there
     yet (keycloak-db-password, keycloak-dashboard-secret, debezium-mongo-password; the per-service database passwords db-<service>-password,
     db-<service>-cdc-password and db-assistant-mongo-password of plan 08 ruling 6) are generated once (32 letters and digits) and written to
-    the user secrets first, so the AppHost and the cluster share them. Every Secret is applied with `kubectl apply`, so a second run
-    reports "unchanged". Rerun this script after changing a user secret, then restart the pods that use it.
-    Prints only object names, never values.
+    the user secrets first, so the AppHost and the cluster share them. Every Secret is applied server-side, so a second run changes
+    nothing. Rerun this script after changing a user secret, then restart the pods that use it.
+    Keys a Secret has on the cluster but this script no longer writes (a secret-shape change, e.g. plan 08 Task 4 dropped
+    procure-debezium/postgres-password) are KEPT by default, with their live values: pods of the previous revision may still reference
+    them until Argo CD has synced and rolled the new one, and a pod that restarts into a missing key hangs in CreateContainerConfigError
+    (a StatefulSet then never rolls past it). Run with -Prune only after that rollout to remove them, and Secrets this script retired
+    (procure-audit-log-reader). The order: docs/kubernetes.md in procure-ai, "Changing the shape of a Secret".
+    Prints only object and key names, never values.
 
     Secrets (keys):
       procure-postgres           password
@@ -32,7 +37,9 @@
 [CmdletBinding()]
 param(
     # The GitHub account whose token pulls the GHCR images.
-    [string] $GhcrUser = 'modefan'
+    [string] $GhcrUser = 'modefan',
+    # Remove the keys (and Secrets) this script no longer writes. Only after Argo CD synced and rolled every pod that used them.
+    [switch] $Prune
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -94,8 +101,32 @@ $mongoPassword = Get-Parameter 'mongo-password'
 $auditLogReaderPassword = Get-Parameter 'audit-log-reader-password'
 
 $results = [System.Collections.Generic.List[string]]::new()
+function Get-StaleKeys([string] $namespace, [string] $name, [System.Collections.IDictionary] $data) {
+    # The live Secret's keys that $data does not have, with their values as they are (base64; never printed). Empty for a new Secret.
+    $stale = [ordered]@{}
+    $json = & kubectl --context $KubeContext -n $namespace get secret $name -o json --ignore-not-found 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "kubectl get secret $namespace/$name failed: $(@($json)[0])" }
+    if (-not "$json".Trim()) { return $stale }
+    $live = ($json | Out-String | ConvertFrom-Json -AsHashtable).data
+    if ($live) {
+        foreach ($key in @($live.Keys) | Sort-Object) { if (-not $data.Contains($key)) { $stale[$key] = $live[$key] } }
+    }
+    $stale
+}
+function Set-Secret([string] $namespace, [string] $name, [System.Collections.IDictionary] $data, [string] $type = 'Opaque') {
+    # Server-side apply removes every key this field manager wrote before and leaves out now; without -Prune those keys are applied
+    # again with their live values, so the Secret keeps them.
+    $stale = Get-StaleKeys $namespace $name $data
+    $keep = if ($Prune) { [ordered]@{} } else { $stale }
+    $line = Invoke-Apply (New-SecretObject -Namespace $namespace -Name $name -Data $data -EncodedData $keep -Type $type)
+    if ($stale.Count -gt 0) {
+        $what = if ($Prune) { 'pruned' } else { 'kept (no longer written; remove with -Prune after the rollout)' }
+        $line += "; stale key(s) $what`: $($stale.Keys -join ', ')"
+    }
+    $results.Add($line)
+}
 function Set-ProcureSecret([string] $name, [System.Collections.IDictionary] $data, [string] $type = 'Opaque') {
-    $results.Add((Invoke-Apply (New-SecretObject -Namespace procure -Name $name -Data $data -Type $type)))
+    Set-Secret procure $name $data $type
 }
 
 Set-ProcureSecret procure-postgres ([ordered]@{ password = $postgresPassword })
@@ -114,9 +145,7 @@ Set-ProcureSecret procure-keycloak ([ordered]@{
     'db-password'         = Get-Parameter 'keycloak-db-password'
 })
 # The Aspire dashboard (namespace observability) gets only its own client secret, not the other Keycloak values.
-$results.Add((Invoke-Apply (New-SecretObject -Namespace observability -Name procure-keycloak -Data ([ordered]@{
-    'dashboard-secret' = Get-Parameter 'keycloak-dashboard-secret'
-}))))
+Set-Secret observability procure-keycloak ([ordered]@{ 'dashboard-secret' = Get-Parameter 'keycloak-dashboard-secret' })
 # debezium-mongo's MongoDB user; the Postgres Debeziums each replicate as their database's own role (procure-db-roles).
 Set-ProcureSecret procure-debezium ([ordered]@{ 'mongo-password' = Get-Parameter 'debezium-mongo-password' })
 $dbRoles = [ordered]@{}
@@ -162,10 +191,12 @@ $connectionStrings['redis'] = "redis:6379,password=$redisPassword"
 $connectionStrings['auditlog'] = New-NpgsqlConnectionString 'audit_log_reader' $auditLogReaderPassword 'auditdb'
 Set-ProcureSecret procure-connection-strings $connectionStrings
 # Older bootstraps also made a Secret procure-audit-log-reader that nothing reads (the password is in procure-connection-strings/auditlog);
-# remove it so there is one place to rotate.
-$stale = & kubectl --context $KubeContext -n procure delete secret procure-audit-log-reader --ignore-not-found 2>&1
-if ($LASTEXITCODE -ne 0) { throw "kubectl delete secret procure-audit-log-reader failed: $stale" }
-if ($stale) { $results.Add("$stale") }
+# -Prune removes it so there is one place to rotate.
+if ($Prune) {
+    $stale = & kubectl --context $KubeContext -n procure delete secret procure-audit-log-reader --ignore-not-found 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "kubectl delete secret procure-audit-log-reader failed: $stale" }
+    if ($stale) { $results.Add("$stale") }
+}
 
 # --- GHCR pull secret (plan 07 ruling 7): the token in Dale's gh keyring; plan 08 replaces it with a read:packages-only token. ---
 $gh = (Get-Command gh -ErrorAction SilentlyContinue)?.Source ?? 'C:\Program Files\GitHub CLI\gh.exe'
