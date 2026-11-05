@@ -10,7 +10,8 @@
     2. Every Secret (with its keys), the procure-ca ConfigMap, the default TLSStore and the namespaces exist.
     3. A pod in `procure` resolves auth.procure.localtest.me to the Traefik ClusterIP (CoreDNS rewrite).
     4. Traefik serves the local CA's wildcard certificate on https://procure.localtest.me (port 443 on the PC).
-    0. (first) The node is capped at 8 CPUs and the kubelet keeps memory back (reservations + eviction threshold) from what k3d gives it.
+    0. (first) The node is capped at 8 CPUs and the kubelet keeps memory back (reservations + eviction threshold) from what k3d gives it,
+       and the cluster's published ports (80, 443, the API) listen on 127.0.0.1 / ::1 only, never on the PC's network interfaces.
     Prints names only, never values. Exit code 1 on any failure.
 #>
 [CmdletBinding()]
@@ -34,6 +35,11 @@ $keptBack = $budget.MemoryCapacity - $budget.MemoryAllocatable
 if ($budget.MemoryCapacity -gt 10.5GB) { Fail "kubelet sees $([math]::Round($budget.MemoryCapacity / 1GB, 2)) GiB, not the node's $NodeMemory cap" }
 if ($keptBack -lt (Get-ExpectedKeptBack)) { Fail "kubelet keeps back $([math]::Round($keptBack / 1MB)) MiB, expected $([math]::Round((Get-ExpectedKeptBack) / 1MB)) MiB" }
 else { Pass "kubelet keeps back $([math]::Round($keptBack / 1MB)) MiB of $([math]::Round($budget.MemoryCapacity / 1GB, 2)) GiB (reserved + eviction-hard)" }
+
+# Loopback only (final review I1): nobody on the LAN reaches Mailpit, Keycloak's admin console or Argo CD.
+$exposure = @(Get-ClusterPortExposure)
+if ($exposure) { foreach ($line in $exposure) { Fail "published port not on loopback only: $line" } }
+else { Pass "ports $($PublishedPorts -join ', ') listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners)" }
 
 # --- 1. Second run changes nothing -------------------------------------------------------------------------------------------------
 $caFiles = @('ca.key', 'ca.crt', 'procure.key', 'procure.crt', 'mongo.key', 'mongo.crt', 'mongo.pem')
@@ -118,7 +124,6 @@ $expectedSecrets = [ordered]@{
                                      'access-admin-secret', 'demo-login-secret', 'dashboard-secret', 'db-password')
     'procure-debezium'           = @('postgres-password', 'mongo-password')
     'procure-api-keys'           = @('admin-api-key', 'admin-api-key-sha256', 'simulator-api-key', 'supplier-webhook-secret')
-    'procure-audit-log-reader'   = @('password')
     'procure-connection-strings' = @('requestsdb', 'accessdb', 'budgetsdb', 'approvalsdb', 'auditdb', 'purchasingdb', 'invoicingdb',
                                      'assistantdb', 'suppliersdb', 'assistantchatdb', 'rabbitmq', 'redis', 'auditlog')
     'ghcr-pull'                  = @('.dockerconfigjson')

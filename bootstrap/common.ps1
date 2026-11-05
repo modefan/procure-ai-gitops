@@ -19,6 +19,11 @@ $script:NodeCpus = 8
 $script:KubeReservedMemory = '1Gi'
 $script:SystemReservedMemory = '256Mi'
 $script:EvictionHardMemory = '1Gi'
+# Published on the PC's loopback address only (final review I1): Mailpit, Keycloak's admin console and Argo CD are not meant for a network,
+# so the ingress (80/443) and the Kubernetes API never listen on the PC's network interfaces. A fixed API port keeps the kubeconfig stable.
+$script:LoopbackAddress = '127.0.0.1'
+$script:ApiPort = 6550
+$script:PublishedPorts = @(80, 443, $script:ApiPort)
 # Outside every repo; listed by name in DEMO PASSWORDS.txt.
 $script:LocalCaDir = Join-Path $env:USERPROFILE '.procure-ai\local-ca'
 # Argo CD's read-only deploy keys and CI's write key for this repo (plan 07 ruling 6); outside every repo, listed by name in DEMO
@@ -154,6 +159,45 @@ function Get-NodeBudget {
         MemoryCapacity    = ConvertTo-Bytes $node.status.capacity.memory
         MemoryAllocatable = ConvertTo-Bytes $node.status.allocatable.memory
     }
+}
+
+function Get-ClusterPortExposure {
+    # Every way the cluster's published ports could be reachable from outside the PC. Returns problem lines; none = loopback only.
+    #  1. Docker's port bindings of every container of the cluster (load balancer, server): each HostIp must be 127.0.0.1 or ::1, and
+    #     80, 443 and the API port must be published.
+    #  2. Windows' listeners on those ports (Docker Desktop's backend opens them): each local address must be 127.0.0.1 or ::1.
+    $loopback = @('127.0.0.1', '::1')
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $ids = @(& docker ps -q --filter "label=k3d.cluster=$script:ClusterName" 2>&1)
+    if ($LASTEXITCODE -ne 0) { $problems.Add("docker ps failed: $($ids -join ' ')"); return $problems }
+    $published = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($id in $ids | Where-Object { $_ }) {
+        $raw = & docker inspect -f '{{.Name}}|{{json .HostConfig.PortBindings}}' $id 2>&1
+        if ($LASTEXITCODE -ne 0) { $problems.Add("docker inspect $id failed: $raw"); continue }
+        $name, $json = "$raw" -split '\|', 2
+        $bindings = $json | ConvertFrom-Json -AsHashtable
+        if (-not $bindings) { continue }
+        foreach ($containerPort in $bindings.Keys) {
+            foreach ($binding in @($bindings[$containerPort])) {
+                $hostIp = "$($binding.HostIp)"
+                if ($hostIp -notin $loopback) {
+                    $shown = if ($hostIp) { $hostIp } else { '"" (all interfaces)' }
+                    $problems.Add("container $($name.TrimStart('/')) publishes $containerPort on host $($shown):$($binding.HostPort), not on loopback")
+                }
+                if ("$($binding.HostPort)" -match '^\d+$') { [void] $published.Add([int] $binding.HostPort) }
+            }
+        }
+    }
+    foreach ($port in $script:PublishedPorts) {
+        if (-not $published.Contains($port)) { $problems.Add("no container of cluster '$script:ClusterName' publishes host port $port") }
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
+        if (-not $listeners) { $problems.Add("nothing listens on port $port on the PC"); continue }
+        foreach ($listener in $listeners | Where-Object { $_.LocalAddress -notin $loopback }) {
+            $process = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+            $problems.Add("port $port listens on $($listener.LocalAddress) ($($process.ProcessName), PID $($listener.OwningProcess)), not only on loopback")
+        }
+    }
+    $problems
 }
 
 function Get-ExpectedKeptBack {

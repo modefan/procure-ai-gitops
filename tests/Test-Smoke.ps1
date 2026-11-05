@@ -15,6 +15,8 @@
     7. The dashboard's telemetry API (/api/telemetry/...) answers 404: it is switched off.
     8. Signed in at Keycloak (username page, password page, form_post), Tom (no dashboard-viewer role) does not get the dashboard, the
        admin (client role dashboard-viewer) does. The demo password comes from the AppHost user secrets and reaches curl in a file.
+    9. (first) The cluster's published ports (80, 443, the API) listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners),
+       never on the PC's network interfaces (final review I1).
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
     from pwsh). The admin key goes to curl in a header file that only the current user can read, never on a command line; nothing
     secret is printed. Exit code 1 on any failure.
@@ -103,6 +105,11 @@ function Invoke-DashboardSignIn {
 }
 
 try {
+    # --- 9. Loopback only (first: the checks below go through these ports) ------------------------------------------------------
+    $exposure = @(Get-ClusterPortExposure)
+    if ($exposure) { foreach ($line in $exposure) { Fail "published port not on loopback only: $line" } }
+    else { Pass "ports $($PublishedPorts -join ', ') listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners)" }
+
     # --- 1. Gateway readiness through Traefik ---------------------------------------------------------------------------------------
     $r = Invoke-Curl "https://$AppHost/health/ready"
     if ($r.Status -eq 200) { Pass "https://$AppHost/health/ready answers 200" }

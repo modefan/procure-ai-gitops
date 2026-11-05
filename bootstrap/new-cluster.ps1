@@ -2,12 +2,15 @@
 <#
 .SYNOPSIS
     Creates (or starts) the local k3d cluster `procure`: 1 server, 0 agents, 10 GB and 8 CPUs, kubelet memory reservations and eviction,
-    ports 80/443 on the PC, CoreDNS rewrite, namespaces.
+    ports 80/443 and the API (6550) on the PC's loopback address only, CoreDNS rewrite, namespaces.
 .DESCRIPTION
     Safe to run again: an existing cluster is started if stopped, its CPU cap is set again (docker update, a no-op when unchanged), and the
     CoreDNS rewrite and namespaces are re-applied. The kubelet reservations are k3s arguments, fixed when the cluster is created: an older
     cluster without them is reported, and remove-cluster.ps1 + this script recreate it (local data only).
-    Before creating or starting, ports 80 and 443 on the PC must be free (k3d's load balancer binds them).
+    Before creating or starting, ports 80, 443 and 6550 on 127.0.0.1 must be free (k3d's load balancer binds them there). The ports are
+    published on 127.0.0.1 only, never on the PC's network interfaces (final review I1: Mailpit, Keycloak's admin console and Argo CD
+    must not be reachable from the LAN); an older cluster published on all interfaces is reported, and remove-cluster.ps1 + this script
+    recreate it.
     Never run the cluster and an Aspire AppHost at the same time (CLAUDE.md "My PC is shared"); stop it with `k3d cluster stop procure`.
 #>
 [CmdletBinding()]
@@ -17,13 +20,17 @@ param()
 Assert-DockerRunning
 
 function Assert-PortsFree {
-    $busy = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in 80, 443 })
+    # A listener on 127.0.0.1 or on all interfaces (0.0.0.0, ::) takes the port from k3d's 127.0.0.1 binding; ::1 and a listener on
+    # another single address (e.g. the LAN IP) do not.
+    $conflicting = @($LoopbackAddress, '0.0.0.0', '::')
+    $busy = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -in $PublishedPorts -and $_.LocalAddress -in $conflicting })
     if ($busy) {
         $owners = $busy | ForEach-Object {
             $process = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
             "port $($_.LocalPort) is used by $($process.ProcessName) (PID $($_.OwningProcess))"
         } | Sort-Object -Unique
-        throw "Ports 80 and 443 must be free for the cluster's load balancer: $($owners -join '; '). Stop that program (IIS, another cluster, a dev server) and run this script again."
+        throw "Ports $($PublishedPorts -join ', ') on $LoopbackAddress must be free for the cluster's load balancer: $($owners -join '; '). Stop that program (IIS, another cluster, a dev server) and run this script again."
     }
 }
 
@@ -38,7 +45,8 @@ if (-not $cluster) {
         --k3s-arg "--kubelet-arg=kube-reserved=memory=$KubeReservedMemory@server:0" `
         --k3s-arg "--kubelet-arg=system-reserved=memory=$SystemReservedMemory@server:0" `
         --k3s-arg "--kubelet-arg=eviction-hard=memory.available<$EvictionHardMemory@server:0" `
-        -p '80:80@loadbalancer' -p '443:443@loadbalancer' `
+        --api-port "$($LoopbackAddress):$ApiPort" `
+        -p "$($LoopbackAddress):80:80@loadbalancer" -p "$($LoopbackAddress):443:443@loadbalancer" `
         --kubeconfig-update-default --kubeconfig-switch-context=false `
         --wait --timeout 300s
     if ($LASTEXITCODE -ne 0) { throw "k3d cluster create $ClusterName failed." }
@@ -57,6 +65,13 @@ $out = & docker update --cpus $NodeCpus "k3d-$ClusterName-server-0" 2>&1
 if ($LASTEXITCODE -ne 0) { throw "docker update --cpus $NodeCpus k3d-$ClusterName-server-0 failed: $out" }
 
 Assert-ClusterReachable
+
+# Loopback only (final review I1). The bindings are fixed when the cluster is created, so an older cluster has to be recreated.
+$exposure = @(Get-ClusterPortExposure)
+if ($exposure) {
+    throw "The cluster's ports are not on loopback only: $($exposure -join '; '). Recreate it: remove-cluster.ps1, then this script, new-local-ca.ps1 and new-secrets.ps1 (local data only)."
+}
+Write-Host "Ports $($PublishedPorts -join ', ') listen on loopback only."
 
 $budget = Get-NodeBudget
 if ($budget.Cpus -ne $NodeCpus) { throw "The node has $($budget.Cpus) CPUs, expected $NodeCpus." }

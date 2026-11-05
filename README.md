@@ -7,11 +7,12 @@ and the code it needs ship in one commit; Argo CD takes the chart from procure-a
 
 ## Local cluster (k3d)
 
-Needs Docker Desktop running, `k3d`, `kubectl`, `gh` (signed in) and the .NET SDK (`dotnet user-secrets`). Ports 80 and 443 must be
-free. Never run the cluster and the Aspire AppHost at the same time: `k3d cluster stop procure` first.
+Needs Docker Desktop running, `k3d`, `kubectl`, `gh` (signed in) and the .NET SDK (`dotnet user-secrets`). Ports 80, 443 and 6550 on
+127.0.0.1 must be free: the cluster publishes the ingress and the Kubernetes API on the PC's loopback address only, never on its network
+interfaces (checked by `new-cluster.ps1`, `Test-BootstrapIsIdempotent.ps1` and `Test-Smoke.ps1`). Never run the cluster and the Aspire AppHost at the same time: `k3d cluster stop procure` first.
 
 ```powershell
-./bootstrap/new-cluster.ps1     # k3d cluster `procure` (1 server, 10 GB), CoreDNS rewrite, namespaces procure/observability/argocd
+./bootstrap/new-cluster.ps1     # k3d cluster `procure` (1 server, 10 GiB), CoreDNS rewrite, namespaces procure/observability/argocd
 ./bootstrap/new-local-ca.ps1    # local CA + certificates in %USERPROFILE%\.procure-ai\local-ca\, TLS Secrets, ConfigMap procure-ca
 ./bootstrap/new-secrets.ps1     # Secrets in `procure` from the AppHost user secrets (+ ghcr-pull from `gh auth token`)
 ./tests/Test-BootstrapIsIdempotent.ps1   # second run changes nothing, every Secret exists, DNS rewrite and TLS work
@@ -26,7 +27,7 @@ Every script is safe to run again (`kubectl apply`; files are created once). Aft
 |---|---|
 | `bootstrap/new-cluster.ps1` | Creates or starts the cluster (k3s image pinned in `bootstrap/common.ps1`), applies `coredns-custom.yaml`, creates the namespaces, waits for Traefik. |
 | `bootstrap/new-local-ca.ps1` | CA (10 years), wildcard `*.procure.localtest.me` and a MongoDB server certificate; Secrets `procure-tls` (Traefik's default certificate through the `default` TLSStore) and `mongo-tls`; ConfigMap `procure-ca` (`<subject hash>.0`, `ca.crt`) in `procure` and `observability`. |
-| `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-api-keys`, `procure-audit-log-reader`, `procure-connection-strings` (one key per AppHost connection name), `ghcr-pull`; in `observability` `procure-keycloak` with only `dashboard-secret` (the Aspire dashboard's client). Generates missing new values into the user secrets first. |
+| `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-api-keys`, `procure-connection-strings` (one key per AppHost connection name), `ghcr-pull`; in `observability` `procure-keycloak` with only `dashboard-secret` (the Aspire dashboard's client). Generates missing new values into the user secrets first. |
 | `bootstrap/install-argocd.ps1` | Deploy keys (read-only for Argo CD on both repos, write on this repo for procure-ai's publish workflow, whose Actions secret `GITOPS_DEPLOY_KEY` it sets) in `%USERPROFILE%\.procure-ai\deploy-keys\`; Argo CD by Helm (chart version in `apps/values.yaml`, values `argocd/values.yaml`); repository Secrets; the root Application. |
 | `bootstrap/remove-cluster.ps1` | Deletes the cluster and all its data (asks first). Keeps the CA. |
 | `bootstrap/trust-local-ca.ps1` | Optional, run by hand: trusts the local CA for the current Windows user so browsers accept the certificates (`-Remove` undoes it). |

@@ -18,7 +18,6 @@
                                  demo-login-secret, dashboard-secret, db-password
       procure-debezium           postgres-password, mongo-password
       procure-api-keys           admin-api-key, admin-api-key-sha256, simulator-api-key, supplier-webhook-secret
-      procure-audit-log-reader   password
       procure-connection-strings one key per AppHost connection name (ConnectionStrings__<name>): the Postgres databases, suppliersdb,
                                  assistantchatdb, rabbitmq, redis, auditlog; in-cluster host names; MongoDB with tls=true
       ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io from `gh auth token` (plan 07 ruling 7)
@@ -115,7 +114,6 @@ Set-ProcureSecret procure-api-keys ([ordered]@{
     'simulator-api-key'       = Get-Parameter 'simulator-api-key'
     'supplier-webhook-secret' = Get-Parameter 'supplier-webhook-secret'
 })
-Set-ProcureSecret procure-audit-log-reader ([ordered]@{ password = $auditLogReaderPassword })
 
 # --- Connection strings (controller ruling R2): the names the AppHost gives the apps (ConnectionStrings__<name>), in-cluster hosts. ---
 function New-NpgsqlConnectionString([string] $user, [string] $password, [string] $database) {
@@ -143,6 +141,11 @@ $connectionStrings['redis'] = "redis:6379,password=$redisPassword"
 # Audit reads the server's pgaudit log as audit_log_reader (ServiceResources.WithAuditLogReader, connection name "auditlog").
 $connectionStrings['auditlog'] = New-NpgsqlConnectionString 'audit_log_reader' $auditLogReaderPassword 'auditdb'
 Set-ProcureSecret procure-connection-strings $connectionStrings
+# Older bootstraps also made a Secret procure-audit-log-reader that nothing reads (the password is in procure-connection-strings/auditlog);
+# remove it so there is one place to rotate.
+$stale = & kubectl --context $KubeContext -n procure delete secret procure-audit-log-reader --ignore-not-found 2>&1
+if ($LASTEXITCODE -ne 0) { throw "kubectl delete secret procure-audit-log-reader failed: $stale" }
+if ($stale) { $results.Add("$stale") }
 
 # --- GHCR pull secret (plan 07 ruling 7): the token in Dale's gh keyring; plan 08 replaces it with a read:packages-only token. ---
 $gh = (Get-Command gh -ErrorAction SilentlyContinue)?.Source ?? 'C:\Program Files\GitHub CLI\gh.exe'
