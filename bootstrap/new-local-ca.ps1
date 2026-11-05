@@ -8,20 +8,35 @@
       procure.key / .crt       wildcard *.procure.localtest.me + procure.localtest.me (Traefik's default certificate)
       mongo.key / .crt / .pem  MongoDB server certificate for mongo / mongo.procure.svc.cluster.local (.pem = key + certificate)
     Existing files are kept; a leaf certificate is reissued only when it expires within 30 days.
+    The CA may only vouch for the names the cluster uses (X.509 name constraints, critical; final review M4): DNS localtest.me and its
+    subdomains (every *.procure.localtest.me host), the in-cluster names on MongoDB's certificate (mongo, mongo.procure,
+    mongo.procure.svc, procure.svc.cluster.local and below them, localhost) and the address 127.0.0.1. A certificate signed for any other
+    name fails validation in OpenSSL, .NET, Java, Go and Windows, so the CA is harmless if Dale imports it (trust-local-ca.ps1) or its key
+    leaks. A CA in the folder without exactly these constraints (one made before plan 08) is replaced, and every leaf with it.
     Cluster objects (kubectl apply, so a second run reports "unchanged"):
       procure/Secret procure-tls (kubernetes.io/tls)   + procure/TLSStore default (Traefik's default certificate)
       procure/Secret mongo-tls   (tls.crt, tls.key, ca.crt, mongo.pem)
       procure and observability/ConfigMap procure-ca   (key <openssl subject hash>.0 for SSL_CERT_DIR, and ca.crt)
     Browsers do not trust this CA unless Dale imports it himself (trust-local-ca.ps1, optional).
+    -CaDir and -FilesOnly (tests/Test-LocalCa.ps1): write the files into another folder and leave the cluster alone.
 #>
 [CmdletBinding()]
-param()
+param(
+    [string] $CaDir,
+    # Only the files: no cluster needed, no cluster objects written.
+    [switch] $FilesOnly
+)
 
 . (Join-Path $PSScriptRoot 'common.ps1')
-Assert-ClusterReachable
+if (-not $CaDir) { $CaDir = $LocalCaDir }
+if (-not $FilesOnly) { Assert-ClusterReachable }
 $openssl = Get-OpenSsl
 
-Set-CurrentUserOnlyAcl $LocalCaDir
+Set-CurrentUserOnlyAcl $CaDir
+
+# What the CA may sign (see the description); Test-LocalCa.ps1 checks the same list.
+$permittedNames = @('DNS:localtest.me', 'DNS:mongo', 'DNS:mongo.procure', 'DNS:mongo.procure.svc', 'DNS:procure.svc.cluster.local',
+    'DNS:localhost', 'IP:127.0.0.1/255.255.255.255')
 
 function Invoke-OpenSsl {
     $out = & $openssl @args 2>&1
@@ -34,22 +49,38 @@ function Test-CertificateCurrent([string] $path) {
     $cert.NotAfter -gt (Get-Date).AddDays(30)
 }
 
-$caKey = Join-Path $LocalCaDir 'ca.key'
-$caCrt = Join-Path $LocalCaDir 'ca.crt'
+function Test-CaConstrained([string] $path) {
+    # True when the CA carries exactly $permittedNames as its (critical) permitted subtrees and nothing excluded.
+    $text = (& $openssl x509 -in $path -noout -text 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { return $false }
+    if ($text -notmatch 'X509v3 Name Constraints: critical\s*\n\s*Permitted:\s*\n((?:\s+(?:DNS|IP):[^\n]+\n?)+)') { return $false }
+    if ($text -match 'Excluded:') { return $false }
+    $found = @($Matches[1] -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object)
+    ($found -join ',') -eq ((@($permittedNames) | Sort-Object) -join ',')
+}
+
+$caKey = Join-Path $CaDir 'ca.key'
+$caCrt = Join-Path $CaDir 'ca.crt'
 $caCreated = $false
-if (-not ((Test-Path $caKey) -and (Test-Path $caCrt))) {
+$caExists = (Test-Path $caKey) -and (Test-Path $caCrt)
+if ($caExists -and -not (Test-CaConstrained $caCrt)) {
+    Write-Host 'The local CA has no (or other) name constraints: replacing it and every certificate it issued...'
+    $caExists = $false
+}
+if (-not $caExists) {
     Write-Host 'Creating the local CA...'
     Invoke-OpenSsl req -x509 -new -newkey rsa:3072 -noenc -keyout $caKey -out $caCrt -days 3650 -sha256 `
         -subj '/O=procure-ai/CN=procure-ai local CA' `
         -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' `
         -addext 'keyUsage=critical,keyCertSign,cRLSign' `
-        -addext 'subjectKeyIdentifier=hash'
+        -addext 'subjectKeyIdentifier=hash' `
+        -addext ('nameConstraints=critical,' + (($permittedNames | ForEach-Object { "permitted;$_" }) -join ','))
     $caCreated = $true
 }
 
 function New-LeafCertificate([string] $name, [string] $commonName, [string[]] $altNames, [string] $extendedKeyUsage) {
-    $key = Join-Path $LocalCaDir "$name.key"
-    $crt = Join-Path $LocalCaDir "$name.crt"
+    $key = Join-Path $CaDir "$name.key"
+    $crt = Join-Path $CaDir "$name.crt"
     # A new CA invalidates every certificate the old one issued.
     if (-not $caCreated -and (Test-Path $key) -and (Test-CertificateCurrent $crt)) { return $false }
     Write-Host "Issuing $name certificate ($($altNames -join ', '))..."
@@ -83,11 +114,16 @@ New-LeafCertificate 'procure' 'procure.localtest.me' @('procure.localtest.me', '
 $mongoIssued = New-LeafCertificate 'mongo' 'mongo.procure.svc.cluster.local' @(
     'mongo', 'mongo.procure', 'mongo.procure.svc', 'mongo.procure.svc.cluster.local',
     'mongo-0.mongo', 'mongo-0.mongo.procure.svc.cluster.local', 'localhost', '127.0.0.1') 'serverAuth,clientAuth'
-$mongoPem = Join-Path $LocalCaDir 'mongo.pem'
+$mongoPem = Join-Path $CaDir 'mongo.pem'
 if ($mongoIssued -or -not (Test-Path $mongoPem)) {
     # mongod --tlsCertificateKeyFile wants key and certificate in one file.
-    $pem = (Get-Content -Raw (Join-Path $LocalCaDir 'mongo.key')) + (Get-Content -Raw (Join-Path $LocalCaDir 'mongo.crt'))
+    $pem = (Get-Content -Raw (Join-Path $CaDir 'mongo.key')) + (Get-Content -Raw (Join-Path $CaDir 'mongo.crt'))
     [IO.File]::WriteAllText($mongoPem, $pem)
+}
+
+if ($FilesOnly) {
+    Write-Host "Local CA in $CaDir (files only, no cluster objects)."
+    return
 }
 
 # --- Cluster objects ---
@@ -95,8 +131,8 @@ $hash = (& $openssl x509 -subject_hash -noout -in $caCrt).Trim()
 if ($LASTEXITCODE -ne 0 -or $hash -notmatch '^[0-9a-f]{8}$') { throw 'Could not compute the CA subject hash.' }
 
 Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name procure-tls -Type 'kubernetes.io/tls' -FileData ([ordered]@{
-    'tls.crt' = Join-Path $LocalCaDir 'procure.crt'
-    'tls.key' = Join-Path $LocalCaDir 'procure.key'
+    'tls.crt' = Join-Path $CaDir 'procure.crt'
+    'tls.key' = Join-Path $CaDir 'procure.key'
 })))
 Write-Host (Invoke-Apply ([ordered]@{
     apiVersion = 'traefik.io/v1alpha1'
@@ -106,8 +142,8 @@ Write-Host (Invoke-Apply ([ordered]@{
     spec       = [ordered]@{ defaultCertificate = [ordered]@{ secretName = 'procure-tls' } }
 }))
 Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name mongo-tls -Type 'kubernetes.io/tls' -FileData ([ordered]@{
-    'tls.crt'   = Join-Path $LocalCaDir 'mongo.crt'
-    'tls.key'   = Join-Path $LocalCaDir 'mongo.key'
+    'tls.crt'   = Join-Path $CaDir 'mongo.crt'
+    'tls.key'   = Join-Path $CaDir 'mongo.key'
     'ca.crt'    = $caCrt
     'mongo.pem' = $mongoPem
 })))
@@ -121,4 +157,4 @@ foreach ($namespace in 'procure', 'observability') {
         data       = [ordered]@{ "$hash.0" = $caPem; 'ca.crt' = $caPem }
     }))
 }
-Write-Host "Local CA in $LocalCaDir (subject hash $hash)."
+Write-Host "Local CA in $CaDir (subject hash $hash)."

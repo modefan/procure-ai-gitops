@@ -26,7 +26,7 @@ Every script is safe to run again (`kubectl apply`; files are created once). Aft
 | Script | What it does |
 |---|---|
 | `bootstrap/new-cluster.ps1` | Creates or starts the cluster (k3s image pinned in `bootstrap/common.ps1`), applies `coredns-custom.yaml`, creates the namespaces, waits for Traefik. |
-| `bootstrap/new-local-ca.ps1` | CA (10 years), wildcard `*.procure.localtest.me` and a MongoDB server certificate; Secrets `procure-tls` (Traefik's default certificate through the `default` TLSStore) and `mongo-tls`; ConfigMap `procure-ca` (`<subject hash>.0`, `ca.crt`) in `procure` and `observability`. |
+| `bootstrap/new-local-ca.ps1` | CA (10 years, name-constrained to `localtest.me`, MongoDB's in-cluster names and 127.0.0.1: it cannot vouch for any other site; an older unconstrained CA is replaced), wildcard `*.procure.localtest.me` and a MongoDB server certificate; Secrets `procure-tls` (Traefik's default certificate through the `default` TLSStore) and `mongo-tls`; ConfigMap `procure-ca` (`<subject hash>.0`, `ca.crt`) in `procure` and `observability`. |
 | `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-api-keys`, `procure-connection-strings` (one key per AppHost connection name), `ghcr-pull`; in `observability` `procure-keycloak` with only `dashboard-secret` (the Aspire dashboard's client). Generates missing new values into the user secrets first. |
 | `bootstrap/install-argocd.ps1` | Deploy keys (read-only for Argo CD on both repos, write on this repo for procure-ai's publish workflow, whose Actions secret `GITOPS_DEPLOY_KEY` it sets) in `%USERPROFILE%\.procure-ai\deploy-keys\`; Argo CD by Helm (chart version in `apps/values.yaml`, values `argocd/values.yaml`); repository Secrets; the root Application. |
 | `bootstrap/remove-cluster.ps1` | Deletes the cluster and all its data (asks first). Keeps the CA. |
@@ -63,6 +63,8 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
   `tests/Test-ApplicationHealth.ps1` runs the check (Lua, `winget install DEVCOM.Lua`) against `tests/health/application-health-cases.lua`.
 - Argo CD UI: https://argocd.procure.localtest.me, user `admin`, password in Secret `argocd/argocd-initial-admin-secret`
   (`kubectl --context k3d-procure -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}'`, base64).
+  `argocd.adminEnabled` and `argocd.ingressEnabled` in `envs/<env>/apps.yaml` (default on, as local) turn the admin user and the ingress
+  off for a public host (plan 08 ruling 4); the argocd Application and `install-argocd.ps1` both apply them.
 - Chart checks for `apps/`: `helm unittest apps` and `helm template root apps -f envs/local/apps.yaml -f envs/local/release.yaml |
   kubeconform -strict -summary -schema-location default -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'`
   (the Application schema from the CRDs catalog).
@@ -70,8 +72,11 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
   that revision with `deploy/scripts/build-images.ps1 -Tag <appRevision> -Registry ghcr.io/modefan`; the test imports them into k3d.
   `-WatchOnly` skips the delete and bootstrap and only checks the running cluster (after a deploy).
 - `tests/Test-Smoke.ps1` (also the last step of Test-FreshCluster): gateway and Keycloak through Traefik, demo login, seeded data with the
-  admin key, the observability Application, the dashboard's Keycloak sign-in (Tom refused, the admin with `dashboard-viewer` let in) and
-  its telemetry API answering 404.
+  admin key, the observability Application, the dashboard's Keycloak sign-in (Tom refused, the admin with `dashboard-viewer` let in),
+  its telemetry API answering 404, and that a pod in `procure` cannot reach the gateway or Keycloak directly with a spoofed
+  `X-Forwarded-For` (only through Traefik; plan 08 ruling 5).
+- `tests/Test-LocalCa.ps1` (no cluster needed): `new-local-ca.ps1 -FilesOnly` into a temp folder; the CA's name constraints, both leaves
+  verify, a certificate for any other name signed by the same CA does not, an old unconstrained CA is replaced.
 - `tests/Test-Upgrade.ps1` (plan 07 Review Focus 2): deploys two throwaway procure-ai revisions by a helm parameter on the root
   Application (branches `test-upgrade/*`, only requests-api built, the other app images retagged in the node): one with an empty
   migration (every `<name>-migrate` Job reruns and finishes before the new pods start) and one whose Requests migration fails (the old

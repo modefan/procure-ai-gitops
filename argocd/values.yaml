@@ -3,6 +3,9 @@
 # with the same chart and values, so a change here is deployed by a push to this repo.
 # Small on purpose: the node has 10 GB for everything (CLAUDE.md "My PC is shared"); one replica of each component, no Dex (the admin
 # user is enough for a local cluster), no notifications, no ApplicationSet controller.
+# Two switches per environment live in the apps chart, not here (plan 08 ruling 4): argocd.adminEnabled (configs.cm admin.enabled) and
+# argocd.ingressEnabled (server.ingress.enabled), set in envs/<env>/apps.yaml; the argocd Application passes them as valuesObject over this
+# file and install-argocd.ps1 passes them with --set. Local: both on. A public host: both off (port-forward; `argocd --core`).
 
 global:
   domain: argocd.procure.localtest.me
@@ -131,6 +134,7 @@ server:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 500m, memory: 192Mi }
   ingress:
+    # Default only: argocd.ingressEnabled (apps chart) decides.
     enabled: true
     ingressClassName: traefik
     hostname: argocd.procure.localtest.me

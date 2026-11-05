@@ -10,7 +10,9 @@
 {{- if .enabled }}
 {{- $sources := list
       (dict "repoURL" .chartRepo "chart" .chart "targetRevision" (toString .chartVersion)
-            "helm" (dict "releaseName" .releaseName "valueFiles" (list "$values/argocd/values.yaml")))
+            "helm" (dict "releaseName" .releaseName "valueFiles" (list "$values/argocd/values.yaml")
+                         "valuesObject" (dict "configs" (dict "cm" (dict "admin.enabled" (ne .adminEnabled false)))
+                                              "server" (dict "ingress" (dict "enabled" (ne .ingressEnabled false))))))
       (dict "repoURL" $.Values.repos.gitops "targetRevision" $.Values.repos.gitopsRevision "ref" "values") }}
 ---
 {{ include "procure-apps.application" (dict "root" $ "name" "argocd" "app" . "sources" $sources "finalizer" false) }}

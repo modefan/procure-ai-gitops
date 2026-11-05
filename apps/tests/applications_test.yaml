@@ -99,6 +99,14 @@ tests:
               helm:
                 releaseName: argocd
                 valueFiles: [$values/argocd/values.yaml]
+                # The environment's switches (argocd.adminEnabled, argocd.ingressEnabled); local keeps both on.
+                valuesObject:
+                  configs:
+                    cm:
+                      admin.enabled: true
+                  server:
+                    ingress:
+                      enabled: true
             - repoURL: git@github.com:modefan/procure-ai-gitops.git
               targetRevision: main
               ref: values
@@ -182,3 +190,22 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: platformImageTags.postgres must be a 40-character git tree hash
+
+  # Plan 08 ruling 4: a hosted environment has no public Argo CD (no ingress) and no admin user (no password login at all; the UI is
+  # reached by kubectl port-forward with a temporary switch, or `argocd --core`).
+  - it: argo cd has no ingress and no admin user when the environment turns them off
+    set:
+      argocd:
+        adminEnabled: false
+        ingressEnabled: false
+    documentSelector: { path: metadata.name, value: argocd }
+    asserts:
+      - equal:
+          path: spec.sources[0].helm.valuesObject
+          value:
+            configs:
+              cm:
+                admin.enabled: false
+            server:
+              ingress:
+                enabled: false

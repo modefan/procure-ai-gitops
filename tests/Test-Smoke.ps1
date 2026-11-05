@@ -15,6 +15,10 @@
     7. The dashboard's telemetry API (/api/telemetry/...) answers 404: it is switched off.
     8. Signed in at Keycloak (username page, password page, form_post), Tom (no dashboard-viewer role) does not get the dashboard, the
        admin (client role dashboard-viewer) does. The demo password comes from the AppHost user secrets and reaches curl in a file.
+    10. Only Traefik reaches the gateway and Keycloak (plan 08 ruling 5): both trust X-Forwarded-* from the pod network, so a curl pod in
+       namespace procure that sends X-Forwarded-For: 203.0.113.9 straight to the gateway's or Keycloak's Service is refused (the
+       connection times out or is rejected), while the same requests through Traefik answer 200 and the pod still reaches an ordinary
+       service (requests-api) directly.
     9. (first) The cluster's published ports (80, 443, the API) listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners),
        never on the PC's network interfaces (final review I1).
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
@@ -223,6 +227,60 @@ try {
             }
         }
         Remove-Item $passwordFile -Force
+    }
+
+    # --- 10. Only Traefik reaches the gateway and Keycloak -----------------------------------------------------------------------------
+    # One throwaway curl pod (no label any NetworkPolicy allows by name) runs every probe; it trusts the local CA from ConfigMap procure-ca.
+    # The control (requests-api, allowed for every pod of the namespace) is retried first: the policy controller adds a new pod's address
+    # to the allowed set a moment after it starts. Then each probe sends the spoofed header; curl exit 28 = timed out, 7 = rejected.
+    $probeScript = @'
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://requests-api:8080/health/ready); e=$?
+  [ "$c" = 200 ] && break; sleep 2
+done
+echo "PROBE control $c $e"
+xff='X-Forwarded-For: 203.0.113.9'
+c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "$xff" http://gateway:8080/health/ready); echo "PROBE direct-gateway $c $?"
+c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "$xff" http://keycloak:8080/realms/procure/.well-known/openid-configuration); echo "PROBE direct-keycloak $c $?"
+c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H "$xff" --connect-to procure.localtest.me:443:traefik.kube-system.svc.cluster.local:443 https://procure.localtest.me/health/ready); echo "PROBE traefik-gateway $c $?"
+c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H "$xff" https://auth.procure.localtest.me/realms/procure/.well-known/openid-configuration); echo "PROBE traefik-keycloak $c $?"
+'@
+    $probePod = 'smoke-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+    $overrides = [ordered]@{
+        apiVersion = 'v1'
+        spec       = [ordered]@{
+            automountServiceAccountToken = $false
+            securityContext              = [ordered]@{ runAsNonRoot = $true; runAsUser = 100; runAsGroup = 101; seccompProfile = @{ type = 'RuntimeDefault' } }
+            containers                   = @([ordered]@{
+                    name            = $probePod
+                    image           = 'docker.io/curlimages/curl:8.23.0'
+                    command         = @('sh', '-c', ($probeScript -replace "`r", ''))
+                    resources       = [ordered]@{ limits = [ordered]@{ memory = '64Mi'; cpu = '200m' }; requests = [ordered]@{ memory = '16Mi'; cpu = '10m' } }
+                    securityContext = [ordered]@{ allowPrivilegeEscalation = $false; readOnlyRootFilesystem = $true; capabilities = @{ drop = @('ALL') } }
+                    volumeMounts    = @([ordered]@{ name = 'ca'; mountPath = '/ca'; readOnly = $true })
+                })
+            volumes                      = @([ordered]@{ name = 'ca'; configMap = [ordered]@{ name = 'procure-ca' } })
+        }
+    } | ConvertTo-Json -Depth 10 -Compress
+    $out = & kubectl --context $KubeContext -n procure run $probePod --image=docker.io/curlimages/curl:8.23.0 --restart=Never --rm -i --quiet `
+        --labels='app.kubernetes.io/name=smoke-probe' --overrides=$overrides --pod-running-timeout=2m 2>&1 | ForEach-Object { "$_" }
+    & kubectl --context $KubeContext -n procure delete pod $probePod --ignore-not-found --wait=false 2>&1 | Out-Null
+    $probes = @{}
+    foreach ($line in $out) { if ($line -match '^PROBE (\S+) (\d{3}) (\d+)$') { $probes[$Matches[1]] = @{ Code = $Matches[2]; Exit = [int] $Matches[3] } } }
+    function Show([string] $name) { if ($probes.ContainsKey($name)) { "HTTP $($probes[$name].Code), curl exit $($probes[$name].Exit)" } else { 'no result' } }
+    if (-not $probes.ContainsKey('control') -or $probes['control'].Code -ne '200') {
+        Fail "probe pod could not reach requests-api directly ($(Show 'control')); output: $(($out | Select-Object -Last 5) -join ' | ')"
+    } else {
+        Pass 'a pod in procure reaches an ordinary service (requests-api) directly'
+        foreach ($name in 'direct-gateway', 'direct-keycloak') {
+            $p = $probes[$name]
+            if ($p -and $p.Code -eq '000' -and $p.Exit -in 7, 28) { Pass "$name with X-Forwarded-For: 203.0.113.9 is refused ($(if ($p.Exit -eq 28) { 'timed out' } else { 'rejected' }))" }
+            else { Fail "$name with X-Forwarded-For: 203.0.113.9 was not refused ($(Show $name)): only Traefik may connect" }
+        }
+        foreach ($name in 'traefik-gateway', 'traefik-keycloak') {
+            $p = $probes[$name]
+            if ($p -and $p.Code -eq '200') { Pass "$name (the same request through Traefik) answers 200" } else { Fail "$name answered $(Show $name), expected 200" }
+        }
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

@@ -20,6 +20,8 @@
     4. The root Application.
     Safe to run again. Prints names and fingerprints only, never a key.
     The admin password of the Argo CD UI (https://argocd.procure.localtest.me, user admin) is in Secret argocd/argocd-initial-admin-secret.
+    With argocd.adminEnabled / argocd.ingressEnabled false in envs/<Environment>/apps.yaml, Argo CD is installed without the admin user /
+    its ingress from the start.
 #>
 [CmdletBinding()]
 param(
@@ -133,9 +135,28 @@ if ($appsValues -notmatch '(?m)^\s+chartVersion:\s*"?([0-9][0-9A-Za-z.\-]*)"?\s*
 $chartVersion = $Matches[1]
 $chartRepo = 'https://argoproj.github.io/argo-helm'
 
-Write-Host "Installing Argo CD (chart argo-cd $chartVersion)..."
+# The environment's switches (argocd.adminEnabled, argocd.ingressEnabled: apps/values.yaml, overridden by envs/<env>/apps.yaml) as the
+# argocd Application passes them (apps/templates/applications.yaml), so the first install is never more open than what follows it.
+function Get-ArgoCdSwitch([string] $name) {
+    $value = $true
+    foreach ($file in (Join-Path $repoRoot 'apps/values.yaml'), (Join-Path $envDir 'apps.yaml')) {
+        # Lines of the top-level `argocd:` block (from its line to the next top-level key).
+        $inBlock = $false
+        foreach ($line in Get-Content $file) {
+            if ($line -match '^[A-Za-z]') { $inBlock = $line -match '^argocd:\s*(#.*)?$'; continue }
+            if ($inBlock -and $line -match "^\s+$($name):\s*(true|false)\s*(#.*)?$") { $value = $Matches[1] -eq 'true' }
+        }
+    }
+    $value
+}
+$adminEnabled = Get-ArgoCdSwitch 'adminEnabled'
+$ingressEnabled = Get-ArgoCdSwitch 'ingressEnabled'
+
+Write-Host "Installing Argo CD (chart argo-cd $chartVersion; admin user $(if ($adminEnabled) { 'on' } else { 'off' }), ingress $(if ($ingressEnabled) { 'on' } else { 'off' }))..."
 $out = & helm --kube-context $KubeContext upgrade --install argocd argo-cd --repo $chartRepo --version $chartVersion `
-    --namespace argocd -f (Join-Path $repoRoot 'argocd/values.yaml') --wait --timeout 10m 2>&1
+    --namespace argocd -f (Join-Path $repoRoot 'argocd/values.yaml') `
+    --set "configs.cm.admin\.enabled=$($adminEnabled.ToString().ToLowerInvariant())" `
+    --set "server.ingress.enabled=$($ingressEnabled.ToString().ToLowerInvariant())" --wait --timeout 10m 2>&1
 if ($LASTEXITCODE -ne 0) { throw "helm upgrade --install argocd failed: $($out -join [Environment]::NewLine)" }
 Write-Host "Argo CD is running."
 
