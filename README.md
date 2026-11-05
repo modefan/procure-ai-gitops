@@ -21,7 +21,9 @@ interfaces (checked by `new-cluster.ps1`, `Test-BootstrapIsIdempotent.ps1` and `
 ```
 
 Every script is safe to run again (`kubectl apply`; files are created once). After changing an AppHost user secret, rerun
-`new-secrets.ps1` and restart the pods that use it.
+`new-secrets.ps1` and restart the pods that use it. `new-secrets.ps1` keeps keys it no longer writes (pods of the previous revision may
+still use them); after Argo CD synced and rolled a revision that dropped keys, run `new-secrets.ps1 -Prune` (procure-ai
+`docs/kubernetes.md`, "Changing the shape of a Secret").
 
 | Script | What it does |
 |---|---|
@@ -54,8 +56,11 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
   retention keeps the newest 15 versions per image and every tag of the last 15 releases).
 - App Deployments roll with `maxSurge: 0` (envs/local/procure-ai.yaml): the node has no room for surge pods during a deploy.
 - CI writes here with the write deploy key, which is the secret `GITOPS_DEPLOY_KEY` of procure-ai's Environment `gitops` (deployment
-  branches: main only); install-argocd.ps1 creates the Environment and sets the secret.
-- Every Application syncs automatically (prune, self-heal, server-side apply, retries).
+  branches: main only); install-argocd.ps1 creates the Environment and sets the secret. procure-ai's weekly `retention` workflow only
+  reads this repo, with the read-only deploy key `procure-ai retention workflow (read-only)` (secret `GITOPS_READ_DEPLOY_KEY` of the
+  Environment `gitops-read`, main only; plan 08 Task 6).
+- Every Application syncs automatically (prune, self-heal, server-side apply, 3 retries 10 s, 20 s and 40 s apart). A sync whose retries
+  are spent (phase `Failed` or `Error`, e.g. a failing migration) makes the root Application `Degraded` (plan 08 ruling 9).
 - The platform turns Healthy only after the apps' migrations ran (each Debezium waits for its service's publication). So the root
   does not wait for the platform's health before the apps' wave: Application `platform` carries `procure-ai/wave-gate: synced`, and the
   Application health check in `argocd/values.yaml` lets the next wave start once it is Synced and its sync of the target revision

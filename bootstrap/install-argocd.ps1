@@ -13,8 +13,11 @@
          ci-gitops-write           write on modefan/procure-ai-gitops       (procure-ai's publish workflow bumps appRevision); its
                                    private half is the secret GITOPS_DEPLOY_KEY of the procure-ai
                                    Environment `gitops` (deployment branches: main only)
-       A key is generated once and added to GitHub when GitHub does not list it; the Actions secret is set when the CI key is new or the
-       secret is missing (-SetCiSecret sets it again). Needs `gh` signed in with admin rights on both repos.
+         gitops-retention-read     read-only on modefan/procure-ai-gitops   (procure-ai's retention workflow reads the releases); its
+                                   private half is the secret GITOPS_READ_DEPLOY_KEY of the procure-ai Environment `gitops-read`
+                                   (main only; plan 08 Task 6, so the weekly clean-up holds no write key)
+       A key is generated once and added to GitHub when GitHub does not list it; each Actions secret is set when its key is new or the
+       secret is missing (-SetCiSecret sets both again). Needs `gh` signed in with admin rights on both repos.
     2. Argo CD by Helm (chart argo/argo-cd at the version in apps/values.yaml, values argocd/values.yaml), waiting until it runs.
     3. Repository Secrets repo-procure-ai and repo-procure-ai-gitops in namespace argocd (server-side apply, no value printed).
     4. The root Application.
@@ -91,36 +94,41 @@ function Initialize-DeployKey([string] $name, [string] $repo, [bool] $write, [st
 Initialize-DeployKey 'argocd-procure-ai' $appRepo $false 'argocd-local (read-only)' | Out-Null
 Initialize-DeployKey 'argocd-procure-ai-gitops' $gitopsRepo $false 'argocd-local (read-only)' | Out-Null
 $ciKeyNew = Initialize-DeployKey 'ci-gitops-write' $gitopsRepo $true 'procure-ai publish workflow (write)'
+$retentionKeyNew = Initialize-DeployKey 'gitops-retention-read' $gitopsRepo $false 'procure-ai retention workflow (read-only)'
 
-# The CI key lives in the Environment `gitops` of procure-ai, which only the main branch may use (deployment branch policy), so a
-# workflow run on any other branch cannot read it. publish.yml's deploy job and retention.yml name that Environment.
+# Each CI key lives in an Environment of procure-ai that only the main branch may use (deployment branch policy), so a workflow run on any
+# other branch cannot read it: `gitops` (the write key) for publish.yml's deploy job, `gitops-read` (the read-only key) for retention.yml.
 function Invoke-Gh([string] $what) {
     $out = & $gh @args 2>&1
     if ($LASTEXITCODE -ne 0) { throw "$what failed: $out" }
     ($out | ForEach-Object { "$_" }) -join "`n"
 }
-$ghEnvironment = 'gitops'
-'{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' |
-    & $gh api -X PUT "repos/$appRepo/environments/$ghEnvironment" --input - 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "creating Environment $ghEnvironment on $appRepo failed." }
-$policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
-if ($policies -notmatch '(^|\s)branch:main(\s|$)') {
-    Invoke-Gh 'adding the main branch policy' api -X POST "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" -f name=main -f type=branch | Out-Null
-}
-$policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
-if ($policies.Trim() -ne 'branch:main') { throw "Environment $ghEnvironment on $appRepo allows '$policies'; expected only branch:main. Fix it on GitHub (Settings, Environments)." }
-Write-Host "Environment $ghEnvironment on $appRepo (deployment branches: main only)"
+function Initialize-KeyEnvironment([string] $ghEnvironment, [string] $secretName, [string] $keyName, [bool] $keyNew) {
+    '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' |
+        & $gh api -X PUT "repos/$appRepo/environments/$ghEnvironment" --input - 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "creating Environment $ghEnvironment on $appRepo failed." }
+    $policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
+    if ($policies -notmatch '(^|\s)branch:main(\s|$)') {
+        Invoke-Gh 'adding the main branch policy' api -X POST "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" -f name=main -f type=branch | Out-Null
+    }
+    $policies = Invoke-Gh 'listing deployment branch policies' api "repos/$appRepo/environments/$ghEnvironment/deployment-branch-policies" --jq '[.branch_policies[] | .type + ":" + .name] | join(" ")'
+    if ($policies.Trim() -ne 'branch:main') { throw "Environment $ghEnvironment on $appRepo allows '$policies'; expected only branch:main. Fix it on GitHub (Settings, Environments)." }
+    Write-Host "Environment $ghEnvironment on $appRepo (deployment branches: main only)"
 
-$envSecrets = Invoke-Gh 'gh secret list --env' secret list -R $appRepo --env $ghEnvironment --json name
-$hasCiSecret = @(($envSecrets | ConvertFrom-Json) | Where-Object name -eq 'GITOPS_DEPLOY_KEY').Count -gt 0
-if ($ciKeyNew -or $SetCiSecret -or -not $hasCiSecret) {
-    # The value goes through stdin, never a command line or the console.
-    $out = Get-Content -Raw (Join-Path $DeployKeyDir 'ci-gitops-write') | & $gh secret set GITOPS_DEPLOY_KEY -R $appRepo --env $ghEnvironment 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "gh secret set GITOPS_DEPLOY_KEY -R $appRepo --env $ghEnvironment failed: $out" }
-    Write-Host "Environment secret GITOPS_DEPLOY_KEY set ($appRepo, $ghEnvironment)"
-} else {
-    Write-Host "Environment secret GITOPS_DEPLOY_KEY exists ($appRepo, $ghEnvironment)"
+    $envSecrets = Invoke-Gh 'gh secret list --env' secret list -R $appRepo --env $ghEnvironment --json name
+    $hasSecret = @(($envSecrets | ConvertFrom-Json) | Where-Object name -eq $secretName).Count -gt 0
+    if ($keyNew -or $SetCiSecret -or -not $hasSecret) {
+        # The value goes through stdin, never a command line or the console.
+        $out = Get-Content -Raw (Join-Path $DeployKeyDir $keyName) | & $gh secret set $secretName -R $appRepo --env $ghEnvironment 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "gh secret set $secretName -R $appRepo --env $ghEnvironment failed: $out" }
+        Write-Host "Environment secret $secretName set ($appRepo, $ghEnvironment)"
+    } else {
+        Write-Host "Environment secret $secretName exists ($appRepo, $ghEnvironment)"
+    }
 }
+Initialize-KeyEnvironment 'gitops' 'GITOPS_DEPLOY_KEY' 'ci-gitops-write' $ciKeyNew
+Initialize-KeyEnvironment 'gitops-read' 'GITOPS_READ_DEPLOY_KEY' 'gitops-retention-read' $retentionKeyNew
+$ghEnvironment = 'gitops'
 # A repository-level copy (before the Environment existed) would be readable from every branch: remove it.
 $repoSecrets = Invoke-Gh 'gh secret list' secret list -R $appRepo --json name
 if (@(($repoSecrets | ConvertFrom-Json) | Where-Object name -eq 'GITOPS_DEPLOY_KEY').Count -gt 0) {
