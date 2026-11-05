@@ -67,7 +67,8 @@ platform:
   # this Application's sync succeeded (argocd/values.yaml, health check of argoproj.io/Application); its own health still shows the truth.
   waveGate: synced
 
-# Logs, traces and metrics (procure-ai deploy/charts/procure-observability, plan 07 Task 7). Off until that chart exists.
+# Logs, traces and metrics (procure-ai deploy/charts/procure-observability, plan 07 Task 7): the collector and the Aspire dashboard.
+# Off by default (an environment turns it on in envs/<env>/apps.yaml). No wave gate: it depends on nothing and turns Healthy in a minute.
 observability:
   enabled: false
   namespace: observability

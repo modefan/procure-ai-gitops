@@ -1,0 +1,8 @@
+# Values of the procure-observability chart (procure-ai deploy/charts/procure-observability) for the local k3d cluster `procure`:
+# the OpenTelemetry Collector (DaemonSet) and the Aspire dashboard at https://dashboard.procure.localtest.me (Keycloak sign-in,
+# dashboard-viewer only). No secrets here: the dashboard's client secret is Secret observability/procure-keycloak (bootstrap/new-secrets.ps1).
+hosts:
+  dashboard: dashboard.procure.localtest.me
+  keycloak: auth.procure.localtest.me
+ingressClassName: traefik
+appNamespace: procure

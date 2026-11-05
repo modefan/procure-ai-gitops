@@ -8,6 +8,9 @@
     3. Demo login as Tom (what the welcome page does: GET /bff/demo-login/users hands out the XSRF token, POST /bff/demo-login with it)
        returns 204 and the BFF session cookie __Host-procure, and /bff/user then answers 200.
     4. GET /api/v1/requests with the admin key (user env var DEMO_ADMIN_API_KEY) and X-Tenant-Id: acme returns seeded rows.
+    5. The Argo CD Application `observability` is Synced and Healthy (collector DaemonSet, Aspire dashboard).
+    6. The dashboard's root at https://dashboard.procure.localtest.me redirects to Keycloak's authorization endpoint for client
+       aspire-dashboard with the redirect URI https://dashboard.procure.localtest.me/signin-oidc (OIDC on, forwarded headers trusted).
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
     from pwsh). The admin key goes to curl in a header file that only the current user can read, never on a command line; nothing
     secret is printed. Exit code 1 on any failure.
@@ -16,6 +19,7 @@
 param(
     [string] $AppHost = 'procure.localtest.me',
     [string] $KeycloakHost = 'auth.procure.localtest.me',
+    [string] $DashboardHost = 'dashboard.procure.localtest.me',
     [string] $Tenant = 'acme'
 )
 
@@ -100,6 +104,30 @@ try {
             if ($count -gt 0) { Pass "GET /api/v1/requests (admin key, tenant $Tenant): $count seeded rows on the first page (total $($page.total))" }
             else { Fail "GET /api/v1/requests (admin key, tenant $Tenant) returned no rows (is the demo seed done?)" }
         }
+    }
+
+    # --- 5. The observability Application ------------------------------------------------------------------------------------------
+    $appJson = & kubectl --context $KubeContext -n argocd get application observability -o json 2>&1
+    if ($LASTEXITCODE -ne 0) { Fail "Argo CD Application observability not found: $appJson" }
+    else {
+        $app = ($appJson -join "`n") | ConvertFrom-Json
+        $sync = $app.status.sync.status; $health = $app.status.health.status
+        if ($sync -eq 'Synced' -and $health -eq 'Healthy') { Pass 'Argo CD Application observability is Synced and Healthy' }
+        else { Fail "Argo CD Application observability is $sync / $health" }
+    }
+
+    # --- 6. The dashboard signs in with Keycloak -----------------------------------------------------------------------------------
+    $r = Invoke-Curl "https://$DashboardHost/" @('-D', (Join-Path $work 'dashboard-headers.txt'))
+    $location = (Get-Content (Join-Path $work 'dashboard-headers.txt') -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match '^location:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -Last 1)
+    $authorize = "https://$KeycloakHost/realms/procure/protocol/openid-connect/auth?"
+    $redirect = "redirect_uri=$([Uri]::EscapeDataString("https://$DashboardHost/signin-oidc"))"
+    if ($r.Status -eq 302 -and $location -and $location.StartsWith($authorize) -and $location.Contains('client_id=aspire-dashboard') -and
+        $location.Contains($redirect)) {
+        Pass "https://$DashboardHost/ redirects to Keycloak (client aspire-dashboard, redirect URI https://$DashboardHost/signin-oidc)"
+    } else {
+        $shown = if ($location) { $location.Substring(0, [Math]::Min(300, $location.Length)) } else { '(no Location header)' }
+        Fail "https://$DashboardHost/ answered $($r.Status), Location: $shown"
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

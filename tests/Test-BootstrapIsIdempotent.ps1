@@ -61,8 +61,9 @@ function Get-ManagedVersions {
     $versions
 }
 $versionsBefore = Get-ManagedVersions
-# 12 Secrets (10 from new-secrets.ps1, procure-tls and mongo-tls), the TLSStore and procure-ca in two namespaces.
-if ($versionsBefore.Count -lt 15) { Fail "expected at least 15 bootstrap-managed objects, found $($versionsBefore.Count)" }
+# 13 Secrets (10 from new-secrets.ps1 in procure plus observability/procure-keycloak, procure-tls and mongo-tls), the TLSStore and
+# procure-ca in two namespaces.
+if ($versionsBefore.Count -lt 16) { Fail "expected at least 16 bootstrap-managed objects, found $($versionsBefore.Count)" }
 
 $applied = 0
 foreach ($script in 'new-local-ca.ps1', 'new-secrets.ps1') {
@@ -134,6 +135,16 @@ foreach ($name in $expectedSecrets.Keys) {
     if ($missing) { Fail "secret procure/$name lacks keys: $($missing -join ', ')" }
     elseif ($empty) { Fail "secret procure/$name has empty keys: $($empty -join ', ')" }
     else { Pass "secret procure/$name ($($expectedSecrets[$name].Count) keys)" }
+}
+# The Aspire dashboard's copy in observability holds its own client secret and nothing else.
+$json = & kubectl --context $KubeContext -n observability get secret procure-keycloak -o json 2>$null
+if ($LASTEXITCODE -ne 0) { Fail 'secret observability/procure-keycloak is missing' }
+else {
+    $data = ($json | ConvertFrom-Json -AsHashtable).data
+    $keys = @($data.Keys)
+    if ($keys.Count -ne 1 -or $keys[0] -ne 'dashboard-secret' -or [string]::IsNullOrEmpty($data['dashboard-secret'])) {
+        Fail "secret observability/procure-keycloak must hold only a non-empty dashboard-secret (has: $($keys -join ', '))"
+    } else { Pass 'secret observability/procure-keycloak (dashboard-secret only)' }
 }
 $ghcrType = & kubectl --context $KubeContext -n procure get secret ghcr-pull -o jsonpath='{.type}' 2>$null
 if ($ghcrType -ne 'kubernetes.io/dockerconfigjson') { Fail "secret ghcr-pull has type '$ghcrType', expected kubernetes.io/dockerconfigjson" }

@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Creates the Kubernetes Secrets in namespace `procure` from the AppHost user secrets (the one source of every secret, plan 07 ruling 5).
+    Creates the Kubernetes Secrets in namespaces `procure` and `observability` from the AppHost user secrets (the one source of every secret, plan 07 ruling 5).
 .DESCRIPTION
     Reads `dotnet user-secrets` of the AppHost (UserSecretsId procure-ai-apphost). Values that are new in plan 07 and not there yet
     (keycloak-db-password, keycloak-dashboard-secret, debezium-mongo-password) are generated once (32 letters and digits) and written to
@@ -22,6 +22,8 @@
       procure-connection-strings one key per AppHost connection name (ConnectionStrings__<name>): the Postgres databases, suppliersdb,
                                  assistantchatdb, rabbitmq, redis, auditlog; in-cluster host names; MongoDB with tls=true
       ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io from `gh auth token` (plan 07 ruling 7)
+    In namespace observability (a pod reads Secrets of its own namespace only):
+      procure-keycloak           dashboard-secret only (the Aspire dashboard's Keycloak client aspire-dashboard)
 #>
 [CmdletBinding()]
 param(
@@ -108,6 +110,10 @@ Set-ProcureSecret procure-keycloak ([ordered]@{
     'dashboard-secret'    = Get-Parameter 'keycloak-dashboard-secret'
     'db-password'         = Get-Parameter 'keycloak-db-password'
 })
+# The Aspire dashboard (namespace observability) gets only its own client secret, not the other Keycloak values.
+$results.Add((Invoke-Apply (New-SecretObject -Namespace observability -Name procure-keycloak -Data ([ordered]@{
+    'dashboard-secret' = Get-Parameter 'keycloak-dashboard-secret'
+}))))
 Set-ProcureSecret procure-debezium ([ordered]@{
     'postgres-password' = Get-Parameter 'debezium-password'
     'mongo-password'    = Get-Parameter 'debezium-mongo-password'
@@ -160,4 +166,4 @@ $dockerConfig = [ordered]@{ auths = [ordered]@{ 'ghcr.io' = [ordered]@{
 Set-ProcureSecret ghcr-pull ([ordered]@{ '.dockerconfigjson' = $dockerConfig }) 'kubernetes.io/dockerconfigjson'
 
 $results | ForEach-Object { Write-Host $_ }
-Write-Host "Secrets in namespace procure: $($results.Count) applied (names only shown)."
+Write-Host "Secrets in namespaces procure and observability: $($results.Count) applied (names only shown)."

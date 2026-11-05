@@ -26,7 +26,7 @@ Every script is safe to run again (`kubectl apply`; files are created once). Aft
 |---|---|
 | `bootstrap/new-cluster.ps1` | Creates or starts the cluster (k3s image pinned in `bootstrap/common.ps1`), applies `coredns-custom.yaml`, creates the namespaces, waits for Traefik. |
 | `bootstrap/new-local-ca.ps1` | CA (10 years), wildcard `*.procure.localtest.me` and a MongoDB server certificate; Secrets `procure-tls` (Traefik's default certificate through the `default` TLSStore) and `mongo-tls`; ConfigMap `procure-ca` (`<subject hash>.0`, `ca.crt`) in `procure` and `observability`. |
-| `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-api-keys`, `procure-audit-log-reader`, `procure-connection-strings` (one key per AppHost connection name), `ghcr-pull`. Generates missing new values into the user secrets first. |
+| `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-api-keys`, `procure-audit-log-reader`, `procure-connection-strings` (one key per AppHost connection name), `ghcr-pull`; in `observability` `procure-keycloak` with only `dashboard-secret` (the Aspire dashboard's client). Generates missing new values into the user secrets first. |
 | `bootstrap/install-argocd.ps1` | Deploy keys (read-only for Argo CD on both repos, write on this repo for procure-ai's publish workflow, whose Actions secret `GITOPS_DEPLOY_KEY` it sets) in `%USERPROFILE%\.procure-ai\deploy-keys\`; Argo CD by Helm (chart version in `apps/values.yaml`, values `argocd/values.yaml`); repository Secrets; the root Application. |
 | `bootstrap/remove-cluster.ps1` | Deletes the cluster and all its data (asks first). Keeps the CA. |
 | `bootstrap/trust-local-ca.ps1` | Optional, run by hand: trusts the local CA for the current Windows user so browsers accept the certificates (`-Remove` undoes it). |
@@ -43,7 +43,7 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
   -> Argo CD (polls every 2-3 min) -> root Application renders apps/ with envs/local/{apps,release}.yaml
        wave -2 argocd         Argo CD manages itself (chart argo-cd, values argocd/values.yaml)
        wave -1 platform       procure-ai deploy/charts/procure-platform @ appRevision + envs/local/platform.yaml
-       wave -1 observability  procure-ai deploy/charts/procure-observability (off until plan 07 Task 7)
+       wave -1 observability  procure-ai deploy/charts/procure-observability @ appRevision + envs/local/observability.yaml
        wave  0 procure-ai     procure-ai deploy/charts/procure-ai @ appRevision + envs/local/procure-ai.yaml
 ```
 

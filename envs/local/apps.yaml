@@ -1,5 +1,5 @@
 # Values of the app of apps (apps/) for the local k3d cluster `procure`. The revision is in release.yaml.
 env: local
 observability:
-  # Plan 07 Task 7 adds deploy/charts/procure-observability and envs/local/observability.yaml, then turns this on.
-  enabled: false
+  # The collector and the Aspire dashboard (procure-ai deploy/charts/procure-observability, values envs/local/observability.yaml).
+  enabled: true
