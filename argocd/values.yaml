@@ -33,8 +33,10 @@ configs:
     # at the revisions its spec asks for has finished: Argo CD may call a just-created Application Healthy before its first sync, and
     # right after the root changed an Application's targetRevision (a deploy) its status still shows the previous, finished sync. So
     # every source pinned to a full commit SHA must be the revision Argo compared (status.sync), with sync status Synced and no sync
-    # running (not the last sync's revision: a revision that changes nothing for an Application gets no new sync). A failed sync is retried by the Application's own retry policy, so it is Progressing too, with the
-    # reason. After that it reports its own health, with one exception: with annotation procure-ai/wave-gate: synced it counts as
+    # running (not the last sync's revision: a revision that changes nothing for an Application gets no new sync). A failed sync that Argo
+    # CD still retries (its retry policy keeps the phase Running between attempts) is Progressing too, with the reason. A sync whose last
+    # phase is Failed or Error (every retry spent, e.g. a failing migration hook) is Degraded (plan 08 ruling 9): the root then shows the
+    # failure instead of Progressing for ever. After that it reports its own health, with one exception: with annotation procure-ai/wave-gate: synced it counts as
     # Healthy for the wave order as soon as it is Synced, even while its pods are still Progressing. The platform needs that: it becomes
     # Healthy only after the apps' migrations (next wave) created the publications its Debezium servers wait for.
     # Tested by tests/Test-ApplicationHealth.ps1 (Lua); the order on a cluster by tests/Test-FreshCluster.ps1.
@@ -65,6 +67,38 @@ configs:
       if obj.status.sync ~= nil then
         sync = obj.status.sync.status
       end
+      local targets = {}
+      local compared = {}
+      if obj.spec.sources ~= nil then
+        for i, source in ipairs(obj.spec.sources) do
+          targets[i] = source.targetRevision
+        end
+        if obj.status.sync ~= nil and obj.status.sync.revisions ~= nil then
+          compared = obj.status.sync.revisions
+        end
+      elseif obj.spec.source ~= nil then
+        targets[1] = obj.spec.source.targetRevision
+        if obj.status.sync ~= nil then
+          compared[1] = obj.status.sync.revision
+        end
+      end
+      -- Every source pinned to a full commit SHA (40 characters; chart versions and branch names are shorter; Argo CD's Lua has no string
+      -- library) compared at that SHA: the status is about the revisions the spec asks for, not an earlier deploy's.
+      local atTarget = true
+      local notAt = ""
+      for i, target in pairs(targets) do
+        if type(target) == "string" and #target == 40 and compared[i] ~= target then
+          atTarget = false
+          notAt = "Source " .. i .. " compared at " .. tostring(compared[i]) .. ", target " .. target
+        end
+      end
+      -- Every retry spent (Argo CD keeps the phase Running between attempts): Degraded, so the root shows the failure (plan 08 ruling 9).
+      -- Only for the current target: a failed sync of an earlier target is history once the root asked for a new one.
+      if (op == "Failed" or op == "Error") and atTarget then
+        hs.status = "Degraded"
+        hs.message = "Sync " .. op .. ": " .. opMessage
+        return hs
+      end
       if op ~= "Succeeded" then
         if op ~= nil then
           hs.message = "Sync " .. op .. ": " .. opMessage
@@ -75,30 +109,12 @@ configs:
         hs.message = "Sync status " .. tostring(sync)
         return hs
       end
-      local targets = {}
-      local compared = {}
-      if obj.spec.sources ~= nil then
-        for i, source in ipairs(obj.spec.sources) do
-          targets[i] = source.targetRevision
-        end
-        if obj.status.sync.revisions ~= nil then
-          compared = obj.status.sync.revisions
-        end
-      elseif obj.spec.source ~= nil then
-        targets[1] = obj.spec.source.targetRevision
-        compared[1] = obj.status.sync.revision
-      end
-      for i, target in pairs(targets) do
-        -- A full commit SHA (40 characters; chart versions and branch names are shorter). Argo CD's Lua has no string library.
-        if type(target) == "string" and #target == 40 then
-          -- Synced (checked above) at the target revision: the live state is that revision's. No check on the last sync's
-          -- revision: a revision that renders the same manifests (e.g. an app-only deploy for the platform) is Synced without a new
-          -- sync, so requiring one would block the next wave forever.
-          if compared[i] ~= target then
-            hs.message = "Source " .. i .. " compared at " .. tostring(compared[i]) .. ", target " .. target
-            return hs
-          end
-        end
+      -- Synced (checked above) at the target revision: the live state is that revision's. No check on the last sync's revision: a
+      -- revision that renders the same manifests (e.g. an app-only deploy for the platform) is Synced without a new sync, so requiring
+      -- one would block the next wave forever.
+      if not atTarget then
+        hs.message = notAt
+        return hs
       end
       local gate = obj.metadata.annotations ~= nil and obj.metadata.annotations["procure-ai/wave-gate"] == "synced"
       if gate and health ~= "Degraded" then

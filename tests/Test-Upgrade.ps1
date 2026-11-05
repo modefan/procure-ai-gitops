@@ -11,8 +11,8 @@
        pods of its app started; every app Deployment runs the new revision; the empty migration is in Requests' migration history.
     2. Broken revision: test-upgrade/broken-<stamp> adds a Requests migration that raises an error, so `requests-api --migrate` exits 1.
        Checks: the new requests-migrate Job fails, and for -BrokenObserveSeconds the old requests-api pods keep running and serving (every app
-       Deployment stays at the no-op revision), the procure-ai sync does not succeed and the root Application does not count procure-ai as
-       Healthy.
+       Deployment stays at the no-op revision), the procure-ai sync does not succeed, and within -DegradedWithinMinutes of the deploy (every
+       retry spent: 3, apps/values.yaml) its last sync is Failed and the root Application is Degraded (plan 08 ruling 9).
     3. Always (also after a failure): the running sync is terminated, the root's parameter removed, and the script waits until everything is
        back at the release's appRevision; then the test migrations' history rows, the throwaway branches, the worktree and the test image
        tags are removed. Rerunnable: a parameter or branches left by an interrupted run are cleaned up first.
@@ -30,6 +30,8 @@ param(
     [string] $AppHost = 'procure.localtest.me',
     [int] $DeployTimeoutMinutes = 20,
     [int] $BrokenObserveSeconds = 180,
+    # The root must turn Degraded within this many minutes of the broken revision's deploy (plan 08 ruling 9).
+    [int] $DegradedWithinMinutes = 5,
     [double] $MinFreeGB = 3.5
 )
 
@@ -323,6 +325,7 @@ try {
     $before = Get-AppDeployments
     $requestsJobBefore = (Get-MigrationJobs)['requests-migrate'].Uid
     Write-Step "Deploying $(Short $broken)"
+    $brokenSince = Get-Date
     Set-RootRevision $broken
     $deadline = (Get-Date).AddMinutes(10)
     while ($true) {
@@ -356,19 +359,30 @@ try {
     else { Pass "every app Deployment stayed at $(Short $noop); the old requests-api pod(s) $(($before['requests-api'].Pods | ForEach-Object Name) -join ', ') kept running, Ready" }
     $status = Test-ServesRequests
     if ($status -eq '200') { Pass 'GET /api/v1/requests (admin key) answers 200: the old Requests pods serve' } else { Fail "GET /api/v1/requests answered $status" }
-    $app = Get-App 'procure-ai'
-    $phase = Get-Prop $app 'status.operationState.phase'; $message = Get-Prop $app 'status.operationState.message'
-    $health = Get-Prop $app 'status.health.status'; $sync = Get-Prop $app 'status.sync.status'
     # Argo CD 3 keeps the health of an Application's resources out of its status (only in its cache), so the root's own health, which
-    # aggregates its Applications' health from the check in argocd/values.yaml, is what shows: Progressing while procure-ai's sync fails.
-    $root = Get-App 'root'
-    $rootHealth = Get-Prop $root 'status.health.status'
-    $rootMessage = Get-Prop $root 'status.health.message'
-    Write-Host "  procure-ai: sync $sync, health $health, last sync $phase ($message); the root Application: $rootHealth $rootMessage"
+    # aggregates its Applications' health from the check in argocd/values.yaml, is what shows: Progressing while procure-ai's sync is
+    # retried, Degraded once every retry is spent (phase Failed).
+    $degradedBy = $brokenSince.AddMinutes($DegradedWithinMinutes)
+    $lastRoot = ''
+    while ($true) {
+        Assert-Memory
+        $app = Get-App 'procure-ai'
+        $phase = Get-Prop $app 'status.operationState.phase'; $message = Get-Prop $app 'status.operationState.message'
+        $health = Get-Prop $app 'status.health.status'; $sync = Get-Prop $app 'status.sync.status'
+        $root = Get-App 'root'
+        $rootHealth = Get-Prop $root 'status.health.status'
+        $rootMessage = Get-Prop $root 'status.health.message'
+        $line = "procure-ai: sync $sync, health $health, last sync $phase; the root Application: $rootHealth"
+        if ($line -ne $lastRoot) { Write-Host "  $(Get-Date -Format HH:mm:ss) $line"; $lastRoot = $line }
+        if ($rootHealth -eq 'Degraded' -or (Get-Date) -gt $degradedBy) { break }
+        Start-Sleep -Seconds 5
+    }
+    $after = [math]::Round(((Get-Date) - $brokenSince).TotalSeconds)
+    Write-Host "  procure-ai's last sync: $phase ($message); the root: $rootHealth $rootMessage"
     if ($phase -eq 'Succeeded' -and @(Get-Prop $app 'status.operationState.syncResult.revisions')[0] -eq $broken) { Fail 'the procure-ai sync of the broken revision succeeded' }
     else { Pass "the procure-ai sync of $(Short $broken) did not succeed (phase $phase)" }
-    if (-not $rootHealth -or $rootHealth -eq 'Healthy') { Fail "the root Application is '$rootHealth' while procure-ai's migration fails (expected not Healthy)" }
-    else { Pass "the root Application is $rootHealth, not Healthy, while procure-ai's migration fails" }
+    if ($rootHealth -ne 'Degraded') { Fail "the root Application is '$rootHealth' $DegradedWithinMinutes minutes after the broken deploy (expected Degraded)" }
+    else { Pass "the root Application turned Degraded $after s after the broken deploy (limit $DegradedWithinMinutes min)" }
 } catch {
     Fail "$($_.Exception.Message)"
 } finally {

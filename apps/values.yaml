@@ -21,7 +21,9 @@ destination:
 project: default
 
 # Every Application syncs on its own: prune what left git, undo manual changes, server-side apply (large CRDs, no
-# last-applied-configuration). Retries matter on a fresh cluster, where a first sync can fail while a dependency is still starting.
+# last-applied-configuration). Retries matter on a fresh cluster, where a first sync can fail while a dependency is still starting. Three
+# (plan 08 ruling 9, was 10): every retry reruns every migration hook, and only a sync with every retry spent is Failed, which the root's
+# health check (argocd/values.yaml) reports as Degraded; with 10 a failing migration kept the root Progressing for well over half an hour.
 syncPolicy:
   automated:
     prune: true
@@ -29,11 +31,13 @@ syncPolicy:
   syncOptions:
     - ServerSideApply=true
   retry:
-    limit: 10
+    limit: 3
+    # 10 s, 20 s, 40 s between the four attempts (was 20 s doubling to 3 min): with procure-app's migration Jobs not retrying pods
+    # (backoffLimit 0), a failing migration is Failed, and the root Degraded, within about 5 minutes (tests/Test-Upgrade.ps1).
     backoff:
-      duration: 20s
+      duration: 10s
       factor: 2
-      maxDuration: 3m
+      maxDuration: 1m
 
 # Fields the API server adds that the charts do not set, so Argo CD's diff would show every StatefulSet with a PVC template as
 # OutOfSync forever (and the automated sync would rerun its hooks again and again).
