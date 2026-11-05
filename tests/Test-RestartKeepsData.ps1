@@ -6,12 +6,14 @@
 .DESCRIPTION
     On the running local cluster `procure` (converged, e.g. after Test-FreshCluster.ps1 or a deploy):
     1. Counts, per tenant: purchase requests (requestsdb), business events and data changes (Audit's Marten documents in auditdb); the
-       supplier documents (MongoDB suppliersdb); and each Debezium replication slot's confirmed position (pg_replication_slots).
+       supplier documents (MongoDB suppliersdb); and each Debezium replication slot's confirmed position (pg_replication_slots). A slot
+       must still exist afterwards; its position may be back at the last checkpoint after the unclean node stop (Postgres saves slot
+       positions only at checkpoints and sends the changes since again), which the equal data change counts show to be harmless.
     2. `k3d cluster stop procure`, `k3d cluster start procure`, then waits until everything is converged again (Test-FreshCluster.ps1
        -WatchOnly: every Application Synced and Healthy, every pod Ready, nothing restarting, smoke checks).
     3. Deletes the postgres-0 and mongo-0 pods and waits again.
     4. Waits -SettleSeconds (a Debezium that lost its offset and snapshots again, or replays, would add data changes in that time), then
-       compares: every count equal, every slot still there and not behind its old position, every Debezium pod Ready with no restart
+       compares: every count equal, every slot still there, every Debezium pod Ready with no restart
        since the wait.
     5. Creates a purchase request with the admin key and checks that its insert reaches the data change log (Debezium -> RabbitMQ -> Audit)
        within -CaptureSeconds, attributed to the app (not "outside the app").
@@ -115,6 +117,7 @@ try {
 
     # --- 2. Cluster stop and start ----------------------------------------------------------------------------------------------------
     Write-Step "k3d cluster stop $ClusterName"
+    $stoppedAt = [datetime]::UtcNow
     & k3d cluster stop $ClusterName
     if ($LASTEXITCODE -ne 0) { throw 'k3d cluster stop failed.' }
     Write-Step "k3d cluster start $ClusterName"
@@ -126,6 +129,13 @@ try {
         Start-Sleep -Seconds 5
     }
     Wait-Converged 'the cluster restart'
+    # For the record: did Postgres shut down cleanly with the node, or recover from its WAL (then slot positions fall back to the last checkpoint)?
+    $pgLog = & kubectl --context $KubeContext -n procure logs postgres-0 -c postgres --tail 400 2>&1
+    # Only lines written since the stop (the log can hold older lines): they start with "yyyy-MM-dd HH:mm:ss.fff UTC".
+    $recovered = @($pgLog | Where-Object {
+            "$_" -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+ UTC .*(not properly shut down|was interrupted|automatic recovery)' -and
+            [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture) -ge $stoppedAt.AddSeconds(-1) })
+    Write-Host "  Postgres after the cluster start: $(if ($recovered) { "crash recovery from the WAL ($("$($recovered[0])".Trim()))" } else { 'clean start' })"
 
     # --- 3. Database pods deleted ---------------------------------------------------------------------------------------------------
     Write-Step 'Deleting the postgres-0 and mongo-0 pods'
@@ -148,7 +158,12 @@ try {
     }
     foreach ($slot in $slotsBefore.Keys) {
         if (-not $slotsAfter.ContainsKey($slot)) { Fail "replication slot $slot is gone" }
-        elseif ($slotsAfter[$slot] -lt $slotsBefore[$slot]) { Fail "replication slot $slot went back from $($slotsBefore[$slot]) to $($slotsAfter[$slot])" }
+        elseif ($slotsAfter[$slot] -lt $slotsBefore[$slot]) {
+            # Postgres saves a slot's position only at checkpoints: after an unclean stop (k3d stops the node without draining it) the slot is
+            # back at its last checkpoint and the changes since are decoded again. Debezium resumes from its own offset and Audit stores a
+            # change once by its log position, so nothing is lost or stored twice: the equal data change counts above check that.
+            Pass "replication slot $slot kept; back at its last checkpointed position ($($slotsBefore[$slot]) -> $($slotsAfter[$slot])), changes since then are sent again and deduplicated"
+        }
         else { Pass "replication slot $slot kept (position $($slotsBefore[$slot]) -> $($slotsAfter[$slot]))" }
     }
     $debeziumPods = Get-DebeziumPods
