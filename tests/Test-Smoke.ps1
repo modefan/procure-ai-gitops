@@ -23,6 +23,10 @@
        statements mark it), every CREATE TABLE in a service database (the migrations' and Wolverine's start-up DDL) in today's server log
        was run by that service's own role <service>_app, never by the superuser postgres, and at least five databases show one. Read in the
        postgres pod as the superuser through Audit's own log tables (auditdb, pgaudit.log_<weekday>).
+    12. The realm in Git matches the server (plan 08 ruling 7): the realm file baked into the deployed Keycloak image, its non-secret
+       placeholders filled in, against Keycloak's partial export (kcadm in the pod): each of the file's clients' redirect URIs, web
+       origins, post-logout redirect URIs, client scopes and client roles, the file's client scopes and their mappers, the realm roles.
+       A change made by hand in the admin console shows here until the keycloak-config Job of the next sync puts the file back.
     9. (first) The cluster's published ports (80, 443, the API) listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners),
        never on the PC's network interfaces (final review I1).
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
@@ -302,7 +306,7 @@ SELECT DISTINCT database_name || '|' || user_name FROM log, roles_run
     if ($LASTEXITCODE -ne 0) { Fail "reading today's pgaudit log in postgres-0 failed: $(($rows | Select-Object -Last 3) -join ' | ')" }
     else {
         $seen = @($rows | Where-Object { $_ -match '^(\w+db)\|(\S+)$' } | ForEach-Object { [pscustomobject]@{ Database = $Matches[1]; Role = $Matches[2] } })
-        $databases = @($seen.Database | Sort-Object -Unique)
+        $databases = @($seen | ForEach-Object Database | Sort-Object -Unique)
         if ($databases.Count -lt 5) { Fail "today's pgaudit log names CREATE TABLE since the last roles.sql run in only $($databases.Count) service database(s): $(($rows | Select-Object -First 5) -join ' | ')" }
         foreach ($database in $databases) {
             $expected = ($database -replace 'db$', '') + '_app'
@@ -310,6 +314,65 @@ SELECT DISTINCT database_name || '|' || user_name FROM log, roles_run
             if ($roles.Count -eq 1 -and $roles[0] -eq $expected) { Pass "pgaudit: every CREATE TABLE in $database since roles.sql ran was run by $expected" }
             else { Fail "pgaudit: CREATE TABLE in $database since roles.sql ran was run by $($roles -join ', '), expected only $expected" }
         }
+    }
+
+    # --- 12. The realm in Git matches the server -------------------------------------------------------------------------------------
+    # The realm file of the deployed Keycloak image (infra/keycloak/procure-realm.json at the deployed revision) with its non-secret
+    # placeholders filled in as the chart fills them, against Keycloak's partial export (secrets masked) read with kcadm in the pod: per
+    # client of the file its redirect URIs, web origins, post-logout redirect URIs, default and optional client scopes (those that exist)
+    # and client roles; the file's client scopes with their mappers; the realm roles (plus Keycloak's own). The keycloak-config Job
+    # (plan 08 ruling 7) keeps them equal on every sync. kcadm gets the admin password from the pod's environment (KC_CLI_PASSWORD).
+    $kcadmExport = @'
+export KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD"; k=/opt/keycloak/bin/kcadm.sh; c=/tmp/kcadm-smoke.config
+$k config credentials --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --config $c >/dev/null 2>&1 &&
+  $k create partial-export -r procure -q exportClients=true -q exportGroupsAndRoles=true -o --config $c; rc=$?; rm -f $c; exit $rc
+'@
+    $realmText = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- cat /opt/keycloak/data/import/procure-realm.json 2>&1
+    $realmOk = $LASTEXITCODE -eq 0
+    $liveText = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '')
+    if (-not $realmOk -or $LASTEXITCODE -ne 0) { Fail "reading the realm file or Keycloak's partial export failed (kubectl exec into deploy/keycloak)" }
+    else {
+        # ${NAME} and ${NAME:default}, as Keycloak and the keycloak-config Job resolve them; the secret placeholders are not compared.
+        $placeholders = @{ KC_APP_BASE_URL = "https://$AppHost"; KC_DASHBOARD_BASE_URL = "https://$DashboardHost" }
+        $expanded = [regex]::Replace(($realmText -join "`n"), '\$\{(KC_[A-Z0-9_]+)(?::([^}]*))?\}', {
+                param($m)
+                if ($placeholders.ContainsKey($m.Groups[1].Value)) { $placeholders[$m.Groups[1].Value] } elseif ($m.Groups[2].Success) { $m.Groups[2].Value } else { $m.Value }
+            })
+        $want = $expanded | ConvertFrom-Json -AsHashtable
+        $live = ($liveText -join "`n") | ConvertFrom-Json -AsHashtable
+        $drift = [System.Collections.Generic.List[string]]::new()
+        function Compare-Set([string] $what, $expected, $actual) {
+            $e = @($expected | Where-Object { $_ } | Sort-Object -Unique); $a = @($actual | Where-Object { $_ } | Sort-Object -Unique)
+            if (($e -join "`n") -ne ($a -join "`n")) { $drift.Add("$what is [$($a -join ', ')] on the server, [$($e -join ', ')] in Git") }
+        }
+        # Hashtables throughout ($h['key'] is $null for a missing key under strict mode).
+        function Get-Names($items) { @($items | Where-Object { $_ } | ForEach-Object { $_['name'] }) }
+        $liveScopes = Get-Names $live['clientScopes']
+        $wantClientRoles = if ($want['roles']) { $want['roles']['client'] }
+        $liveClientRoles = if ($live['roles']) { $live['roles']['client'] }
+        foreach ($client in $want['clients']) {
+            $id = $client['clientId']
+            $server = @($live['clients'] | Where-Object { $_['clientId'] -eq $id }) | Select-Object -First 1
+            if (-not $server) { $drift.Add("client $id is missing on the server"); continue }
+            foreach ($field in 'redirectUris', 'webOrigins') { if ($client.ContainsKey($field)) { Compare-Set "client $id $field" $client[$field] $server[$field] } }
+            foreach ($field in 'defaultClientScopes', 'optionalClientScopes') {
+                # Keycloak skips a listed scope that the realm does not have (the file names email and roles for the AppHost's realm).
+                if ($client.ContainsKey($field)) { Compare-Set "client $id $field" @($client[$field] | Where-Object { $_ -in $liveScopes }) $server[$field] }
+            }
+            $logout = if ($client['attributes']) { $client['attributes']['post.logout.redirect.uris'] }
+            $liveLogout = if ($server['attributes']) { $server['attributes']['post.logout.redirect.uris'] }
+            if ($logout) { Compare-Set "client $id post.logout.redirect.uris" ($logout -split '##') ("$liveLogout" -split '##') }
+            Compare-Set "client $id roles" (Get-Names ($wantClientRoles ? $wantClientRoles[$id] : $null)) (Get-Names ($liveClientRoles ? $liveClientRoles[$id] : $null))
+        }
+        foreach ($scope in $want['clientScopes']) {
+            $server = @($live['clientScopes'] | Where-Object { $_['name'] -eq $scope['name'] }) | Select-Object -First 1
+            if (-not $server) { $drift.Add("client scope $($scope['name']) is missing on the server"); continue }
+            Compare-Set "client scope $($scope['name']) mappers" (Get-Names $scope['protocolMappers']) (Get-Names $server['protocolMappers'])
+        }
+        # Keycloak's own realm roles exist besides the file's.
+        Compare-Set 'realm roles' ((Get-Names $want['roles']['realm']) + 'offline_access', 'uma_authorization', $want['defaultRole']['name']) (Get-Names $live['roles']['realm'])
+        if ($drift.Count -eq 0) { Pass "the realm in Git matches the server ($(@($want['clients']).Count) clients, $(@($want['clientScopes']).Count) client scopes, realm and client roles)" }
+        else { foreach ($d in $drift) { Fail "realm drift: $d" } }
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
