@@ -19,6 +19,9 @@
        namespace procure that sends X-Forwarded-For: 203.0.113.9 straight to the gateway's or Keycloak's Service is refused (the
        connection times out or is rejected), while the same requests through Traefik answer 200 and the pod still reaches an ordinary
        service (requests-api) directly.
+    11. pgaudit shows who ran the DDL (plan 08 ruling 6): in every service database, the latest CREATE TABLE in today's server log (the
+       migration's or Wolverine's start-up DDL) was run by that service's own role <service>_app, never by the superuser postgres. Read in
+       the postgres pod as the superuser through Audit's own log tables (auditdb, pgaudit.log_<weekday>).
     9. (first) The cluster's published ports (80, 443, the API) listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners),
        never on the PC's network interfaces (final review I1).
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
@@ -280,6 +283,26 @@ c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H 
         foreach ($name in 'traefik-gateway', 'traefik-keycloak') {
             $p = $probes[$name]
             if ($p -and $p.Code -eq '200') { Pass "$name (the same request through Traefik) answers 200" } else { Fail "$name answered $(Show $name), expected 200" }
+        }
+    }
+
+    # --- 11. pgaudit: the services' DDL runs as their own roles ---------------------------------------------------------------------
+    # The newest CREATE TABLE per database from today's csvlog (Audit's file_fdw table of today's weekday, in the server's log_timezone).
+    # roles.sql never creates a plain table, so these are the migrations' and Wolverine's own statements.
+    $pgauditSql = @'
+SELECT format($q$SELECT database_name || '|' || user_name FROM (SELECT DISTINCT ON (database_name) database_name, user_name FROM pgaudit.%I
+  WHERE message LIKE 'AUDIT: SESSION,%%,DDL,CREATE TABLE,%%' AND database_name LIKE '%%db' AND database_name <> 'keycloakdb'
+  ORDER BY database_name, log_time DESC) latest ORDER BY 1$q$, 'log_' || lower(to_char(now() AT TIME ZONE current_setting('log_timezone'), 'Dy'))) \gexec
+'@
+    $rows = $pgauditSql -replace "`r", '' | & kubectl --context $KubeContext -n procure exec -i postgres-0 -c postgres -- psql -X -q -tA -U postgres -d auditdb 2>&1
+    if ($LASTEXITCODE -ne 0) { Fail "reading today's pgaudit log in postgres-0 failed: $(($rows | Select-Object -Last 3) -join ' | ')" }
+    else {
+        $latest = @($rows | Where-Object { $_ -match '^(\w+db)\|(\S+)$' } | ForEach-Object { [pscustomobject]@{ Database = $Matches[1]; Role = $Matches[2] } })
+        if ($latest.Count -lt 5) { Fail "today's pgaudit log names CREATE TABLE in only $($latest.Count) service database(s): $(($rows | Select-Object -First 5) -join ' | ')" }
+        foreach ($entry in $latest) {
+            $expected = ($entry.Database -replace 'db$', '') + '_app'
+            if ($entry.Role -eq $expected) { Pass "pgaudit: the latest CREATE TABLE in $($entry.Database) ran as $expected" }
+            else { Fail "pgaudit: the latest CREATE TABLE in $($entry.Database) ran as $($entry.Role), expected $expected" }
         }
     }
 } finally {

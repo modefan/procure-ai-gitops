@@ -122,7 +122,12 @@ $expectedSecrets = [ordered]@{
     'procure-mongo'              = @('username', 'password', 'keyfile')
     'procure-keycloak'           = @('admin-username', 'admin-password', 'demo-password', 'gateway-secret', 'internal-secret',
                                      'access-admin-secret', 'demo-login-secret', 'dashboard-secret', 'db-password')
-    'procure-debezium'           = @('postgres-password', 'mongo-password')
+    'procure-debezium'           = @('mongo-password')
+    'procure-db-roles'           = @('access-password', 'approvals-password', 'assistant-password', 'audit-password', 'budgets-password',
+                                     'invoicing-password', 'purchasing-password', 'requests-password', 'suppliers-password',
+                                     'access-cdc-password', 'approvals-cdc-password', 'assistant-cdc-password', 'budgets-cdc-password',
+                                     'invoicing-cdc-password', 'purchasing-cdc-password', 'requests-cdc-password',
+                                     'assistant-mongo-password', 'audit-log-reader-password')
     'procure-api-keys'           = @('admin-api-key', 'admin-api-key-sha256', 'simulator-api-key', 'supplier-webhook-secret')
     'procure-connection-strings' = @('requestsdb', 'accessdb', 'budgetsdb', 'approvalsdb', 'auditdb', 'purchasingdb', 'invoicingdb',
                                      'assistantdb', 'suppliersdb', 'assistantchatdb', 'rabbitmq', 'redis', 'auditlog')

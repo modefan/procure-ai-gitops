@@ -3,8 +3,9 @@
 .SYNOPSIS
     Creates the Kubernetes Secrets in namespaces `procure` and `observability` from the AppHost user secrets (the one source of every secret, plan 07 ruling 5).
 .DESCRIPTION
-    Reads `dotnet user-secrets` of the AppHost (UserSecretsId procure-ai-apphost). Values that are new in plan 07 and not there yet
-    (keycloak-db-password, keycloak-dashboard-secret, debezium-mongo-password) are generated once (32 letters and digits) and written to
+    Reads `dotnet user-secrets` of the AppHost (UserSecretsId procure-ai-apphost). Values that are new in plan 07 or plan 08 and not there
+    yet (keycloak-db-password, keycloak-dashboard-secret, debezium-mongo-password; the per-service database passwords db-<service>-password,
+    db-<service>-cdc-password and db-assistant-mongo-password of plan 08 ruling 6) are generated once (32 letters and digits) and written to
     the user secrets first, so the AppHost and the cluster share them. Every Secret is applied with `kubectl apply`, so a second run
     reports "unchanged". Rerun this script after changing a user secret, then restart the pods that use it.
     Prints only object names, never values.
@@ -16,10 +17,14 @@
       procure-mongo              username, password, keyfile
       procure-keycloak           admin-username, admin-password, demo-password, gateway-secret, internal-secret, access-admin-secret,
                                  demo-login-secret, dashboard-secret, db-password
-      procure-debezium           postgres-password, mongo-password
+      procure-debezium           mongo-password (debezium-mongo's MongoDB user)
+      procure-db-roles           <service>-password (accessdb ... requestsdb, suppliers on MongoDB), <service>-cdc-password (each Postgres
+                                 database a Debezium reads), assistant-mongo-password, audit-log-reader-password: what the platform's
+                                 db-roles Job sets on the roles and users, and what each Debezium replicates with
       procure-api-keys           admin-api-key, admin-api-key-sha256, simulator-api-key, supplier-webhook-secret
       procure-connection-strings one key per AppHost connection name (ConnectionStrings__<name>): the Postgres databases, suppliersdb,
-                                 assistantchatdb, rabbitmq, redis, auditlog; in-cluster host names; MongoDB with tls=true
+                                 assistantchatdb, rabbitmq, redis, auditlog; in-cluster host names; MongoDB with tls=true. Each
+                                 database as its service's own role or user (<service>_app), never the superuser or root
       ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io from `gh auth token` (plan 07 ruling 7)
     In namespace observability (a pod reads Secrets of its own namespace only):
       procure-keycloak           dashboard-secret only (the Aspire dashboard's Keycloak client aspire-dashboard)
@@ -35,9 +40,17 @@ Assert-ClusterReachable
 
 $secrets = Read-UserSecrets
 
-# New in plan 07: generated once, stored in the AppHost user secrets first (stdin JSON merges into the store, no value on a command line).
+# The services' own database roles (plan 08 ruling 6; infra/postgres/roles.sql, infra/mongo/users.js): Postgres services, the ones a
+# Debezium reads (a <service>_cdc role each), and the MongoDB-only service.
+$postgresServices = 'access', 'approvals', 'assistant', 'audit', 'budgets', 'invoicing', 'purchasing', 'requests'
+$capturedServices = 'access', 'approvals', 'assistant', 'budgets', 'invoicing', 'purchasing', 'requests'
+$databasePasswords = @($postgresServices + 'suppliers' | ForEach-Object { "db-$_-password" }) +
+    @($capturedServices | ForEach-Object { "db-$_-cdc-password" }) + 'db-assistant-mongo-password'
+
+# New in plan 07 and 08: generated once, stored in the AppHost user secrets first (stdin JSON merges into the store, no value on a command
+# line). The AppHost generates the same names on its first run (persisted parameters); whichever runs first, both then share the value.
 $generated = [ordered]@{}
-foreach ($name in 'keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') {
+foreach ($name in @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords) {
     if (-not $secrets.ContainsKey("Parameters:$name") -or [string]::IsNullOrEmpty($secrets["Parameters:$name"])) {
         $generated["Parameters:$name"] = [Security.Cryptography.RandomNumberGenerator]::GetString(
             [char[]] 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', 32)
@@ -62,13 +75,13 @@ function Get-Parameter([string] $name, $default = $null) {
 $required = 'postgres-password', 'rabbitmq-password', 'redis-password', 'mongo-password', 'mongo-keyfile-content',
     'keycloak-admin-password', 'keycloak-demo-password', 'keycloak-gateway-secret', 'keycloak-internal-secret',
     'keycloak-access-admin-secret', 'keycloak-demo-login-secret', 'keycloak-dashboard-secret', 'keycloak-db-password',
-    'debezium-password', 'debezium-mongo-password', 'admin-api-key', 'admin-api-key-sha256', 'simulator-api-key',
+    'debezium-mongo-password', 'admin-api-key', 'admin-api-key-sha256', 'simulator-api-key',
     'supplier-webhook-secret', 'audit-log-reader-password'
+$required += $databasePasswords
 $missing = @($required | Where-Object { [string]::IsNullOrEmpty($secrets["Parameters:$_"]) })
 if ($missing) { throw "AppHost user secrets missing: $(($missing | ForEach-Object { "Parameters:$_" }) -join ', '). Run the AppHost once, then this script again." }
 
 # User names: the AppHost sets none, so Aspire's defaults apply (an override in the user secrets wins, as in the AppHost).
-$postgresUser = Get-Parameter 'postgres-username' 'postgres'
 $rabbitUser = Get-Parameter 'rabbitmq-username' 'guest'
 $mongoUser = Get-Parameter 'mongo-username' 'admin'
 # Not a secret: the AppHost's appsettings.json sets Parameters:keycloak-admin to this.
@@ -104,10 +117,14 @@ Set-ProcureSecret procure-keycloak ([ordered]@{
 $results.Add((Invoke-Apply (New-SecretObject -Namespace observability -Name procure-keycloak -Data ([ordered]@{
     'dashboard-secret' = Get-Parameter 'keycloak-dashboard-secret'
 }))))
-Set-ProcureSecret procure-debezium ([ordered]@{
-    'postgres-password' = Get-Parameter 'debezium-password'
-    'mongo-password'    = Get-Parameter 'debezium-mongo-password'
-})
+# debezium-mongo's MongoDB user; the Postgres Debeziums each replicate as their database's own role (procure-db-roles).
+Set-ProcureSecret procure-debezium ([ordered]@{ 'mongo-password' = Get-Parameter 'debezium-mongo-password' })
+$dbRoles = [ordered]@{}
+foreach ($service in $postgresServices + 'suppliers') { $dbRoles["$service-password"] = Get-Parameter "db-$service-password" }
+foreach ($service in $capturedServices) { $dbRoles["$service-cdc-password"] = Get-Parameter "db-$service-cdc-password" }
+$dbRoles['assistant-mongo-password'] = Get-Parameter 'db-assistant-mongo-password'
+$dbRoles['audit-log-reader-password'] = $auditLogReaderPassword
+Set-ProcureSecret procure-db-roles $dbRoles
 Set-ProcureSecret procure-api-keys ([ordered]@{
     'admin-api-key'           = Get-Parameter 'admin-api-key'
     'admin-api-key-sha256'    = Get-Parameter 'admin-api-key-sha256'
@@ -123,19 +140,22 @@ function New-NpgsqlConnectionString([string] $user, [string] $password, [string]
     $builder['Password'] = $password; $builder['Database'] = $database
     $builder.ConnectionString
 }
-function New-MongoConnectionString([string] $database) {
+function New-MongoConnectionString([string] $user, [string] $password, [string] $database) {
     # Single-member replica set rs0 with TLS required (Task 3); directConnection as the AppHost's Debezium uses, so the member's
-    # name in the replica set config does not matter. The pod trusts the local CA through SSL_CERT_DIR (procure-ca).
-    $user = [uri]::EscapeDataString($mongoUser); $password = [uri]::EscapeDataString($mongoPassword)
+    # name in the replica set config does not matter. The pod trusts the local CA through SSL_CERT_DIR (procure-ca). The user lives in the
+    # admin database (infra/mongo/users.js), hence authSource=admin.
+    $user = [uri]::EscapeDataString($user); $password = [uri]::EscapeDataString($password)
     "mongodb://${user}:${password}@mongo:27017/${database}?authSource=admin&authMechanism=SCRAM-SHA-256&replicaSet=rs0&directConnection=true&tls=true"
 }
 if ($redisPassword -match '[,=]') { throw 'Parameters:redis-password holds , or =, which a StackExchange.Redis configuration string cannot carry.' }
 
 $connectionStrings = [ordered]@{}
-foreach ($database in 'accessdb', 'approvalsdb', 'assistantdb', 'auditdb', 'budgetsdb', 'invoicingdb', 'purchasingdb', 'requestsdb') {
-    $connectionStrings[$database] = New-NpgsqlConnectionString $postgresUser $postgresPassword $database
+# Every service as its own role <service>_app (plan 08 ruling 6): the superuser's and root's passwords reach no app.
+foreach ($service in $postgresServices) {
+    $connectionStrings["${service}db"] = New-NpgsqlConnectionString "${service}_app" (Get-Parameter "db-$service-password") "${service}db"
 }
-foreach ($database in 'suppliersdb', 'assistantchatdb') { $connectionStrings[$database] = New-MongoConnectionString $database }
+$connectionStrings['suppliersdb'] = New-MongoConnectionString 'suppliers_app' (Get-Parameter 'db-suppliers-password') 'suppliersdb'
+$connectionStrings['assistantchatdb'] = New-MongoConnectionString 'assistant_app' (Get-Parameter 'db-assistant-mongo-password') 'assistantchatdb'
 $connectionStrings['rabbitmq'] = "amqp://$([uri]::EscapeDataString($rabbitUser)):$([uri]::EscapeDataString($rabbitPassword))@rabbitmq:5672"
 $connectionStrings['redis'] = "redis:6379,password=$redisPassword"
 # Audit reads the server's pgaudit log as audit_log_reader (ServiceResources.WithAuditLogReader, connection name "auditlog").
