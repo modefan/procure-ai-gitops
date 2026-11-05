@@ -10,7 +10,8 @@
     4. GET /api/v1/requests with the admin key (user env var DEMO_ADMIN_API_KEY) and X-Tenant-Id: acme returns seeded rows.
     5. The Argo CD Application `observability` is Synced and Healthy (collector DaemonSet, Aspire dashboard).
     6. The dashboard's root at https://dashboard.procure.localtest.me redirects to Keycloak's authorization endpoint for client
-       aspire-dashboard with the redirect URI https://dashboard.procure.localtest.me/signin-oidc (OIDC on, forwarded headers trusted).
+       aspire-dashboard, after Keycloak accepted the pushed authorization request (OIDC on, forwarded headers trusted, redirect URI and
+       scopes valid).
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
     from pwsh). The admin key goes to curl in a header file that only the current user can read, never on a command line; nothing
     secret is printed. Exit code 1 on any failure.
@@ -117,17 +118,30 @@ try {
     }
 
     # --- 6. The dashboard signs in with Keycloak -----------------------------------------------------------------------------------
-    $r = Invoke-Curl "https://$DashboardHost/" @('-D', (Join-Path $work 'dashboard-headers.txt'))
-    $location = (Get-Content (Join-Path $work 'dashboard-headers.txt') -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match '^location:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -Last 1)
+    # The dashboard first redirects within its own host (/ -> /structuredlogs), then challenges with OIDC. It pushes the authorization
+    # request to Keycloak first (PAR), so the browser's Location carries request_uri instead of redirect_uri: Keycloak only issues a
+    # request_uri after it accepted the client, its secret, the redirect URI https://<dashboard>/ and the scopes (it answers 400 otherwise,
+    # and the dashboard 500).
+    $url = "https://$DashboardHost/"; $location = $null; $status = 0
+    foreach ($hop in 1..3) {
+        $headerFile = Join-Path $work "dashboard-headers-$hop.txt"
+        $r = Invoke-Curl $url @('-D', $headerFile)
+        $status = $r.Status
+        $location = (Get-Content $headerFile -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^location:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -Last 1)
+        if ($status -ne 302 -or -not $location) { break }
+        if ($location.StartsWith('/')) { $location = "https://$DashboardHost$location" }
+        if (-not $location.StartsWith("https://$DashboardHost/")) { break }
+        $url = $location
+    }
     $authorize = "https://$KeycloakHost/realms/procure/protocol/openid-connect/auth?"
-    $redirect = "redirect_uri=$([Uri]::EscapeDataString("https://$DashboardHost/signin-oidc"))"
-    if ($r.Status -eq 302 -and $location -and $location.StartsWith($authorize) -and $location.Contains('client_id=aspire-dashboard') -and
-        $location.Contains($redirect)) {
-        Pass "https://$DashboardHost/ redirects to Keycloak (client aspire-dashboard, redirect URI https://$DashboardHost/signin-oidc)"
+    $redirect = "redirect_uri=$([Uri]::EscapeDataString("https://$DashboardHost/"))"
+    if ($status -eq 302 -and $location -and $location.StartsWith($authorize) -and $location.Contains('client_id=aspire-dashboard') -and
+        ($location.Contains('request_uri=') -or $location.Contains($redirect))) {
+        Pass "https://$DashboardHost/ redirects to Keycloak's sign-in for client aspire-dashboard (authorization request accepted)"
     } else {
         $shown = if ($location) { $location.Substring(0, [Math]::Min(300, $location.Length)) } else { '(no Location header)' }
-        Fail "https://$DashboardHost/ answered $($r.Status), Location: $shown"
+        Fail "https://$DashboardHost/ ended with $status at $url, Location: $shown"
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
