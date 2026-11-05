@@ -19,9 +19,10 @@
        namespace procure that sends X-Forwarded-For: 203.0.113.9 straight to the gateway's or Keycloak's Service is refused (the
        connection times out or is rejected), while the same requests through Traefik answer 200 and the pod still reaches an ordinary
        service (requests-api) directly.
-    11. pgaudit shows who ran the DDL (plan 08 ruling 6): since the latest run of roles.sql (the db-roles Job; its ALTER ROLE ... PASSWORD
-       statements mark it), every CREATE TABLE in a service database (the migrations' and Wolverine's start-up DDL) in today's server log
-       was run by that service's own role <service>_app, never by the superuser postgres, and at least five databases show one. Read in the
+    11. pgaudit shows who ran the DDL (plan 08 ruling 6): since the first run of roles.sql in the logged week (the db-roles Job; its ALTER
+       ROLE ... PASSWORD statements mark it; it reruns on every platform sync), every CREATE TABLE in a service database (the migrations'
+       and Wolverine's start-up DDL) in the server's weekday logs was run by that service's own role <service>_app, never by the superuser
+       postgres, and at least five databases show one. Read in the
        postgres pod as the superuser through Audit's own log tables (auditdb, pgaudit.log_<weekday>).
     12. The realm in Git matches the server (plan 08 ruling 7): the realm file baked into the deployed Keycloak image, its non-secret
        placeholders filled in, against Keycloak's partial export (kcadm in the pod): each of the file's clients' redirect URIs, web
@@ -292,45 +293,59 @@ c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H 
     }
 
     # --- 11. pgaudit: the services' DDL runs as their own roles ---------------------------------------------------------------------
-    # Every role that ran CREATE TABLE in a service database since roles.sql last ran, from today's csvlog (Audit's file_fdw table of today's
-    # weekday, in the server's log_timezone). roles.sql never creates a plain table, so these are the migrations' and Wolverine's own
-    # statements; earlier ones today may still be the superuser's (a deploy from before the roles).
+    # Every role that ran CREATE TABLE in a service database since the EARLIEST run of roles.sql in the logged week (its ALTER ROLE
+    # <service>_app ... statements mark a run), read from every weekday csvlog that exists (Audit's file_fdw tables pgaudit.log_<dy>, one
+    # per weekday, truncated on rotation). Not the latest run: db-roles reruns roles.sql on every platform sync, and no migration need
+    # follow it, so "since the latest run" can be empty without anything being wrong. Since the earliest run every CREATE TABLE in a
+    # service database must be its own <service>_app's (never the superuser postgres: that is the regression this catches, before or
+    # after a later roles.sql run), and at least five databases must show one, so the check cannot pass on an empty window. roles.sql
+    # itself creates no plain table (only file_fdw foreign tables, CREATE FOREIGN TABLE). A weekday's table is read only when its file
+    # exists (file_fdw fails on a missing file; pg_stat_file's `change` is always NULL on Linux, hence `.size`). With no roles.sql run in the week the whole
+    # week is judged. A cluster idle for over a week (no run, no DDL) fails here for lack of evidence: deploy or sync, then rerun.
     $pgauditSql = @'
-SELECT format($q$WITH log AS (SELECT * FROM pgaudit.%1$I),
-  roles_run AS (SELECT max(log_time) AS at FROM log WHERE message LIKE 'AUDIT: SESSION,%%,ROLE,ALTER ROLE,%%' AND message LIKE '%%\_app%%')
+SELECT format($q$WITH log AS (%s),
+  roles_run AS (SELECT coalesce(min(log_time), '-infinity') AS at FROM log
+    WHERE message LIKE 'AUDIT: SESSION,%%,ROLE,ALTER ROLE,%%' AND message LIKE '%%\_app%%')
 SELECT DISTINCT database_name || '|' || user_name FROM log, roles_run
   WHERE log_time > roles_run.at AND message LIKE 'AUDIT: SESSION,%%,DDL,CREATE TABLE,%%' AND database_name LIKE '%%db' AND database_name <> 'keycloakdb'
-  ORDER BY 1$q$, 'log_' || lower(to_char(now() AT TIME ZONE current_setting('log_timezone'), 'Dy'))) \gexec
+  ORDER BY 1$q$, string_agg(format('SELECT log_time, user_name, database_name, message FROM pgaudit.%I', 'log_' || lower(day)), ' UNION ALL '))
+FROM unnest(ARRAY['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) AS day
+WHERE (pg_stat_file('log/postgresql-' || day || '.csv', true)).size IS NOT NULL \gexec
 '@
-    $rows = $pgauditSql -replace "`r", '' | & kubectl --context $KubeContext -n procure exec -i postgres-0 -c postgres -- psql -X -q -tA -U postgres -d auditdb 2>&1
-    if ($LASTEXITCODE -ne 0) { Fail "reading today's pgaudit log in postgres-0 failed: $(($rows | Select-Object -Last 3) -join ' | ')" }
+    $rows = $pgauditSql -replace "`r", '' | & kubectl --context $KubeContext -n procure exec -i postgres-0 -c postgres -- psql -X -q -tA -v ON_ERROR_STOP=1 -U postgres -d auditdb 2>&1
+    if ($LASTEXITCODE -ne 0) { Fail "reading the pgaudit logs in postgres-0 failed: $(($rows | Select-Object -Last 3) -join ' | ')" }
     else {
-        $seen = @($rows | Where-Object { $_ -match '^(\w+db)\|(\S+)$' } | ForEach-Object { [pscustomobject]@{ Database = $Matches[1]; Role = $Matches[2] } })
+        $seen = @($rows | Where-Object { "$_" -match '^(\w+db)\|(\S+)$' } | ForEach-Object { [pscustomobject]@{ Database = $Matches[1]; Role = $Matches[2] } })
         $databases = @($seen | ForEach-Object Database | Sort-Object -Unique)
-        if ($databases.Count -lt 5) { Fail "today's pgaudit log names CREATE TABLE since the last roles.sql run in only $($databases.Count) service database(s): $(($rows | Select-Object -First 5) -join ' | ')" }
+        if ($databases.Count -lt 5) { Fail "the week's pgaudit logs name CREATE TABLE since the first roles.sql run in only $($databases.Count) service database(s) (no evidence; at least 5 expected): $(($rows | Select-Object -First 5) -join ' | ')" }
         foreach ($database in $databases) {
             $expected = ($database -replace 'db$', '') + '_app'
             $roles = @($seen | Where-Object Database -eq $database | ForEach-Object Role)
-            if ($roles.Count -eq 1 -and $roles[0] -eq $expected) { Pass "pgaudit: every CREATE TABLE in $database since roles.sql ran was run by $expected" }
-            else { Fail "pgaudit: CREATE TABLE in $database since roles.sql ran was run by $($roles -join ', '), expected only $expected" }
+            if ($roles.Count -eq 1 -and $roles[0] -ceq $expected) { Pass "pgaudit: every CREATE TABLE in $database since roles.sql first ran was run by $expected" }
+            else { Fail "pgaudit: CREATE TABLE in $database since roles.sql first ran was run by $($roles -join ', '), expected only $expected" }
         }
     }
 
     # --- 12. The realm in Git matches the server -------------------------------------------------------------------------------------
     # The realm file of the deployed Keycloak image (infra/keycloak/procure-realm.json at the deployed revision) with its non-secret
     # placeholders filled in as the chart fills them, against Keycloak's partial export (secrets masked) read with kcadm in the pod: per
-    # client of the file its redirect URIs, web origins, post-logout redirect URIs, default and optional client scopes (those that exist)
-    # and client roles; the file's client scopes with their mappers; the realm roles (plus Keycloak's own). The keycloak-config Job
+    # client of the file its redirect URIs, web origins, post-logout redirect URIs, default and optional client scopes (the full lists:
+    # a client may name only scopes the realm defines, RealmFileTests) and client roles; the file's client scopes with their mappers; the realm roles (plus Keycloak's own). The keycloak-config Job
     # (plan 08 ruling 7) keeps them equal on every sync. kcadm gets the admin password from the pod's environment (KC_CLI_PASSWORD).
     $kcadmExport = @'
 export KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD"; k=/opt/keycloak/bin/kcadm.sh; c=/tmp/kcadm-smoke.config
-$k config credentials --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --config $c >/dev/null 2>&1 &&
+$k config credentials --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --config $c >/dev/null &&
   $k create partial-export -r procure -q exportClients=true -q exportGroupsAndRoles=true -o --config $c; rc=$?; rm -f $c; exit $rc
 '@
     $realmText = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- cat /opt/keycloak/data/import/procure-realm.json 2>&1
     $realmOk = $LASTEXITCODE -eq 0
-    $liveText = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '')
-    if (-not $realmOk -or $LASTEXITCODE -ne 0) { Fail "reading the realm file or Keycloak's partial export failed (kubectl exec into deploy/keycloak)" }
+    # stdout is the export; stderr (kcadm's "Logging into ..." and any error) stays apart for the FAIL message.
+    $exportOut = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '') 2>&1
+    $exportExit = $LASTEXITCODE
+    $liveText = @($exportOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    $exportErr = @($exportOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+    if (-not $realmOk) { Fail "reading the realm file from deploy/keycloak failed: $(($realmText | Select-Object -Last 3) -join ' | ')" }
+    elseif ($exportExit -ne 0) { Fail "Keycloak's partial export (kcadm in deploy/keycloak) failed with exit code ${exportExit}: $(($exportErr | Select-Object -Last 3) -join ' | ')" }
     else {
         # ${NAME} and ${NAME:default}, as Keycloak and the keycloak-config Job resolve them; the secret placeholders are not compared.
         $placeholders = @{ KC_APP_BASE_URL = "https://$AppHost"; KC_DASHBOARD_BASE_URL = "https://$DashboardHost" }
@@ -342,30 +357,27 @@ $k config credentials --server http://localhost:8080 --realm master --user "$KC_
         $live = ($liveText -join "`n") | ConvertFrom-Json -AsHashtable
         $drift = [System.Collections.Generic.List[string]]::new()
         function Compare-Set([string] $what, $expected, $actual) {
-            $e = @($expected | Where-Object { $_ } | Sort-Object -Unique); $a = @($actual | Where-Object { $_ } | Sort-Object -Unique)
-            if (($e -join "`n") -ne ($a -join "`n")) { $drift.Add("$what is [$($a -join ', ')] on the server, [$($e -join ', ')] in Git") }
+            $e = @($expected | Where-Object { $_ } | Sort-Object -Unique -CaseSensitive); $a = @($actual | Where-Object { $_ } | Sort-Object -Unique -CaseSensitive)
+            if (($e -join "`n") -cne ($a -join "`n")) { $drift.Add("$what is [$($a -join ', ')] on the server, [$($e -join ', ')] in Git") }
         }
         # Hashtables throughout ($h['key'] is $null for a missing key under strict mode).
         function Get-Names($items) { @($items | Where-Object { $_ } | ForEach-Object { $_['name'] }) }
-        $liveScopes = Get-Names $live['clientScopes']
         $wantClientRoles = if ($want['roles']) { $want['roles']['client'] }
         $liveClientRoles = if ($live['roles']) { $live['roles']['client'] }
         foreach ($client in $want['clients']) {
             $id = $client['clientId']
-            $server = @($live['clients'] | Where-Object { $_['clientId'] -eq $id }) | Select-Object -First 1
+            $server = @($live['clients'] | Where-Object { $_['clientId'] -ceq $id }) | Select-Object -First 1
             if (-not $server) { $drift.Add("client $id is missing on the server"); continue }
             foreach ($field in 'redirectUris', 'webOrigins') { if ($client.ContainsKey($field)) { Compare-Set "client $id $field" $client[$field] $server[$field] } }
-            foreach ($field in 'defaultClientScopes', 'optionalClientScopes') {
-                # Keycloak skips a listed scope that the realm does not have (the file names email and roles for the AppHost's realm).
-                if ($client.ContainsKey($field)) { Compare-Set "client $id $field" @($client[$field] | Where-Object { $_ -in $liveScopes }) $server[$field] }
-            }
+            # The full lists: offline_access (Keycloak's own scope) is named in the file where a client offers it.
+            foreach ($field in 'defaultClientScopes', 'optionalClientScopes') { if ($client.ContainsKey($field)) { Compare-Set "client $id $field" $client[$field] $server[$field] } }
             $logout = if ($client['attributes']) { $client['attributes']['post.logout.redirect.uris'] }
             $liveLogout = if ($server['attributes']) { $server['attributes']['post.logout.redirect.uris'] }
             if ($logout) { Compare-Set "client $id post.logout.redirect.uris" ($logout -split '##') ("$liveLogout" -split '##') }
             Compare-Set "client $id roles" (Get-Names ($wantClientRoles ? $wantClientRoles[$id] : $null)) (Get-Names ($liveClientRoles ? $liveClientRoles[$id] : $null))
         }
         foreach ($scope in $want['clientScopes']) {
-            $server = @($live['clientScopes'] | Where-Object { $_['name'] -eq $scope['name'] }) | Select-Object -First 1
+            $server = @($live['clientScopes'] | Where-Object { $_['name'] -ceq $scope['name'] }) | Select-Object -First 1
             if (-not $server) { $drift.Add("client scope $($scope['name']) is missing on the server"); continue }
             Compare-Set "client scope $($scope['name']) mappers" (Get-Names $scope['protocolMappers']) (Get-Names $server['protocolMappers'])
         }
