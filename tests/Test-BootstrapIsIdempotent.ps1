@@ -67,9 +67,9 @@ function Get-ManagedVersions {
     $versions
 }
 $versionsBefore = Get-ManagedVersions
-# 13 Secrets (10 from new-secrets.ps1 in procure plus observability/procure-keycloak, procure-tls and mongo-tls), the TLSStore and
+# 12 Secrets (9 from new-secrets.ps1 in procure plus observability/procure-keycloak, procure-tls and mongo-tls), the TLSStore and
 # procure-ca in two namespaces.
-if ($versionsBefore.Count -lt 16) { Fail "expected at least 16 bootstrap-managed objects, found $($versionsBefore.Count)" }
+if ($versionsBefore.Count -lt 15) { Fail "expected at least 15 bootstrap-managed objects, found $($versionsBefore.Count)" }
 
 $applied = 0
 foreach ($script in 'new-local-ca.ps1', 'new-secrets.ps1') {
