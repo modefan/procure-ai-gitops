@@ -20,7 +20,9 @@ local function app(t)
     obj.status.operationState = {
       phase = t.op, message = "msg",
       syncResult = { revisions = { t.applied or NEW, VALUES }, revision = t.applied },
+      operation = { sync = { revisions = { t.opRev or NEW, VALUES } } },
     }
+    if t.single then obj.status.operationState.operation = { sync = { revision = t.opRev or t.target } } end
   end
   return obj
 end
@@ -32,8 +34,14 @@ return {
   -- Argo CD keeps the phase Running between retry attempts; Failed or Error means every retry is spent (plan 08 ruling 9).
   { "sync retrying after a failed attempt: Progressing", app { gate = true, op = "Running", health = "Healthy" }, "Progressing" },
   { "root is Degraded when a child operation Failed", app { name = "procure-ai", op = "Failed", health = "Healthy" }, "Degraded" },
-  { "a child operation Failed with the migration's sync OutOfSync at the target: Degraded",
-    app { name = "procure-ai", op = "Failed", health = "Healthy", sync = "OutOfSync", applied = OLD }, "Degraded" },
+  { "a Failed sync at the target (no resources applied, OutOfSync): Degraded",
+    app { name = "procure-ai", op = "Failed", health = "Healthy", sync = "OutOfSync", applied = OLD, opRev = NEW }, "Degraded" },
+  { "compared at the new target, the Failed operation still the earlier target's: Progressing",
+    app { name = "procure-ai", op = "Failed", health = "Healthy", sync = "OutOfSync", applied = OLD, opRev = OLD }, "Progressing" },
+  { "single source pinned to a SHA, the Failed operation an earlier SHA's: Progressing",
+    app { single = true, target = NEW, op = "Failed", health = "Healthy", compared = NEW, opRev = OLD }, "Progressing" },
+  { "single source pinned to a SHA, sync Failed at it: Degraded",
+    app { single = true, target = NEW, op = "Failed", health = "Healthy", compared = NEW, opRev = NEW }, "Degraded" },
   { "a Failed sync of an earlier target, the new target not compared yet: Progressing",
     app { name = "procure-ai", op = "Failed", health = "Healthy", compared = OLD, applied = OLD }, "Progressing" },
   { "single source at a chart version, sync Failed: Degraded",

@@ -92,9 +92,29 @@ configs:
           notAt = "Source " .. i .. " compared at " .. tostring(compared[i]) .. ", target " .. target
         end
       end
+      -- The revisions the last operation synced (operationState.operation.sync, present even when a failed sync has no syncResult). Right
+      -- after the root set a new target, the Application is compared at it while operationState still holds the earlier target's failed
+      -- sync until auto-sync starts the new one: that failure is not the target's.
+      local opAtTarget = true
+      if obj.status.operationState ~= nil and obj.status.operationState.operation ~= nil
+          and obj.status.operationState.operation.sync ~= nil then
+        local opSync = obj.status.operationState.operation.sync
+        local opRevisions = {}
+        if opSync.revisions ~= nil then
+          opRevisions = opSync.revisions
+        else
+          opRevisions[1] = opSync.revision
+        end
+        for i, target in pairs(targets) do
+          if type(target) == "string" and #target == 40 and opRevisions[i] ~= target then
+            opAtTarget = false
+          end
+        end
+      end
       -- Every retry spent (Argo CD keeps the phase Running between attempts): Degraded, so the root shows the failure (plan 08 ruling 9).
-      -- Only for the current target: a failed sync of an earlier target is history once the root asked for a new one.
-      if (op == "Failed" or op == "Error") and atTarget then
+      -- Only for the current target: compared at it, and the failed operation was its sync (a failed sync of an earlier target is history
+      -- once the root asked for a new one).
+      if (op == "Failed" or op == "Error") and atTarget and opAtTarget then
         hs.status = "Degraded"
         hs.message = "Sync " .. op .. ": " .. opMessage
         return hs
