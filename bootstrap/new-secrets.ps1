@@ -101,16 +101,27 @@ $mongoPassword = Get-Parameter 'mongo-password'
 $auditLogReaderPassword = Get-Parameter 'audit-log-reader-password'
 
 $results = [System.Collections.Generic.List[string]]::new()
+function Get-LiveSecretData([string] $namespace, [string] $name) {
+    # The live Secret's data (key -> base64 value; never printed), empty for a missing Secret. Only stdout is parsed: a kubectl warning on
+    # stderr (deprecation, version skew) goes to a temporary file and is shown only when kubectl fails.
+    $errFile = New-TemporaryFile
+    try {
+        $json = & kubectl --context $KubeContext -n $namespace get secret $name -o json --ignore-not-found 2>$errFile
+        if ($LASTEXITCODE -ne 0) { throw "kubectl get secret $namespace/$name failed: $((Get-Content -Raw $errFile).Trim())" }
+    } finally {
+        Remove-Item $errFile -ErrorAction SilentlyContinue
+    }
+    $data = [ordered]@{}
+    if (-not "$json".Trim()) { return $data }
+    $live = ($json | Out-String | ConvertFrom-Json -AsHashtable).data
+    if ($live) { foreach ($key in @($live.Keys) | Sort-Object) { $data[$key] = $live[$key] } }
+    $data
+}
 function Get-StaleKeys([string] $namespace, [string] $name, [System.Collections.IDictionary] $data) {
     # The live Secret's keys that $data does not have, with their values as they are (base64; never printed). Empty for a new Secret.
     $stale = [ordered]@{}
-    $json = & kubectl --context $KubeContext -n $namespace get secret $name -o json --ignore-not-found 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "kubectl get secret $namespace/$name failed: $(@($json)[0])" }
-    if (-not "$json".Trim()) { return $stale }
-    $live = ($json | Out-String | ConvertFrom-Json -AsHashtable).data
-    if ($live) {
-        foreach ($key in @($live.Keys) | Sort-Object) { if (-not $data.Contains($key)) { $stale[$key] = $live[$key] } }
-    }
+    $live = Get-LiveSecretData $namespace $name
+    foreach ($key in $live.Keys) { if (-not $data.Contains($key)) { $stale[$key] = $live[$key] } }
     $stale
 }
 function Set-Secret([string] $namespace, [string] $name, [System.Collections.IDictionary] $data, [string] $type = 'Opaque') {
@@ -119,9 +130,18 @@ function Set-Secret([string] $namespace, [string] $name, [System.Collections.IDi
     $stale = Get-StaleKeys $namespace $name $data
     $keep = if ($Prune) { [ordered]@{} } else { $stale }
     $line = Invoke-Apply (New-SecretObject -Namespace $namespace -Name $name -Data $data -EncodedData $keep -Type $type)
-    if ($stale.Count -gt 0) {
-        $what = if ($Prune) { 'pruned' } else { 'kept (no longer written; remove with -Prune after the rollout)' }
-        $line += "; stale key(s) $what`: $($stale.Keys -join ', ')"
+    if ($stale.Count -gt 0 -and -not $Prune) {
+        $line += "; stale key(s) kept (no longer written; remove with -Prune after the rollout): $($stale.Keys -join ', ')"
+    } elseif ($stale.Count -gt 0) {
+        # Server-side apply drops only the keys this field manager owned; a key another manager also owns (made by hand, an old
+        # client-side apply) stays. Report what is really gone, read back from the cluster.
+        $after = Get-LiveSecretData $namespace $name
+        $removed = @($stale.Keys | Where-Object { -not $after.Contains($_) })
+        $left = @($stale.Keys | Where-Object { $after.Contains($_) })
+        if ($removed.Count -gt 0) { $line += "; stale key(s) pruned: $($removed -join ', ')" }
+        if ($left.Count -gt 0) {
+            $line += "; stale key(s) NOT removed (another field manager owns them; remove by hand with kubectl edit or patch): $($left -join ', ')"
+        }
     }
     $results.Add($line)
 }
