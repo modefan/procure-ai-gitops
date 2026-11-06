@@ -90,3 +90,7 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
 - `tests/Test-RestartKeepsData.ps1` (Review Focus 3): row, document and replication-slot counts before and after `k3d cluster
   stop/start` and deleted postgres-0 / mongo-0 pods, then a new request must reach the data change log within 30 s.
 - The procure-ai end-to-end suite runs against the cluster too: see procure-ai `docs/kubernetes.md`.
+
+## Licence
+
+[MIT](LICENSE).
