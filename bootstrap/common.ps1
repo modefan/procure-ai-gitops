@@ -107,9 +107,12 @@ function Invoke-CloudflareApi([string] $path) {
 
 function Get-HostedDnsRecords {
     # The zone's A/AAAA records for the hosted host names (type, name, content, proxied).
-    $names = $script:HostedDnsHosts | ForEach-Object { "$_.$script:HostedDomain" }
-    $all = (Invoke-CloudflareApi "zones/$script:HostedCloudflareZoneId/dns_records?per_page=100").result
-    @($all | Where-Object { $_.name -in $names -and $_.type -in 'A', 'AAAA' })
+    # Asked by exact name, one host at a time, so the answer never depends on how many other records the zone holds.
+    @(foreach ($h in $script:HostedDnsHosts) {
+        $name = "$h.$script:HostedDomain"
+        (Invoke-CloudflareApi "zones/$script:HostedCloudflareZoneId/dns_records?name=$([uri]::EscapeDataString($name))&per_page=100").result |
+            Where-Object { $_.name -eq $name -and $_.type -in 'A', 'AAAA' }
+    })
 }
 
 function Get-HostedServerPrice([string] $type, [string] $location) {
@@ -118,6 +121,9 @@ function Get-HostedServerPrice([string] $type, [string] $location) {
     if (-not $typeInfo) { throw "Hetzner has no server type $type." }
     $price = $typeInfo.prices | Where-Object location -eq $location
     $ipv4 = ((Invoke-HetznerApi 'pricing').pricing.primary_ips | Where-Object type -eq 'ipv4').prices | Where-Object location -eq $location
+    # Fail closed: no price is never read as 0 (which would pass the approved-price check).
+    if (-not $price -or -not $price.price_monthly -or [string]::IsNullOrEmpty("$($price.price_monthly.net)")) { throw "The Hetzner API has no price for $type in $location." }
+    if (-not $ipv4 -or -not $ipv4.price_monthly -or [string]::IsNullOrEmpty("$($ipv4.price_monthly.net)")) { throw "The Hetzner API has no primary IPv4 price for $location." }
     [pscustomobject]@{
         Net = [double] $price.price_monthly.net; Gross = [double] $price.price_monthly.gross
         Ipv4Net = [double] $ipv4.price_monthly.net; Ipv4Gross = [double] $ipv4.price_monthly.gross

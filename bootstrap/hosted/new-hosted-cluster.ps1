@@ -74,13 +74,18 @@ $fingerprint = ((& ssh-keygen -l -f "$HostedSshKey.pub" 2>&1) -join ' ').Split('
 Write-Host "SSH key: $fingerprint"
 # Always the hosted state (also in a fresh clone): -reconfigure points this checkout's .terraform at it, never at ./terraform.tfstate.
 Invoke-Terraform init -input=false -no-color -reconfigure "-backend-config=path=$HostedStateFile" | Out-Null
-$state = @(Invoke-Terraform state list | Where-Object { $_ })
+# No state file yet (a fresh PC, or the file was lost): Terraform's `state list` exits 1 there; that is an empty state, not an error.
+$state = if (Test-Path $HostedStateFile) { @(Invoke-Terraform state list | Where-Object { $_ }) } else { @() }
 $hasServer = $state -contains 'hcloud_server.node'
-# An existing server keeps its type and location (a location change would replace it; a type change is an in-place rescale only on purpose).
-if ($hasServer -and (Test-Path $HostedHostFile)) {
-    $existing = Get-HostedHost
-    if (-not $PSBoundParameters.ContainsKey('ServerType')) { $ServerType = $existing.type }
-    if (-not $PSBoundParameters.ContainsKey('Location')) { $Location = $existing.location }
+# An existing server keeps its type and location, read from the state (not host.json, which may be missing, and never a default): a
+# location change would replace it, a type change is an in-place rescale; the guard refuses both without -AllowReplace.
+$existingServer = $null
+if ($hasServer) {
+    $stateJson = (Invoke-Terraform show -json) -join "`n" | ConvertFrom-Json -Depth 50
+    $existingServer = ($stateJson.values.root_module.resources | Where-Object address -eq 'hcloud_server.node').values
+    if (-not $existingServer) { throw "The state lists hcloud_server.node but terraform show has no values for it; check $HostedStateFile." }
+    if (-not $PSBoundParameters.ContainsKey('ServerType')) { $ServerType = $existingServer.server_type }
+    if (-not $PSBoundParameters.ContainsKey('Location')) { $Location = $existingServer.location }
 }
 
 function Get-TfVars {
@@ -91,7 +96,7 @@ function Get-TfVars {
 # --- Destroy ---------------------------------------------------------------------------------------------------------------------------
 if ($Destroy) {
     if (-not $state) {
-        Write-Host "The state at $HostedStateFile is empty: Terraform manages nothing to destroy."
+        Write-Host "The state at $HostedStateFile is $(if (Test-Path $HostedStateFile) { 'empty' } else { 'missing' }): Terraform manages nothing to destroy."
     } else {
         Write-Host "Destroying (state $HostedStateFile): $($state -join ', ')"
         if (-not $AutoApprove) {
@@ -117,12 +122,22 @@ if ($Destroy) {
 if ($WaitForStock -and -not $hasServer) {
     $deadline = (Get-Date).AddMinutes($WaitMinutes)
     $found = $null
+    $errors = 0
+    $maxErrors = 10
     while (-not $found) {
-        foreach ($type in $HostedApprovedTypes.Keys) {
-            $typeInfo = (Invoke-HetznerApi "server_types?name=$type").server_types | Select-Object -First 1
-            foreach ($loc in $HostedApprovedLocations) {
-                if (-not $found -and @($typeInfo.locations | Where-Object { $_.name -eq $loc -and $_.available }).Count) { $found = @($type, $loc) }
+        try {
+            foreach ($type in $HostedApprovedTypes.Keys) {
+                $typeInfo = (Invoke-HetznerApi "server_types?name=$type").server_types | Select-Object -First 1
+                foreach ($loc in $HostedApprovedLocations) {
+                    if (-not $found -and @($typeInfo.locations | Where-Object { $_.name -eq $loc -and $_.available }).Count) { $found = @($type, $loc) }
+                }
             }
+            $errors = 0
+        } catch {
+            # A 429 or 5xx must not end a long wait; many in a row mean something is really wrong (token, network): stop.
+            $errors++
+            Write-Host "$(Get-Date -Format HH:mm) Hetzner API error ($errors of $maxErrors in a row): $($_.Exception.Message)"
+            if ($errors -ge $maxErrors) { throw "-WaitForStock stopped after $maxErrors Hetzner API errors in a row." }
         }
         if ($found) { break }
         if ((Get-Date) -gt $deadline) { throw "No approved type ($($HostedApprovedTypes.Keys -join ', ')) in stock in $($HostedApprovedLocations -join ', ') within $WaitMinutes minutes." }
@@ -160,6 +175,10 @@ if ($server) {
     if ($after.PSObject.Properties['placement_group_id'] -and $after.placement_group_id) { $problems.Add('the server joins a placement group') }
     if ($after.PSObject.Properties['iso'] -and $after.iso) { $problems.Add('the server mounts an ISO') }
     if ('delete' -in $server.change.actions -and -not $AllowReplace) { $problems.Add('the plan deletes or replaces the server (all its data); rerun with -AllowReplace only on purpose') }
+    $before = $server.change.before
+    if ($before -and $before.server_type -ne $after.server_type -and -not $AllowReplace) {
+        $problems.Add("the plan changes the running server from $($before.server_type) to $($after.server_type) (a rescale shuts it down); rerun with -AllowReplace only on purpose")
+    }
 }
 if ($HostedApprovedTypes.Contains($ServerType) -and $price.Net -gt $HostedApprovedTypes[$ServerType]) {
     $problems.Add("Hetzner now asks EUR $($price.Net) net for $ServerType in $Location; approved is EUR $($HostedApprovedTypes[$ServerType]). Ask Dale.")
@@ -182,9 +201,9 @@ foreach ($rc in $changes) {
     elseif ($rc.address -eq 'hcloud_server.node' -and $rc.change.after) { " ($($rc.change.after.server_type) in $($rc.change.after.location), $($rc.change.after.image), backups=$($rc.change.after.backups))" }
     Write-Host "plan: $($rc.change.actions -join '/') $($rc.address)$extra"
 }
-if ($problems.Count -gt 0) { throw "Plan rejected (nothing applied):`n  $($problems -join "`n  ")" }
+if ($problems.Count -gt 0) { Remove-Item $planFile -ErrorAction SilentlyContinue; throw "Plan rejected (nothing applied):`n  $($problems -join "`n  ")" }
 Write-Host "Plan accepted: $($changes.Count) change(s), only the expected resources. $ServerType in $Location costs $(Format-Price $price)$(if (-not $price.Available -and -not $hasServer) { '; NOT in stock right now (try -WaitForStock)' })."
-if ($PlanOnly) { return }
+if ($PlanOnly) { Remove-Item $planFile -ErrorAction SilentlyContinue; return }
 
 if ($changes.Count -gt 0) {
     if (-not $AutoApprove) {
