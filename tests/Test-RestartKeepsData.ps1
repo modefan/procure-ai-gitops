@@ -182,9 +182,12 @@ try {
     Write-Host "  Postgres after the cluster start: $(if ($recovered) { "crash recovery from the WAL ($("$($recovered[0])".Trim()))" } else { 'clean start' })"
     if ($hosted) {
         # Review Focus 4: the kubelet's graceful node shutdown gives Postgres its grace period, so it must not recover from the WAL.
-        $startLines = @($pgLog | Where-Object { "$_" -match 'database system was shut down at|database system is ready to accept connections' })
+        # Only lines written after the reboot (the log can hold an earlier start): "yyyy-MM-dd HH:mm:ss.fff UTC" timestamps.
+        $startLines = @($pgLog | Where-Object {
+                "$_" -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+ UTC .*database system was shut down at' -and
+                [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture) -ge $stoppedAt.AddSeconds(-1) })
         if ($recovered) { Fail "Postgres recovered from the WAL after the reboot: it did not shut down cleanly ($("$($recovered[0])".Trim()))" }
-        elseif (-not $startLines) { Fail 'the Postgres log after the reboot shows no start (cannot tell a clean start)' }
+        elseif (-not $startLines) { Fail 'the Postgres log shows no "database system was shut down at" start after the reboot (cannot tell a clean start)' }
         else { Pass "Postgres started cleanly after the reboot (no crash recovery): $("$($startLines[0])".Trim())" }
     }
 
