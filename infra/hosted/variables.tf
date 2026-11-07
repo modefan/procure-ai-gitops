@@ -74,7 +74,7 @@ variable "domain" {
 }
 
 variable "dns_hosts" {
-  description = "Host names that point at the server (A and AAAA each): the app, Keycloak and the Aspire dashboard."
+  description = "Host names that point at the server (one A record each): the app, Keycloak and the Aspire dashboard."
   type        = list(string)
   default     = ["procure", "auth", "dashboard"]
 }

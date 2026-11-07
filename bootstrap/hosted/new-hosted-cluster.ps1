@@ -19,15 +19,18 @@
     Money guard (before every apply). Terraform only ADOPTS the instance Dale bought (bootstrap/common.ps1 HostedInstanceId, Cloud VPS 8,
     EUR 14.00 a month); it never orders or cancels one. Checked through the Contabo API before the plan: the instance exists, is product
     V155 in region EU and has no cancellation date. The plan may hold only the SSH key secret, the adopted instance (never a create without
-    that existing_instance_id, never a delete), the firewall (one active rule: in tcp 22, 80, 443 from anywhere) and exactly the six DNS
-    records (A and AAAA for procure, auth, dashboard; not proxied).
+    that existing_instance_id, never a delete), the firewall (one active rule: in tcp 22, 80, 443 from anywhere, on this instance) and
+    exactly the three DNS records (A for procure, auth, dashboard; not proxied; no AAAA, k3s is IPv4 only). Deleting one of our own DNS
+    records is allowed (e.g. the AAAA records of the first version). The check runs in every path that changes something: apply and
+    -Destroy. Terraform in infra/hosted is run ONLY through this script (a raw apply skips the check).
     Adopting the instance REINSTALLS it (all data on it is lost), so a plan that adopts it is applied only with -Reinstall. The first run
     on the new VPS needs -Reinstall; later runs change only the firewall and the DNS records.
     -Reinstall on a VM Terraform already manages: forgets it in the state and adopts it again, which reinstalls it with the current image,
       key and cloud-init.yaml (the deliberate way to apply a cloud-init change).
-    -Destroy: removes what Terraform made that costs nothing (DNS records, firewall, SSH key secret) and forgets the instance in the
-      state. The instance is NOT cancelled and keeps billing until Dale cancels it in the Contabo panel (procure-ai docs/hosting.md).
-      Afterwards both APIs are checked: no DNS record left, no procure-hosted firewall, the instance still there and not cancelled.
+    -Destroy: takes the demo off its names: removes the DNS records, nothing else. The firewall stays (it is free, and the VM keeps running
+      k3s), the instance stays managed and is NOT cancelled; it keeps billing until Dale cancels it in the Contabo panel (procure-ai
+      docs/hosting.md). Afterwards both APIs are checked: no DNS record left, the firewall still active on the instance, the instance not
+      cancelled. A normal run brings the records back.
     The root password Dale received with the VPS stays valid for the Contabo console: the script keeps it in a Contabo password secret
     (procure-hosted-root-password, created once from DEMO PASSWORDS.txt without printing it) that the reinstall uses.
     Safe to run again: with nothing to change, Terraform applies nothing and the rest is re-checked.
@@ -38,7 +41,7 @@ param(
     [Parameter(ParameterSetName = 'Apply')] [switch] $PlanOnly,
     # Allow (or, when Terraform already manages the VM, force) the reinstall that adopting the instance means. All data on the VM is lost.
     [Parameter(ParameterSetName = 'Apply')] [switch] $Reinstall,
-    # Remove the free resources and forget the instance (it is not cancelled).
+    # Remove the DNS records only (the VM, its firewall and the SSH key stay; nothing is cancelled).
     [Parameter(ParameterSetName = 'Destroy', Mandatory)] [switch] $Destroy,
     # Apply (or destroy) without asking (the guard still runs).
     [switch] $AutoApprove
@@ -98,31 +101,96 @@ $instance = Get-Instance
 Assert-InstanceIsTheBoughtOne $instance
 Write-Host "Instance $HostedInstanceId ($($instance.productId), $($instance.region), $HostedMonthlyPrice a month): $($instance.status), Terraform $(if ($managed) { 'manages it' } else { 'does not manage it yet' })."
 
-# --- Destroy (never cancels) -------------------------------------------------------------------------------------------------------------
+# The plan check: only the expected resources, never a new or a cancelled instance (details in the help above). Returns the problems; an
+# empty list means the plan may be applied. -DestroyOnly: the plan may only delete our own DNS records.
+function Test-Plan($plan, [switch] $DestroyOnly) {
+    $dnsKeys = foreach ($h in $HostedDnsHosts) { "$h-A" }
+    $expected = @('contabo_secret.ssh', 'contabo_instance.vps', 'contabo_firewall.public') + @($dnsKeys | ForEach-Object { "cloudflare_dns_record.host[""$_""]" })
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $planAddresses = @($plan.resource_changes | ForEach-Object { "$($_.address)" })
+    foreach ($rc in $plan.resource_changes) {
+        $actions = (@($rc.change.actions) -join ',')
+        $ownDnsDelete = $rc.type -eq 'cloudflare_dns_record' -and $rc.address -like 'cloudflare_dns_record.host*' -and $actions -eq 'delete'
+        if ($rc.address -notin $expected -and -not $ownDnsDelete) { $problems.Add("unexpected resource $($rc.address) ($actions)") }
+        if ($rc.type -like 'contabo_*' -and $rc.type -notin 'contabo_secret', 'contabo_instance', 'contabo_firewall') { $problems.Add("$($rc.type) may cost money") }
+        if ($DestroyOnly -and $actions -notin 'no-op', 'read' -and -not $ownDnsDelete) { $problems.Add("-Destroy may delete only DNS records, not $($rc.address) ($actions)") }
+        if ($rc.type -eq 'contabo_firewall' -and 'delete' -in @($rc.change.actions)) { $problems.Add('the plan deletes the firewall of a VM that keeps running k3s') }
+    }
+    if (-not $DestroyOnly) { foreach ($address in $expected) { if ($address -notin $planAddresses) { $problems.Add("missing resource $address") } } }
+    $vps = $plan.resource_changes | Where-Object address -eq 'contabo_instance.vps'
+    if ($vps) {
+        $actions = @($vps.change.actions)
+        if ('delete' -in $actions) { $problems.Add('the plan deletes the instance, which CANCELS the paid VPS: never') }
+        if ('create' -in $actions) {
+            $after = $vps.change.after
+            if ("$($after.existing_instance_id)" -ne $HostedInstanceId) { $problems.Add("the plan creates an instance without existing_instance_id=${HostedInstanceId}: that would ORDER a new VPS") }
+            if ($after.PSObject.Properties['add_ons'] -and @($after.add_ons).Count) { $problems.Add('the plan adds add-ons (they cost money)') }
+            if (-not $Reinstall) { $problems.Add("the plan adopts instance $HostedInstanceId, which REINSTALLS it (all data lost); rerun with -Reinstall only on purpose") }
+        }
+    }
+    $firewall = $plan.resource_changes | Where-Object address -eq 'contabo_firewall.public'
+    if ($firewall -and $firewall.change.after) {
+        $a = $firewall.change.after
+        $inbound = @($a.rules | ForEach-Object { $_.inbound } | Where-Object { $_ -and $_.action -ne 'drop' })
+        $shape = @($inbound | ForEach-Object {
+            "$($_.protocol)/$($_.action)/$($_.status)/$((@($_.dest_ports) | Sort-Object) -join ',')/$((@($_.src_cidr | ForEach-Object { @($_.ipv4) + @($_.ipv6) }) | Sort-Object) -join ',')"
+        })
+        if ($a.status -ne 'active' -or ($shape -join ';') -notin 'tcp/accept/active/22,443,80/0.0.0.0/0,::/0', 'tcp/accept/active/22,443,80/::/0,0.0.0.0/0') {
+            $problems.Add("firewall is $($a.status) with rules '$($shape -join '; ')', expected one active rule in tcp 22, 80, 443 from 0.0.0.0/0 and ::/0")
+        }
+        if ("$(@($a.instance_ids) -join ',')" -ne $HostedInstanceId) { $problems.Add("firewall holds instances '$(@($a.instance_ids) -join ',')', expected $HostedInstanceId") }
+    }
+    $wantNames = $HostedDnsHosts | ForEach-Object { "$_.$HostedDomain" }
+    foreach ($rc in @($plan.resource_changes | Where-Object type -eq 'cloudflare_dns_record')) {
+        $a = $rc.change.after
+        if (-not $a) { continue }
+        if ($a.zone_id -ne $HostedCloudflareZoneId -or $a.name -notin $wantNames -or $a.type -ne 'A' -or $a.proxied -ne $false) {
+            $problems.Add("DNS record $($rc.address): $($a.type) $($a.name) in zone $($a.zone_id), proxied=$($a.proxied); expected A for $($wantNames -join ', '), not proxied")
+        }
+    }
+    $problems
+}
+
+function Show-Plan($plan) {
+    foreach ($rc in @($plan.resource_changes | Where-Object { (@($_.change.actions) -join ',') -notin 'no-op', 'read' })) {
+        $extra = if ($rc.type -eq 'cloudflare_dns_record' -and $rc.change.after) { " ($($rc.change.after.type) $($rc.change.after.name), proxied=$($rc.change.after.proxied), ttl $($rc.change.after.ttl))" }
+        elseif ($rc.type -eq 'cloudflare_dns_record' -and $rc.change.before) { " ($($rc.change.before.type) $($rc.change.before.name))" }
+        elseif ($rc.address -eq 'contabo_instance.vps' -and $rc.change.after) { " (adopts existing instance $($rc.change.after.existing_instance_id), image $($rc.change.after.image_id): REINSTALL)" }
+        Write-Host "plan: $($rc.change.actions -join '/') $($rc.address)$extra"
+    }
+}
+
+# --- Destroy: the DNS records only (never the firewall of a running VM, never the instance) ---------------------------------------------
 if ($Destroy) {
-    if (-not $AutoApprove) {
-        $answer = Read-Host 'Remove the DNS records, the firewall and the SSH key secret, and forget the instance in the state (it keeps running and billing)? (type yes)'
-        if ($answer -ne 'yes') { Write-Host 'Nothing changed.'; return }
+    $records = @($state | Where-Object { $_ -like 'cloudflare_dns_record.host*' })
+    if ($records) {
+        $tfVars = @('-var', "ssh_public_key_path=$HostedSshKey.pub", '-var', "k3s_version=$HostedK3sVersion")
+        $planFile = Join-Path $HostedDir 'tfplan'
+        $targets = @($records | ForEach-Object { "-target=$_" })
+        Invoke-Terraform plan -destroy -input=false -no-color "-out=$planFile" @targets @tfVars | Out-Null
+        $plan = (Invoke-Terraform show -json $planFile) -join "`n" | ConvertFrom-Json -Depth 50
+        Show-Plan $plan
+        $problems = @(Test-Plan $plan -DestroyOnly)
+        if ($problems) { Remove-Item $planFile -ErrorAction SilentlyContinue; throw "Destroy plan rejected (nothing changed):`n  $($problems -join "`n  ")" }
+        if (-not $AutoApprove) {
+            $answer = Read-Host 'Remove the DNS records (the VM, its firewall and the SSH key stay; nothing is cancelled)? (type yes)'
+            if ($answer -ne 'yes') { Remove-Item $planFile -ErrorAction SilentlyContinue; Write-Host 'Nothing changed.'; return }
+        }
+        $out = & terraform "-chdir=$tfDir" apply -input=false -no-color $planFile 2>&1
+        $exit = $LASTEXITCODE
+        Remove-Item $planFile -ErrorAction SilentlyContinue
+        if ($exit -ne 0) { throw "terraform apply (destroy plan) failed: $($out -join [Environment]::NewLine)" }
+        $out | Select-Object -Last 1 | ForEach-Object { Write-Host $_ }
+    } else {
+        Write-Host 'The state holds no DNS record: nothing to remove.'
     }
-    $tfVars = @('-var', "ssh_public_key_path=$HostedSshKey.pub", '-var', "k3s_version=$HostedK3sVersion")
-    $free = @($state | Where-Object { $_ -like 'cloudflare_dns_record.host*' -or $_ -eq 'contabo_firewall.public' })
-    if ($free) {
-        $targets = @($free | ForEach-Object { "-target=$_" })
-        Invoke-Terraform destroy -input=false -no-color -auto-approve @targets @tfVars | Select-Object -Last 1 | ForEach-Object { Write-Host $_ }
-    }
-    if ($managed) { Invoke-Terraform state rm contabo_instance.vps | ForEach-Object { Write-Host $_ } }
-    if ($state -contains 'contabo_secret.ssh') {
-        Invoke-Terraform destroy -input=false -no-color -auto-approve '-target=contabo_secret.ssh' @tfVars | Select-Object -Last 1 | ForEach-Object { Write-Host $_ }
-    }
-    Remove-Item $HostedHostFile, $HostedKubeconfig -ErrorAction SilentlyContinue
-    & (Join-Path $PSScriptRoot 'open-tunnel.ps1') -Close | Out-Host
-    $records = Get-HostedDnsRecords
-    $firewalls = @((Invoke-ContaboApi 'firewalls?size=100').data | Where-Object name -eq 'procure-hosted-fw')
+    $left = Get-HostedDnsRecords
+    $firewalls = @((Invoke-ContaboApi 'firewalls?size=100').data | Where-Object { $_.status -eq 'active' -and @($_.instances | Where-Object { "$($_.instanceId)" -eq $HostedInstanceId }).Count })
     $after = Get-Instance
-    if ($records -or $firewalls -or $after.cancelDate) {
-        throw "After -Destroy: $($records.Count) DNS record(s), $($firewalls.Count) procure-hosted firewall(s), instance cancel date '$($after.cancelDate)'. Check Cloudflare and the Contabo panel."
+    if ($left -or $firewalls.Count -ne 1 -or $after.cancelDate) {
+        throw "After -Destroy: $($left.Count) DNS record(s) left, $($firewalls.Count) active firewall(s) on the instance, cancel date '$($after.cancelDate)'. Check Cloudflare and the Contabo panel."
     }
-    Write-Host "Checked through the APIs: no procure/auth/dashboard DNS record, no procure-hosted firewall; instance $HostedInstanceId still $($after.status) and NOT cancelled (it bills $HostedMonthlyPrice a month until Dale cancels it in the Contabo panel)."
+    Write-Host "Checked through the APIs: no procure/auth/dashboard DNS record; firewall $($firewalls[0].name) still active on the instance; instance $HostedInstanceId $($after.status) and NOT cancelled (it bills $HostedMonthlyPrice a month until Dale cancels it in the Contabo panel). A normal run of this script brings the records back."
     return
 }
 
@@ -162,54 +230,11 @@ $planFile = Join-Path $HostedDir 'tfplan'
 Invoke-Terraform plan -input=false -no-color "-out=$planFile" @tfVars | Out-Null
 $plan = (Invoke-Terraform show -json $planFile) -join "`n" | ConvertFrom-Json -Depth 50
 
-$dnsKeys = foreach ($h in $HostedDnsHosts) { "$h-A"; "$h-AAAA" }
-$expected = @('contabo_secret.ssh', 'contabo_instance.vps', 'contabo_firewall.public') + @($dnsKeys | ForEach-Object { "cloudflare_dns_record.host[""$_""]" })
-$problems = [System.Collections.Generic.List[string]]::new()
-$changes = @($plan.resource_changes | Where-Object { (@($_.change.actions) -join ',') -ne 'no-op' -and (@($_.change.actions) -join ',') -ne 'read' })
-$planAddresses = @($plan.resource_changes | ForEach-Object { "$($_.address)" })
-foreach ($rc in $plan.resource_changes) {
-    if ($rc.address -notin $expected) { $problems.Add("unexpected resource $($rc.address) ($($rc.change.actions -join '/'))") }
-    if ($rc.type -like 'contabo_*' -and $rc.type -notin 'contabo_secret', 'contabo_instance', 'contabo_firewall') { $problems.Add("$($rc.type) may cost money") }
-}
-foreach ($address in $expected) { if ($address -notin $planAddresses) { $problems.Add("missing resource $address") } }
-$vps = $plan.resource_changes | Where-Object address -eq 'contabo_instance.vps'
-$adopts = $false
-if ($vps) {
-    $actions = @($vps.change.actions)
-    if ('delete' -in $actions) { $problems.Add('the plan deletes the instance, which CANCELS the paid VPS: never') }
-    if ('create' -in $actions) {
-        $adopts = $true
-        $after = $vps.change.after
-        if ("$($after.existing_instance_id)" -ne $HostedInstanceId) { $problems.Add("the plan creates an instance without existing_instance_id=${HostedInstanceId}: that would ORDER a new VPS") }
-        if ($after.PSObject.Properties['add_ons'] -and @($after.add_ons).Count) { $problems.Add('the plan adds add-ons (they cost money)') }
-        if (-not $Reinstall) { $problems.Add("the plan adopts instance $HostedInstanceId, which REINSTALLS it (all data lost); rerun with -Reinstall only on purpose") }
-    }
-}
-$firewall = $plan.resource_changes | Where-Object address -eq 'contabo_firewall.public'
-if ($firewall -and $firewall.change.after) {
-    $a = $firewall.change.after
-    $inbound = @($a.rules | ForEach-Object { $_.inbound } | Where-Object { $_ -and $_.action -ne 'drop' })
-    $shape = @($inbound | ForEach-Object {
-        "$($_.protocol)/$($_.action)/$($_.status)/$((@($_.dest_ports) | Sort-Object) -join ',')/$((@($_.src_cidr | ForEach-Object { @($_.ipv4) + @($_.ipv6) }) | Sort-Object) -join ',')"
-    })
-    if ($a.status -ne 'active' -or ($shape -join ';') -notin 'tcp/accept/active/22,443,80/0.0.0.0/0,::/0', 'tcp/accept/active/22,443,80/::/0,0.0.0.0/0') {
-        $problems.Add("firewall is $($a.status) with rules '$($shape -join '; ')', expected one active rule in tcp 22, 80, 443 from 0.0.0.0/0 and ::/0")
-    }
-}
-$wantNames = $HostedDnsHosts | ForEach-Object { "$_.$HostedDomain" }
-foreach ($rc in @($plan.resource_changes | Where-Object type -eq 'cloudflare_dns_record')) {
-    $a = $rc.change.after
-    if (-not $a) { continue }
-    if ($a.zone_id -ne $HostedCloudflareZoneId -or $a.name -notin $wantNames -or $a.type -notin 'A', 'AAAA' -or $a.proxied -ne $false) {
-        $problems.Add("DNS record $($rc.address): $($a.type) $($a.name) in zone $($a.zone_id), proxied=$($a.proxied); expected A/AAAA for $($wantNames -join ', '), not proxied")
-    }
-}
-foreach ($rc in $changes) {
-    $extra = if ($rc.type -eq 'cloudflare_dns_record' -and $rc.change.after) { " ($($rc.change.after.type) $($rc.change.after.name), proxied=$($rc.change.after.proxied), ttl $($rc.change.after.ttl))" }
-    elseif ($rc.address -eq 'contabo_instance.vps' -and $rc.change.after) { " (adopts existing instance $($rc.change.after.existing_instance_id), image $($rc.change.after.image_id): REINSTALL)" }
-    Write-Host "plan: $($rc.change.actions -join '/') $($rc.address)$extra"
-}
-if ($problems.Count -gt 0) { Remove-Item $planFile -ErrorAction SilentlyContinue; throw "Plan rejected (nothing applied):`n  $($problems -join "`n  ")" }
+$problems = @(Test-Plan $plan)
+$adopts = [bool] (@($plan.resource_changes | Where-Object { $_.address -eq 'contabo_instance.vps' -and 'create' -in @($_.change.actions) }).Count)
+$changes = @($plan.resource_changes | Where-Object { (@($_.change.actions) -join ',') -notin 'no-op', 'read' })
+Show-Plan $plan
+if ($problems) { Remove-Item $planFile -ErrorAction SilentlyContinue; throw "Plan rejected (nothing applied):`n  $($problems -join "`n  ")" }
 Write-Host "Plan accepted: $($changes.Count) change(s), only the expected resources; no new paid resource (the VPS is the one Dale pays $HostedMonthlyPrice a month for)$(if ($adopts) { '; the VM will be REINSTALLED' })."
 if ($PlanOnly) { Remove-Item $planFile -ErrorAction SilentlyContinue; return }
 
@@ -223,6 +248,19 @@ if ($changes.Count -gt 0) {
     Remove-Item $planFile -ErrorAction SilentlyContinue
     if ($applyExit -ne 0) { throw "terraform apply failed: $($applyOut -join [Environment]::NewLine)" }
     $applyOut | Select-Object -Last 3 | ForEach-Object { Write-Host $_ }
+    if ($adopts) {
+        # Provider 0.1.44 drops the reinstall call's error (resourceInstanceUpdate ignores it), so ask the API: a failed reinstall shows as
+        # status error / an errorMessage, or the instance never gets the new SSH key.
+        $keyId = [int64] ((Invoke-Terraform output -raw ssh_key_secret_id) -join '')
+        $deadline = (Get-Date).AddMinutes(15)
+        while ($true) {
+            $now = Get-Instance
+            if ($now.status -eq 'error' -or $now.errorMessage) { throw "The reinstall of instance $HostedInstanceId failed (Contabo API: status $($now.status), '$($now.errorMessage)')." }
+            if ($now.status -eq 'running' -and @($now.sshKeys) -contains $keyId) { Write-Host "Reinstall accepted (Contabo API: running, SSH key $keyId on the instance)."; break }
+            if ((Get-Date) -gt $deadline) { throw "The reinstall of instance $HostedInstanceId did not finish within 15 minutes (Contabo API: status $($now.status), SSH keys $(@($now.sshKeys) -join ','))." }
+            Start-Sleep -Seconds 20
+        }
+    }
 }
 Remove-Item $planFile -ErrorAction SilentlyContinue
 
@@ -262,10 +300,23 @@ Write-Host "SSH works ($target); host key in $HostedKnownHosts."
 # Contabo merges its own cloud-config into the user data: a bootcmd that edits sshd_config and runs `pkill -HUP sshd`, which exits 1 on
 # Ubuntu 26.04 (no process is called sshd there), so cloud-init reports "error" on every boot although everything of ours ran. Accept
 # that one known failure, nothing else (our 00- sshd drop-in wins over Contabo's PermitRootLogin yes; Test-HostBaseline checks it).
+# Our cloud-init.yaml has no bootcmd of its own (checked here), and the merged bootcmd list on the VM must be exactly Contabo's three
+# commands: cloud-init's error text cannot tell the commands apart, so the list itself is compared (it holds no secret).
+if ((Get-Content -Raw (Join-Path $tfDir 'cloud-init.yaml')) -match '(?m)^bootcmd:') { throw 'infra/hosted/cloud-init.yaml must not have a bootcmd (the cloud-init check below could no longer tell its failures from Contabo''s).' }
+$contaboBootcmd = @(
+    "sed 's/#PermitRootLogin .*/PermitRootLogin yes/' -i /etc/ssh/sshd_config",
+    'grep PermitRootLogin /etc/ssh/sshd_config || echo PermitRootLogin yes >> /etc/ssh/sshd_config',
+    'pkill -HUP sshd')
 $status = @(Invoke-HostedSsh -Command 'cloud-init status --wait >/dev/null 2>&1; cloud-init status --format json' -AllowFailure)
 $ci = ($status -join "`n") | ConvertFrom-Json
 $errors = @($ci.errors | ForEach-Object { "$_" })
-$onlyContaboBootcmd = $errors.Count -gt 0 -and @($errors | Where-Object { $_ -notmatch "^\('bootcmd'," }).Count -eq 0
+$bootcmd = @()
+if ($errors) {
+    $bootcmdJson = Invoke-HostedSsh -Command 'sudo python3 -c "import json,yaml; print(json.dumps((yaml.safe_load(open(''/var/lib/cloud/instance/cloud-config.txt'')) or {}).get(''bootcmd'') or []))"'
+    $bootcmd = @(($bootcmdJson -join '') | ConvertFrom-Json | ForEach-Object { "$_" })
+}
+$onlyContaboBootcmd = $errors.Count -gt 0 -and @($errors | Where-Object { $_ -notmatch "^\('bootcmd'," }).Count -eq 0 -and
+    ($bootcmd -join "`n") -eq ($contaboBootcmd -join "`n")
 Write-Host "cloud-init: $($ci.status)$(if ($errors) { "; errors: $($errors.Count) ($(if ($onlyContaboBootcmd) { 'only Contabo''s own bootcmd' } else { 'see the VM' }))" })"
 if (-not ($ci.status -eq 'done' -or ($ci.status -eq 'error' -and $onlyContaboBootcmd))) {
     throw 'cloud-init did not finish cleanly (sudo cloud-init status --long; sudo cat /var/log/cloud-init-output.log on the VM).'

@@ -14,7 +14,7 @@ output "ipv4_address" {
 }
 
 output "ipv6_address" {
-  description = "Public IPv6 (the AAAA records point here)."
+  description = "Public IPv6 (only SSH answers there; no AAAA records, k3s is IPv4 only)."
   value       = local.ipv6
 }
 
@@ -36,4 +36,9 @@ output "firewall_id" {
 output "dns_names" {
   description = "The host names that point at the server."
   value       = sort(distinct([for r in cloudflare_dns_record.host : r.name]))
+}
+
+output "ssh_key_secret_id" {
+  description = "Contabo secret ID of the VM's SSH key (new-hosted-cluster.ps1 checks the reinstall put it on the instance)."
+  value       = contabo_secret.ssh.id
 }

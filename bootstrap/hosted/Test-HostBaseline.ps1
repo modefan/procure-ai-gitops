@@ -11,15 +11,22 @@
       - the kubelet's live configuration: shutdownGracePeriod 60s, shutdownGracePeriodCriticalPods 20s; logind waits long enough;
       - the API (6443), the kubelet (10250) and kube-proxy's health port (10256) listen only on the node address (dummy interface) or loopback,
         never on a public interface or a wildcard;
+      - every TCP and UDP listener on the VM is on loopback or in the allowlist (22 on any address; 6443, 10250, 10256 on the node
+        address); on IPv6 only SSH listens, and nothing answers on [v6]:80/443 (k3s is IPv4 only, so there are no AAAA records);
+      - flannel uses host-gw (no VXLAN socket on UDP 8472);
+      - the host firewall (nftables table inet procure_host) is loaded: on eth0 only replies, 22, 80, 443 (and the ICMP IPv6 needs) come
+        in, and only 80/443 are forwarded to pods;
+      - the sudo group holds only the admin user (Contabo's merged config also creates the image's `ubuntu` user; cloud-init removes it);
       - WARN (not a failure) when a kernel or library update waits for a reboot (/var/run/reboot-required).
     From the PC, against the public IPv4 (and IPv6 when the PC has a route); before host.json exists, the addresses come from the Contabo
     API, so the outside checks also run against a VM that is not set up yet:
       - root and password logins are refused (the server offers only publickey);
-      - 22, 80 and 443 answer; 6443 and the other Kubernetes ports (6444, 10250, 10256, 2379, 2380, 8472/udp is not checked) do not.
+      - IPv4: 22, 80 and 443 answer; 6443 and the other Kubernetes ports (6444, 10250, 10256, 2379, 2380, 8080) do not (UDP is covered
+        by the listener check on the VM); IPv6 (only from a PC with working IPv6): only 22.
     Through the Contabo API: the instance is the one Dale bought (bootstrap/common.ps1: ID, product V155, EU, not cancelled), and exactly
     one active firewall holds it, with exactly one active rule: in tcp 22, 80, 443 from anywhere (IPv4 and IPv6). WARN when Contabo's VNC
-    console is enabled (the API cannot turn it off; Dale can in the panel). Through the Cloudflare API: exactly A and AAAA for procure, auth and dashboard
-    .daleabels.com, pointing at the server's IPv4 and IPv6, not proxied.
+    console is enabled (the API cannot turn it off; Dale can in the panel). Through the Cloudflare API: exactly one A record each for procure, auth and dashboard
+    .daleabels.com, pointing at the server's IPv4, not proxied, and no AAAA record for them.
     Prints PASS/FAIL per check and exits 1 when any check fails. Prints no secret.
 #>
 [CmdletBinding()]
@@ -137,6 +144,53 @@ foreach ($port in 6443, 10250, 10256) {
     }
 }
 
+Add-Check 'every TCP/UDP listener is on loopback or allowed (22 anywhere; 6443, 10250, 10256 on the node address); IPv6: only SSH' {
+    $lines = @(Get-Ssh "ss -Hlntu | awk '{print `$1, `$5}'" | Where-Object { $_ })
+    $node = $hostInfo.nodeIp
+    $bad = foreach ($line in $lines) {
+        $proto, $local = "$line" -split ' ', 2
+        $address = $local -replace ':\d+$|:\*$', '' -replace '%[^\]]+', ''
+        $port = ($local -split ':')[-1]
+        $loopback = $address -match '^127\.' -or $address -in '[::1]', '::1'
+        $allowed = $loopback -or ($proto -eq 'tcp' -and $port -eq '22' -and $address -in '0.0.0.0', '[::]', '*') -or
+            ($proto -eq 'tcp' -and $address -eq $node -and $port -in '6443', '10250', '10256')
+        if (-not $allowed) { "$proto $local" }
+    }
+    if ($bad) { throw "not allowed: $($bad -join ', ')" }
+    # The VM's own IPv6 address: nothing but SSH answers there (curl exit 7 = connection refused).
+    $v6 = ($hostInfo.ipv6 -split '/')[0]
+    $http = Get-Ssh "for p in 80 443; do curl -6 -s -o /dev/null --max-time 5 http://[$v6]:`$p/; echo `$?; done"
+    if (@($http | Where-Object { $_ -ne '7' }).Count) { throw "IPv6 [$v6]:80/443 answer (curl exit codes $($http -join ', ')), but there are no AAAA records" }
+    "$($lines.Count) listeners, all on loopback or allowed; IPv6 [$v6]: 80/443 refused, only SSH"
+}
+
+Add-Check 'flannel uses host-gw (no VXLAN socket)' {
+    $backend = (Get-Ssh "sudo k3s kubectl get node -o jsonpath='{.items[0].metadata.annotations.flannel\.alpha\.coreos\.com/backend-type}'") -join ''
+    $vxlan = Get-Ssh "ip -br link show type vxlan | wc -l; ss -Hlnu 'sport = :8472' | wc -l"
+    if ($backend -ne 'host-gw' -or ($vxlan -join ',') -ne '0,0') { throw "backend '$backend', vxlan links/sockets: $($vxlan -join ', ')" }
+    'host-gw; no vxlan interface, nothing on UDP 8472'
+}
+
+Add-Check 'host firewall loaded (nftables inet procure_host: eth0 in 22/80/443 + replies, forward only 80/443)' {
+    $active = (Get-Ssh 'systemctl is-active procure-host-firewall; systemctl is-enabled procure-host-firewall') -join ','
+    $table = (Get-Ssh 'sudo nft list table inet procure_host') -join "`n"
+    $problems = @()
+    if ($active -ne 'active,enabled') { $problems += "service: $active" }
+    foreach ($want in 'hook input', 'hook forward', 'iifname != "eth0" accept', 'tcp dport { 22, 80, 443 } accept', 'ct original proto-dst { 80, 443 } accept') {
+        if ($table -notlike "*$want*") { $problems += "missing '$want'" }
+    }
+    if (([regex]::Matches($table, 'counter packets \d+ bytes \d+ drop')).Count -ne 2) { $problems += 'expected a final drop in both chains' }
+    if ($problems) { throw ($problems -join '; ') }
+    'service active and enabled; input: 22, 80, 443 and replies; forward: 80, 443 and replies; everything else on eth0 dropped'
+}
+
+Add-Check 'sudo group holds only the admin user; no ubuntu user' {
+    $sudo = (Get-Ssh 'getent group sudo | cut -d: -f4') -join ''
+    $ubuntu = (Get-Ssh 'id ubuntu >/dev/null 2>&1 && echo present || echo absent') -join ''
+    if ($sudo -ne $hostInfo.user -or $ubuntu -ne 'absent') { throw "sudo group: '$sudo'; ubuntu user $ubuntu" }
+    "sudo: $sudo; ubuntu absent"
+}
+
 # A warning only: unattended upgrades install kernel fixes, but the VM reboots only when Dale (or Claude) decides (docs/hosting.md).
 if ($hostInfo) {
     try {
@@ -151,19 +205,18 @@ $addresses = @()
 if ($publicAddresses) {
     $addresses += $publicAddresses[0]
     # The PC may have no IPv6 route; check IPv6 only when it does.
-    # Only with working IPv6 on the PC (a route alone is not enough): a connection to Cloudflare's resolver over IPv6 must succeed.
+    # From the PC over IPv6 only when the PC has working IPv6 (a route alone is not enough); the VM-side check above covers IPv6 anyway.
     $ipv6 = ($publicAddresses[1] -split '/')[0]
     if ($ipv6 -and (Test-Tcp '2606:4700:4700::1111' 443)) { $addresses += $ipv6 }
-    elseif ($ipv6) {
-        $results.Add([pscustomobject]@{ Result = 'WARN'; Check = "from the PC: $ipv6 not checked"; Detail = 'this PC has no working IPv6; the firewall rule covers ::/0 the same way (checked through the Contabo API)' })
-    }
 }
 foreach ($address in $addresses) {
     Add-Check "from the PC: $address answers on 22, 80, 443 only (6443, 6444, 10250, 10256, 2379, 2380, 8080 closed)" {
+        # IPv6 serves only SSH (no AAAA records); IPv4 serves 22, 80 and 443.
+        $wantOpen = if ($address.Contains(':')) { @(22) } else { @(22, 80, 443) }
         $open = @(22, 80, 443) | Where-Object { Test-Tcp $address $_ }
         $closed = @(6443, 6444, 10250, 10256, 2379, 2380, 8080) | Where-Object { Test-Tcp $address $_ }
         $problems = @()
-        if (@($open).Count -ne 3) { $problems += "open of 22/80/443: $($open -join ', ')" }
+        if ((@($open) -join ',') -ne ($wantOpen -join ',')) { $problems += "open of 22/80/443: $($open -join ', '), expected $($wantOpen -join ', ')" }
         if ($closed) { $problems += "should be closed but answer: $($closed -join ', ')" }
         if ($problems) { throw ($problems -join '; ') }
         '22, 80, 443 answer; the rest do not'
@@ -196,21 +249,20 @@ Add-Check 'Contabo API: the bought instance (V155, EU, not cancelled), one activ
     "instance $HostedInstanceId $($instance.productId) $($instance.region) $($instance.status); firewall $($fw.name): $($rules -join '; ')"
 }
 
-Add-Check 'Cloudflare API: A and AAAA for procure, auth, dashboard point at the server, not proxied' {
+Add-Check 'Cloudflare API: one A record each for procure, auth, dashboard to the server, not proxied; no AAAA' {
     if (-not $hostInfo) { throw 'no VM (host.json missing)' }
     $records = Get-HostedDnsRecords
-    $ipv6 = ($hostInfo.ipv6 -split '/')[0]
     $problems = @()
     foreach ($h in $HostedDnsHosts) {
-        foreach ($t in @(@('A', $hostInfo.ipv4), @('AAAA', $ipv6))) {
-            $r = @($records | Where-Object { $_.name -eq "$h.$HostedDomain" -and $_.type -eq $t[0] })
-            if ($r.Count -ne 1) { $problems += "$($t[0]) $h.$($HostedDomain): $($r.Count) records"; continue }
-            if ($r[0].content -ne $t[1]) { $problems += "$($t[0]) $h.$($HostedDomain) -> $($r[0].content), server is $($t[1])" }
-            if ($r[0].proxied) { $problems += "$($t[0]) $h.$($HostedDomain) is proxied" }
-        }
+        $a = @($records | Where-Object { $_.name -eq "$h.$HostedDomain" -and $_.type -eq 'A' })
+        if ($a.Count -ne 1) { $problems += "A $h.$($HostedDomain): $($a.Count) records"; continue }
+        if ($a[0].content -ne $hostInfo.ipv4) { $problems += "A $h.$($HostedDomain) -> $($a[0].content), server is $($hostInfo.ipv4)" }
+        if ($a[0].proxied) { $problems += "A $h.$($HostedDomain) is proxied" }
     }
+    $aaaa = @($records | Where-Object type -eq 'AAAA')
+    if ($aaaa) { $problems += "AAAA records exist: $(($aaaa | ForEach-Object name) -join ', ')" }
     if ($problems) { throw ($problems -join '; ') }
-    "$($records.Count) records, all to $($hostInfo.ipv4) / $ipv6, DNS only"
+    "$($records.Count) A records, all to $($hostInfo.ipv4), DNS only; no AAAA"
 }
 
 $results | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host

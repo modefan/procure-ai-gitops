@@ -7,6 +7,11 @@
 # "cancel instance", so prevent_destroy blocks it, and new-hosted-cluster.ps1 -Destroy removes only the free resources. Cancelling is
 # Dale's call, in the Contabo panel (procure-ai docs/hosting.md). The firewall, the SSH key secret and the DNS records are free.
 #
+# Run Terraform here ONLY through bootstrap/hosted/new-hosted-cluster.ps1: its plan check guards every apply and destroy. prevent_destroy
+# protects the instance only while its block is in this file. NEVER delete the contabo_instance block: a raw `terraform apply` would then
+# cancel the VPS. To stop managing the VM, use `terraform state rm contabo_instance.vps` or a
+# `removed { from = contabo_instance.vps  lifecycle { destroy = false } }` block.
+#
 # State is local and outside every repo: new-hosted-cluster.ps1 runs
 #   terraform init -backend-config="path=%USERPROFILE%\.procure-ai\hosted\terraform.tfstate"
 
@@ -71,7 +76,8 @@ resource "contabo_instance" "vps" {
 
 locals {
   ipv4 = contabo_instance.vps.ip_config[0].v4[0].ip
-  # The API writes IPv6 in full (2a02:...:0000:0001); cidrhost gives the short form Cloudflare stores, so the plan stays without drift.
+  # The VM's IPv6 address (reported only; k3s is IPv4 single-stack, so nothing but SSH answers on IPv6 and there are no AAAA records).
+  # The API writes it in full (2a02:...:0000:0001); cidrhost gives the short form.
   ipv6 = cidrhost("${contabo_instance.vps.ip_config[0].v6[0].ip}/128", 0)
 }
 
@@ -79,10 +85,13 @@ locals {
 # Kubernetes API, the kubelet and kube-proxy's health port also listen only on the node address (cloud-init), so they stay closed even
 # without this firewall.
 resource "contabo_firewall" "public" {
-  name         = "${var.server_name}-fw"
-  description  = "procure-ai hosted VM: in tcp 22, 80, 443 only (Terraform, procure-ai-gitops infra/hosted)"
-  status       = "active"
-  instance_ids = [tonumber(contabo_instance.vps.id)]
+  name        = "${var.server_name}-fw"
+  description = "procure-ai hosted VM: in tcp 22, 80, 443 only (Terraform, procure-ai-gitops infra/hosted)"
+  status      = "active"
+  # The approved ID (known at plan time), not contabo_instance.vps.id: a -Reinstall (state rm + adopt again) then changes nothing here, so
+  # the provider never unassigns and reassigns the firewall, and the VM is never without it.
+  instance_ids = [tonumber(var.instance_id)]
+  depends_on   = [contabo_instance.vps]
 
   rules {
     inbound {
@@ -106,15 +115,12 @@ resource "contabo_firewall" "public" {
   }
 }
 
-# A and AAAA for each host, straight to the server (DNS only: Traefik terminates TLS with Let's Encrypt, Task 12). Only these six
-# records are managed here; the apex and anything else in the zone are not touched.
+# An A record for each host, straight to the server (DNS only: Traefik terminates TLS with Let's Encrypt, Task 12). No AAAA: k3s is
+# IPv4 single-stack (ServiceLB publishes host ports for IPv4 only), so an AAAA record would send IPv6 clients and Let's Encrypt to an
+# address where 80/443 do not answer (controller ruling 2026-11-07; revisit with dual-stack in Task 12). Only these three records are
+# managed here; the apex and anything else in the zone are not touched.
 locals {
-  dns_records = merge([
-    for host in var.dns_hosts : {
-      "${host}-A"    = { name = "${host}.${var.domain}", type = "A", content = local.ipv4 }
-      "${host}-AAAA" = { name = "${host}.${var.domain}", type = "AAAA", content = local.ipv6 }
-    }
-  ]...)
+  dns_records = { for host in var.dns_hosts : "${host}-A" => { name = "${host}.${var.domain}", type = "A", content = local.ipv4 } }
 }
 
 resource "cloudflare_dns_record" "host" {

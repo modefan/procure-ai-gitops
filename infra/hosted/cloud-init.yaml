@@ -2,7 +2,9 @@
 # First boot of the hosted VM after a (re)install (Contabo user_data; Terraform templatefile: admin_user, ssh_public_key, k3s_version,
 # node_ip). Runs once; for a running VM make the same change over SSH and keep this file in line (main.tf ignores user_data changes).
 # Checked by bootstrap/hosted/Test-HostBaseline.ps1.
-#  - one non-root sudo user, SSH key only: no password login, no root login, no keyboard-interactive, only that user;
+#  - one non-root sudo user, SSH key only: no password login, no root login, no keyboard-interactive, only that user (the image's
+#    default user `ubuntu`, which Contabo's merged config also creates, is removed);
+#  - a host firewall (nftables table inet procure_host) next to Contabo's: on the public interface only 22, 80, 443 and replies come in;
 #  - fail2ban on sshd (journal backend; OpenSSH >= 9.8 logs failed logins as sshd-session under ssh.service);
 #  - unattended security upgrades (no automatic reboot: a reboot is a deliberate step, it restarts the whole demo);
 #  - k3s pinned (download and install retried); the node address ${node_ip} lives on a dummy interface (Contabo's private networks are
@@ -29,6 +31,7 @@ packages:
   - unattended-upgrades
   - fail2ban
   - python3-systemd
+  - nftables
 
 write_files:
   # sshd takes the first value it reads, and Ubuntu's sshd_config includes sshd_config.d/*.conf at the top: 00- wins over cloud-init's
@@ -96,6 +99,9 @@ write_files:
       advertise-address: ${node_ip}
       bind-address: ${node_ip}
       write-kubeconfig-mode: "0600"
+      # One node: pods reach each other over the cni0 bridge, so flannel needs no tunnel. host-gw opens no socket (VXLAN would listen
+      # on UDP 8472 on every interface, an unauthenticated way into the pod network).
+      flannel-backend: host-gw
       # kube-proxy's health endpoint (10256) on the node address too (its metrics stay on 127.0.0.1).
       kube-proxy-arg:
         - "healthz-bind-address=${node_ip}:10256"
@@ -143,6 +149,51 @@ write_files:
       [Service]
       ExecStartPre=/usr/local/sbin/ensure-node-ip.sh
 
+  # Host firewall, in its own nftables table (k3s's kube-proxy and flannel rules live in the ip/ip6 tables of iptables-nft and are not
+  # touched; the file replaces only this table). Public interface eth0: replies, SSH, HTTP, HTTPS and the ICMPv6 that IPv6 needs come in,
+  # nothing else. The input chain covers the host's own sockets; the forward chain covers what kube-proxy and ServiceLB forward to pods
+  # (after DNAT, so the original destination port decides): only 80 and 443, never a NodePort. Contabo's firewall in front does the same.
+  - path: /etc/procure/host-firewall.nft
+    permissions: "0644"
+    content: |
+      table inet procure_host
+      delete table inet procure_host
+      table inet procure_host {
+        chain input {
+          type filter hook input priority filter; policy accept;
+          iifname != "eth0" accept
+          ct state established,related accept
+          ct state invalid drop
+          tcp dport { 22, 80, 443 } accept
+          icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big, destination-unreachable, time-exceeded, parameter-problem } accept
+          icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+          counter drop
+        }
+        chain forward {
+          type filter hook forward priority filter; policy accept;
+          iifname != "eth0" accept
+          ct state established,related accept
+          ct state invalid drop
+          meta l4proto tcp ct original proto-dst { 80, 443 } accept
+          counter drop
+        }
+      }
+  - path: /etc/systemd/system/procure-host-firewall.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=procure-ai host firewall (nftables table inet procure_host)
+      DefaultDependencies=no
+      Before=network-pre.target k3s.service
+      Wants=network-pre.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/procure/host-firewall.nft
+      ExecStop=/usr/sbin/nft delete table inet procure_host
+      [Install]
+      WantedBy=multi-user.target
+
   # The install script of the pinned release (it checks the binary's sha256 against the release's checksums). The whole download and
   # install is tried up to 3 times (a GitHub or DNS hiccup on the first boot must not leave the VM without k3s).
   - path: /usr/local/sbin/install-k3s.sh
@@ -163,6 +214,9 @@ write_files:
       exit 1
 
 runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, procure-host-firewall.service]
+  - [sh, -c, "if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi"]
   - [systemctl, restart, systemd-logind]
   - [systemctl, restart, ssh]
   - [systemctl, enable, --now, fail2ban]
