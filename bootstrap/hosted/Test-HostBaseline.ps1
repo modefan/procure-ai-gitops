@@ -171,6 +171,17 @@ Add-Check 'flannel uses host-gw (no VXLAN socket)' {
     'host-gw; no vxlan interface, nothing on UDP 8472'
 }
 
+Add-Check 'the IPv4 and IPv6 default routes use eth0, the interface the host firewall filters' {
+    # The nftables rules match iifname "eth0"; with any other public interface name (a future image with predictable names) they would
+    # let everything through.
+    $routes = Get-Ssh 'ip -4 route show default | awk ''{for (i=1;i<NF;i++) if ($i=="dev") print $(i+1)}''; echo ---; ip -6 route show default | awk ''{for (i=1;i<NF;i++) if ($i=="dev") print $(i+1)}'''
+    $v4 = @($routes | Select-Object -First ([array]::IndexOf(@($routes), '---')) | Where-Object { $_ })
+    $v6 = @($routes | Select-Object -Skip ([array]::IndexOf(@($routes), '---') + 1) | Where-Object { $_ })
+    if (-not $v4 -or @($v4 | Where-Object { $_ -ne 'eth0' })) { throw "IPv4 default route via '$($v4 -join ', ')', but the host firewall filters eth0: fix the interface name in /etc/procure/host-firewall.nft and cloud-init.yaml" }
+    if (@($v6 | Where-Object { $_ -ne 'eth0' })) { throw "IPv6 default route via '$($v6 -join ', ')', but the host firewall filters eth0" }
+    "IPv4 default via $($v4 -join ', '); IPv6 default via $(if ($v6) { $v6 -join ', ' } else { 'none' })"
+}
+
 Add-Check 'host firewall loaded (nftables inet procure_host: eth0 in 22/80/443 + replies, forward only 80/443)' {
     $active = (Get-Ssh 'systemctl is-active procure-host-firewall; systemctl is-enabled procure-host-firewall') -join ','
     $table = (Get-Ssh 'sudo nft list table inet procure_host') -join "`n"

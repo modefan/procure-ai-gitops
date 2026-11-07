@@ -243,20 +243,36 @@ if ($changes.Count -gt 0) {
         $answer = Read-Host "Apply this plan?$(if ($adopts) { ' The VM is reinstalled (all data lost).' }) (type yes)"
         if ($answer -ne 'yes') { Remove-Item $planFile -ErrorAction SilentlyContinue; Write-Host 'Not applied.'; return }
     }
+    $applyStart = [DateTime]::UtcNow.AddSeconds(-30)
     $applyOut = & terraform "-chdir=$tfDir" apply -input=false -no-color $planFile 2>&1
     $applyExit = $LASTEXITCODE
     Remove-Item $planFile -ErrorAction SilentlyContinue
     if ($applyExit -ne 0) { throw "terraform apply failed: $($applyOut -join [Environment]::NewLine)" }
     $applyOut | Select-Object -Last 3 | ForEach-Object { Write-Host $_ }
     if ($adopts) {
-        # Provider 0.1.44 drops the reinstall call's error (resourceInstanceUpdate ignores it), so ask the API: a failed reinstall shows as
-        # status error / an errorMessage, or the instance never gets the new SSH key.
+        # Provider 0.1.44 drops the reinstall call's error (resourceInstanceUpdate ignores it), so ask the API. First proof that a reinstall
+        # STARTED after this apply began: the instance's audit log has a status change to "reinstalling" or "installing" (an instance that
+        # was already running with the same key would otherwise pass at once). Then: running, with our SSH key on it. A failed reinstall
+        # shows as status error / an errorMessage.
         $keyId = [int64] ((Invoke-Terraform output -raw ssh_key_secret_id) -join '')
+        $startDeadline = (Get-Date).AddMinutes(5)
         $deadline = (Get-Date).AddMinutes(15)
+        $started = $false
         while ($true) {
             $now = Get-Instance
             if ($now.status -eq 'error' -or $now.errorMessage) { throw "The reinstall of instance $HostedInstanceId failed (Contabo API: status $($now.status), '$($now.errorMessage)')." }
-            if ($now.status -eq 'running' -and @($now.sshKeys) -contains $keyId) { Write-Host "Reinstall accepted (Contabo API: running, SSH key $keyId on the instance)."; break }
+            if (-not $started) {
+                # Only the status field of each change is read (a change may also carry other fields; none is printed).
+                $audits = @((Invoke-ContaboApi "compute/instances/audits?instanceId=$HostedInstanceId&size=100").data)
+                $started = @($audits | Where-Object {
+                        ([DateTime] $_.timestamp).ToUniversalTime() -ge $applyStart -and
+                        $_.changes.PSObject.Properties['new'] -and $_.changes.new.PSObject.Properties['status'] -and
+                        $_.changes.new.status -in 'reinstalling', 'installing' }).Count -gt 0
+                if (-not $started -and $now.status -in 'reinstalling', 'installing') { $started = $true }
+                if ($started) { Write-Host 'Reinstall started (Contabo API: status reinstalling/installing after this apply began).' }
+                elseif ((Get-Date) -gt $startDeadline) { throw "No sign that the reinstall of instance $HostedInstanceId started: within 5 minutes the Contabo API showed no status 'reinstalling' or 'installing' since the apply began (status now: $($now.status)). The provider may have dropped the reinstall error; check the Contabo panel." }
+            }
+            if ($started -and $now.status -eq 'running' -and @($now.sshKeys) -contains $keyId) { Write-Host "Reinstall done (Contabo API: running, SSH key $keyId on the instance)."; break }
             if ((Get-Date) -gt $deadline) { throw "The reinstall of instance $HostedInstanceId did not finish within 15 minutes (Contabo API: status $($now.status), SSH keys $(@($now.sshKeys) -join ','))." }
             Start-Sleep -Seconds 20
         }
