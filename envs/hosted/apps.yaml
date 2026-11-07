@@ -1,4 +1,4 @@
-# Values of the app of apps (apps/) for the hosted VM (Hetzner, bootstrap/hosted/). The revision is in release.yaml.
+# Values of the app of apps (apps/) for the hosted VM (Contabo VPS, bootstrap/hosted/). The revision is in release.yaml.
 # PLACEHOLDER of plan 08 Task 11: only Argo CD (managing itself) runs; Task 12 adds platform.yaml, procure-ai.yaml and observability.yaml
 # (ingress hosts, certificates, sizes) and turns the three Applications on.
 env: hosted

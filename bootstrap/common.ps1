@@ -35,7 +35,7 @@ $script:AppHostUserSecretsId = 'procure-ai-apphost'
 # the hosted cluster (plan 08 ruling 11), so the public demo shares no secret with Dale's PC.
 $script:UserSecretsId = $script:AppHostUserSecretsId
 
-# --- The hosted VM (plan 08 Task 11, ruling 10): Hetzner Cloud, Terraform in infra/hetzner, k3s by cloud-init. ------------------------
+# --- The hosted VM (plan 08 Task 11, ruling 10): a Contabo Cloud VPS, Terraform in infra/hosted, k3s by cloud-init. -------------------
 # Everything that must stay off the repos lives here (current user only; listed by name in DEMO PASSWORDS.txt): the SSH key pair
 # procure-hosted_ed25519(.pub), known_hosts, the Terraform state terraform.tfstate, host.json (addresses, user) and the kubeconfig.
 $script:HostedDir = Join-Path $env:USERPROFILE '.procure-ai\hosted'
@@ -47,17 +47,21 @@ $script:HostedTunnelPidFile = Join-Path $script:HostedDir 'tunnel.pid'
 $script:HostedStateFile = Join-Path $script:HostedDir 'terraform.tfstate'
 $script:HostedKubeContext = 'procure-hosted'
 $script:HostedUserSecretsId = 'procure-ai-hosted'
-# The Kubernetes API listens only on the VM's private address (infra/hetzner, k3s bind-address); open-tunnel.ps1 forwards this loopback
+# The Kubernetes API listens only on the VM's node address (a dummy interface; infra/hosted, k3s bind-address); open-tunnel.ps1 forwards this loopback
 # port of Dale's PC to it over SSH. Not 6550 (the local cluster's API port), so both clusters can be used side by side.
 $script:HostedTunnelPort = 16443
 # Pinned k3s release of the hosted VM: the local cluster's minor (K3sImage above), the newest patch when the VM was created (a public
 # node gets the security fixes). Changing it needs an upgrade on the VM (or a new VM), not only this line.
 $script:HostedK3sVersion = 'v1.35.10+k3s1'
-# What Dale approved (plan 08, DALE DECISION 2026-11-07 14:05): cx43 or cx53, whichever Hetzner has in stock first, in fsn1, nbg1 or hel1,
-# at these monthly net prices (EUR, per the Hetzner API on 2026-11-07). new-hosted-cluster.ps1 refuses any other type, location or a
-# higher API price; infra/hetzner/variables.tf validates the same lists. Order = preference (-WaitForStock tries them in this order).
-$script:HostedApprovedTypes = [ordered]@{ cx43 = 15.99; cx53 = 29.49 }
-$script:HostedApprovedLocations = @('fsn1', 'nbg1', 'hel1')
+# What Dale bought and approved (plan 08, DALE DECISION 2026-11-07 ~16:30): Contabo Cloud VPS 8 (product V155, region EU, 8 vCPU, 24 GB,
+# 300 GB), instance 203735351, EUR 14.00 a month, monthly term. Terraform adopts exactly this instance and never orders or cancels one
+# (infra/hosted/variables.tf validates the ID; new-hosted-cluster.ps1 refuses any other plan).
+$script:HostedInstanceId = '203735351'
+$script:HostedProductId = 'V155'
+$script:HostedMonthlyPrice = 'EUR 14.00'
+# The Contabo password secret that keeps Dale's root password (console login) valid across the reinstall; created once from DEMO
+# PASSWORDS.txt ("=== Contabo ===", "VPS root password") by new-hosted-cluster.ps1, value never printed.
+$script:HostedRootPasswordSecretName = 'procure-hosted-root-password'
 # The Cloudflare DNS records Terraform keeps (A and AAAA each, DNS only): <host>.<domain> -> the server.
 $script:HostedDomain = 'daleabels.com'
 $script:HostedDnsHosts = @('procure', 'auth', 'dashboard')
@@ -83,7 +87,7 @@ function Select-ProcureCluster {
 }
 
 function Get-HostedHost {
-    # host.json, written by new-hosted-cluster.ps1 from the Terraform outputs: serverId, ipv4, ipv6, privateIp, user.
+    # host.json, written by new-hosted-cluster.ps1 from the Terraform outputs: instanceId, ipv4, ipv6, nodeIp, user, firewallId, dnsNames.
     if (-not (Test-Path $script:HostedHostFile)) { throw "No $script:HostedHostFile. Run bootstrap/hosted/new-hosted-cluster.ps1 first." }
     Get-Content -Raw $script:HostedHostFile | ConvertFrom-Json
 }
@@ -95,9 +99,31 @@ function Get-ApiToken([string] $name) {
     $value
 }
 
-function Invoke-HetznerApi([string] $path) {
-    # GET on the Hetzner Cloud API (project procure-ai, token HCLOUD_TOKEN).
-    Invoke-RestMethod -Headers @{ Authorization = "Bearer $(Get-ApiToken 'HCLOUD_TOKEN')" } "https://api.hetzner.cloud/v1/$path"
+$script:ContaboToken = $null
+$script:ContaboTokenExpires = [datetime]::MinValue
+function Get-ContaboToken {
+    # OAuth2 password grant with Dale's API credentials (user env vars CONTABO_CLIENT_ID, CONTABO_CLIENT_SECRET, CONTABO_USER,
+    # CONTABO_PASSWORD), cached until shortly before it expires. auth.contabo.com sits behind a bot check that challenges PowerShell's
+    # default user agent, so the request names itself like a command-line client.
+    if ($script:ContaboToken -and (Get-Date) -lt $script:ContaboTokenExpires) { return $script:ContaboToken }
+    $body = @{
+        grant_type = 'password'; client_id = (Get-ApiToken 'CONTABO_CLIENT_ID'); client_secret = (Get-ApiToken 'CONTABO_CLIENT_SECRET')
+        username = (Get-ApiToken 'CONTABO_USER'); password = (Get-ApiToken 'CONTABO_PASSWORD')
+    }
+    $response = Invoke-RestMethod -Method Post -Uri 'https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token' -Body $body `
+        -ContentType 'application/x-www-form-urlencoded' -UserAgent 'procure-bootstrap/1.0 (curl-compatible)'
+    $script:ContaboToken = $response.access_token
+    $script:ContaboTokenExpires = (Get-Date).AddSeconds([int] $response.expires_in - 30)
+    $script:ContaboToken
+}
+
+function Invoke-ContaboApi {
+    # A call to the Contabo API (https://api.contabo.com/v1/<path>); every request carries its own x-request-id. Returns the parsed body.
+    param([Parameter(Mandatory)] [string] $Path, [string] $Method = 'Get', $Body)
+    $headers = @{ Authorization = "Bearer $(Get-ContaboToken)"; 'x-request-id' = [guid]::NewGuid().ToString() }
+    $args2 = @{ Method = $Method; Uri = "https://api.contabo.com/v1/$Path"; Headers = $headers }
+    if ($null -ne $Body) { $args2.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $args2.ContentType = 'application/json' }
+    Invoke-RestMethod @args2
 }
 
 function Invoke-CloudflareApi([string] $path) {
@@ -113,22 +139,6 @@ function Get-HostedDnsRecords {
         (Invoke-CloudflareApi "zones/$script:HostedCloudflareZoneId/dns_records?name=$([uri]::EscapeDataString($name))&per_page=100").result |
             Where-Object { $_.name -eq $name -and $_.type -in 'A', 'AAAA' }
     })
-}
-
-function Get-HostedServerPrice([string] $type, [string] $location) {
-    # Monthly net and gross price (EUR) of a server type in a location and of a primary IPv4 there, from the Hetzner API.
-    $typeInfo = (Invoke-HetznerApi "server_types?name=$type").server_types | Select-Object -First 1
-    if (-not $typeInfo) { throw "Hetzner has no server type $type." }
-    $price = $typeInfo.prices | Where-Object location -eq $location
-    $ipv4 = ((Invoke-HetznerApi 'pricing').pricing.primary_ips | Where-Object type -eq 'ipv4').prices | Where-Object location -eq $location
-    # Fail closed: no price is never read as 0 (which would pass the approved-price check).
-    if (-not $price -or -not $price.price_monthly -or [string]::IsNullOrEmpty("$($price.price_monthly.net)")) { throw "The Hetzner API has no price for $type in $location." }
-    if (-not $ipv4 -or -not $ipv4.price_monthly -or [string]::IsNullOrEmpty("$($ipv4.price_monthly.net)")) { throw "The Hetzner API has no primary IPv4 price for $location." }
-    [pscustomobject]@{
-        Net = [double] $price.price_monthly.net; Gross = [double] $price.price_monthly.gross
-        Ipv4Net = [double] $ipv4.price_monthly.net; Ipv4Gross = [double] $ipv4.price_monthly.gross
-        Available = [bool] (@($typeInfo.locations | Where-Object { $_.name -eq $location -and $_.available }).Count)
-    }
 }
 
 function Get-HostedSshArgs {

@@ -38,6 +38,14 @@ Hostnames (all `*.localtest.me`, which resolves to 127.0.0.1): `procure.localtes
 `dashboard.procure.localtest.me`, `argocd.procure.localtest.me`, `mail.procure.localtest.me`. Inside the cluster CoreDNS answers
 `auth.procure.localtest.me` with the Traefik service, so pods reach Keycloak by the same URL as the token issuer.
 
+## Hosted VM (Contabo)
+
+The live demo runs on a Contabo Cloud VPS with k3s, built by Terraform in `infra/hosted/` (the adopted VPS reinstalled with cloud-init,
+Contabo's firewall, the Cloudflare DNS records) and bootstrapped through an SSH tunnel by `bootstrap/hosted/`:
+`new-hosted-cluster.ps1` (plan, money guard, apply, kubeconfig), then `new-secrets.ps1 -Environment hosted` and
+`install-argocd.ps1 -Environment hosted`; `bootstrap/hosted/Test-HostBaseline.ps1` checks the security baseline from the PC. Costs, how
+to cancel and every step: procure-ai `docs/hosting.md`.
+
 ## GitOps: how a commit gets deployed
 
 ```

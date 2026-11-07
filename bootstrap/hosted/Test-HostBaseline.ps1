@@ -9,14 +9,16 @@
       - unattended security upgrades on (APT::Periodic::Unattended-Upgrade 1, service enabled);
       - k3s runs the pinned release (bootstrap/common.ps1 HostedK3sVersion) and the node is Ready;
       - the kubelet's live configuration: shutdownGracePeriod 60s, shutdownGracePeriodCriticalPods 20s; logind waits long enough;
-      - the API (6443), the kubelet (10250) and kube-proxy's health port (10256) listen only on the private address (or loopback),
+      - the API (6443), the kubelet (10250) and kube-proxy's health port (10256) listen only on the node address (dummy interface) or loopback,
         never on a public interface or a wildcard;
       - WARN (not a failure) when a kernel or library update waits for a reboot (/var/run/reboot-required).
-    From the PC, against the public IPv4 (and IPv6 when the PC has a route):
+    From the PC, against the public IPv4 (and IPv6 when the PC has a route); before host.json exists, the addresses come from the Contabo
+    API, so the outside checks also run against a VM that is not set up yet:
       - root and password logins are refused (the server offers only publickey);
       - 22, 80 and 443 answer; 6443 and the other Kubernetes ports (6444, 10250, 10256, 2379, 2380, 8472/udp is not checked) do not.
-    Through the Hetzner API: the server has the type and location in host.json, both approved (bootstrap/common.ps1), and the firewall
-    applied to it has exactly in/tcp 22, 80, 443. Through the Cloudflare API: exactly A and AAAA for procure, auth and dashboard
+    Through the Contabo API: the instance is the one Dale bought (bootstrap/common.ps1: ID, product V155, EU, not cancelled), and exactly
+    one active firewall holds it, with exactly one active rule: in tcp 22, 80, 443 from anywhere (IPv4 and IPv6). WARN when Contabo's VNC
+    console is enabled (the API cannot turn it off; Dale can in the panel). Through the Cloudflare API: exactly A and AAAA for procure, auth and dashboard
     .daleabels.com, pointing at the server's IPv4 and IPv6, not proxied.
     Prints PASS/FAIL per check and exits 1 when any check fails. Prints no secret.
 #>
@@ -35,7 +37,8 @@ function Add-Check([string] $name, [scriptblock] $check) {
 }
 
 function Test-Tcp([string] $address, [int] $port, [int] $timeoutMs = 3000) {
-    $client = [System.Net.Sockets.TcpClient]::new($address.Contains(':') ? 'InterNetworkV6' : 'InterNetwork')
+    $family = if ($address.Contains(':')) { [System.Net.Sockets.AddressFamily]::InterNetworkV6 } else { [System.Net.Sockets.AddressFamily]::InterNetwork }
+    $client = [System.Net.Sockets.TcpClient]::new($family)
     try { $client.ConnectAsync($address, $port).Wait($timeoutMs) -and $client.Connected } catch { $false } finally { $client.Dispose() }
 }
 
@@ -43,8 +46,17 @@ $hostInfo = $null
 Add-Check 'host.json and SSH key exist (VM created by new-hosted-cluster.ps1)' {
     if (-not (Test-Path $HostedSshKey)) { throw "no SSH key at $HostedSshKey" }
     $script:hostInfo = Get-HostedHost
-    "server $($hostInfo.serverId) at $($hostInfo.ipv4)"
+    "instance $($hostInfo.instanceId) at $($hostInfo.ipv4)"
 }
+# The public addresses for the outside checks: host.json, or (not set up yet) what the Contabo API reports for the bought instance.
+$publicAddresses = $null
+try {
+    if ($hostInfo) { $publicAddresses = @($hostInfo.ipv4, $hostInfo.ipv6) }
+    else {
+        $ipConfig = @((Invoke-ContaboApi "compute/instances/$HostedInstanceId").data)[0].ipConfig
+        $publicAddresses = @($ipConfig.v4.ip, ([System.Net.IPAddress]::Parse($ipConfig.v6.ip)).ToString())
+    }
+} catch { }
 function Get-Ssh([string] $command) {
     if (-not $script:hostInfo) { throw 'no VM (host.json missing)' }
     Invoke-HostedSsh -Command $command
@@ -61,13 +73,17 @@ Add-Check 'sshd: no root login, no password or keyboard-interactive login, publi
 }
 
 Add-Check 'from the PC: root and password logins refused (server offers publickey only)' {
-    if (-not $hostInfo) { throw 'no VM (host.json missing)' }
-    $common = @('-o', "UserKnownHostsFile=$HostedKnownHosts", '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15')
+    if (-not $publicAddresses) { throw 'no address (host.json missing and the Contabo API did not answer)' }
+    $user = if ($hostInfo) { $hostInfo.user } else { 'procure' }
+    $ip = $publicAddresses[0]
+    # Only refusals are tested here, so the server's host key does not matter (and before the first setup none is recorded): no known_hosts
+    # is read or written. Every connection that matters (Invoke-HostedSsh) checks the key strictly.
+    $common = @('-o', 'UserKnownHostsFile=NUL', '-o', 'StrictHostKeyChecking=no', '-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15')
     # Root with the right key: refused (AllowUsers and PermitRootLogin).
-    $root = & ssh @common -i $HostedSshKey -o IdentitiesOnly=yes "root@$($hostInfo.ipv4)" true 2>&1
+    $root = & ssh @common -i $HostedSshKey -o IdentitiesOnly=yes "root@$ip" true 2>&1
     if ($LASTEXITCODE -eq 0) { throw 'root logged in with the admin key' }
     # No key at all: the server must list only publickey as a method (no password, no keyboard-interactive).
-    $nokey = & ssh @common -o PubkeyAuthentication=no -o 'PreferredAuthentications=password,keyboard-interactive' "$($hostInfo.user)@$($hostInfo.ipv4)" true 2>&1
+    $nokey = & ssh @common -o PubkeyAuthentication=no -o 'PreferredAuthentications=password,keyboard-interactive' "$user@$ip" true 2>&1
     $denied = ($nokey | ForEach-Object { "$_" }) -match 'Permission denied \(([^)]*)\)'
     if ($LASTEXITCODE -eq 0 -or -not $denied) { throw "unexpected answer without a key: $($nokey -join ' ')" }
     $methods = ([regex]::Match(($nokey -join ' '), 'Permission denied \(([^)]*)\)')).Groups[1].Value
@@ -112,10 +128,10 @@ Add-Check 'kubelet: shutdownGracePeriod 60s, shutdownGracePeriodCriticalPods 20s
 }
 
 foreach ($port in 6443, 10250, 10256) {
-    Add-Check "port $port listens only on the private address, not on a public interface" {
+    Add-Check "port $port listens only on the node address, not on a public interface" {
         $listeners = @(Get-Ssh "ss -Hltn 'sport = :$port' | awk '{print `$4}'" | Where-Object { $_ })
         if (-not $listeners) { throw "nothing listens on $port" }
-        $bad = @($listeners | Where-Object { $_ -notin @("$($hostInfo.privateIp):$port", "127.0.0.1:$port", "[::1]:$port") })
+        $bad = @($listeners | Where-Object { $_ -notin @("$($hostInfo.nodeIp):$port", "127.0.0.1:$port", "[::1]:$port") })
         if ($bad) { throw "$port listens on $($bad -join ', ')" }
         "listens on $($listeners -join ', ')"
     }
@@ -132,11 +148,15 @@ if ($hostInfo) {
 }
 
 $addresses = @()
-if ($hostInfo) {
-    $addresses += $hostInfo.ipv4
+if ($publicAddresses) {
+    $addresses += $publicAddresses[0]
     # The PC may have no IPv6 route; check IPv6 only when it does.
-    $ipv6 = ($hostInfo.ipv6 -split '/')[0]
-    if ($ipv6 -and (Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue)) { $addresses += $ipv6 }
+    # Only with working IPv6 on the PC (a route alone is not enough): a connection to Cloudflare's resolver over IPv6 must succeed.
+    $ipv6 = ($publicAddresses[1] -split '/')[0]
+    if ($ipv6 -and (Test-Tcp '2606:4700:4700::1111' 443)) { $addresses += $ipv6 }
+    elseif ($ipv6) {
+        $results.Add([pscustomobject]@{ Result = 'WARN'; Check = "from the PC: $ipv6 not checked"; Detail = 'this PC has no working IPv6; the firewall rule covers ::/0 the same way (checked through the Contabo API)' })
+    }
 }
 foreach ($address in $addresses) {
     Add-Check "from the PC: $address answers on 22, 80, 443 only (6443, 6444, 10250, 10256, 2379, 2380, 8080 closed)" {
@@ -149,21 +169,31 @@ foreach ($address in $addresses) {
         '22, 80, 443 answer; the rest do not'
     }
 }
-if (-not $hostInfo) { Add-Check 'from the PC: public address answers on 22, 80, 443 only' { throw 'no VM (host.json missing)' } }
+if (-not $addresses) { Add-Check 'from the PC: public address answers on 22, 80, 443 only' { throw 'no address (host.json missing and the Contabo API did not answer)' } }
 
-Add-Check 'Hetzner API: server of the approved type and location in host.json, firewall with exactly in/tcp 22, 80, 443 applied' {
-    if (-not $hostInfo) { throw 'no VM (host.json missing)' }
-    $server = (Invoke-HetznerApi "servers/$($hostInfo.serverId)").server
-    $type = $server.server_type.name; $location = $server.location.name
-    if ($type -ne $hostInfo.type -or $location -ne $hostInfo.location) { throw "server is $type in $location, host.json says $($hostInfo.type) in $($hostInfo.location)" }
-    if (-not $HostedApprovedTypes.Contains($type) -or $location -notin $HostedApprovedLocations) { throw "$type in $location is not approved" }
-    if ($server.backup_window) { throw 'backups are on' }
-    $firewallIds = @($server.public_net.firewalls | Where-Object status -eq 'applied' | ForEach-Object id)
-    if ($firewallIds.Count -ne 1) { throw "firewalls applied: $($firewallIds.Count)" }
-    $fw = (Invoke-HetznerApi "firewalls/$($firewallIds[0])").firewall
-    $rules = @($fw.rules | ForEach-Object { "$($_.direction)/$($_.protocol)/$($_.port)" } | Sort-Object)
-    if (($rules -join ',') -ne 'in/tcp/22,in/tcp/443,in/tcp/80') { throw "rules: $($rules -join ', ')" }
-    "server $($server.name) $type $location; firewall $($fw.name): $($rules -join ', ')"
+Add-Check 'Contabo API: the bought instance (V155, EU, not cancelled), one active firewall with exactly in tcp 22, 80, 443' {
+    $instance = @((Invoke-ContaboApi "compute/instances/$HostedInstanceId").data)[0]
+    if ($hostInfo -and $hostInfo.instanceId -ne $HostedInstanceId) { throw "host.json names instance $($hostInfo.instanceId), approved is $HostedInstanceId" }
+    if ($instance.productId -ne $HostedProductId -or $instance.region -ne 'EU' -or $instance.cancelDate) {
+        throw "instance $HostedInstanceId is $($instance.productId) in $($instance.region), cancel date '$($instance.cancelDate)'"
+    }
+    $firewalls = @((Invoke-ContaboApi 'firewalls?size=100').data | Where-Object { @($_.instances | Where-Object { "$($_.instanceId)" -eq $HostedInstanceId }).Count })
+    if ($firewalls.Count -ne 1) { throw "firewalls holding the instance: $($firewalls.Count)" }
+    $fw = $firewalls[0]
+    if ($fw.status -ne 'active') { throw "firewall $($fw.name) is $($fw.status)" }
+    $active = @($fw.rules.inbound | Where-Object { $_.status -eq 'active' })
+    $rules = @($active | Where-Object { $_.action -eq 'accept' } | ForEach-Object {
+        "$($_.protocol)/$((@($_.destPorts) | Sort-Object) -join ',')/$((@($_.srcCidr.ipv4) + @($_.srcCidr.ipv6) | Sort-Object) -join ',')" })
+    if (($rules -join ';') -notin 'tcp/22,443,80/0.0.0.0/0,::/0', 'tcp/22,443,80/::/0,0.0.0.0/0') { throw "active accept rules: $($rules -join '; ')" }
+    # Contabo's own last rule drops everything else (it is what makes the accept rule an allow-list).
+    $drop = @($active | Where-Object { $_.action -eq 'drop' -and -not $_.protocol -and -not @($_.destPorts).Count -and -not (@($_.srcCidr.ipv4) + @($_.srcCidr.ipv6) | Where-Object { $_ }) })
+    if ($drop.Count -ne 1) { throw "no active 'drop all' rule after the accept rule" }
+    $rules += 'drop all'
+    $vnc = @((Invoke-ContaboApi "compute/instances/$HostedInstanceId/vnc").data)[0]
+    if ($vnc.enabled) {
+        $results.Add([pscustomobject]@{ Result = 'WARN'; Check = 'Contabo VNC console is enabled'; Detail = 'the API cannot turn it off; Dale can in the Contabo panel (it needs the root password, which SSH does not accept)' })
+    }
+    "instance $HostedInstanceId $($instance.productId) $($instance.region) $($instance.status); firewall $($fw.name): $($rules -join '; ')"
 }
 
 Add-Check 'Cloudflare API: A and AAAA for procure, auth, dashboard point at the server, not proxied' {

@@ -1,13 +1,14 @@
 #cloud-config
-# First boot of the hosted VM (Terraform templatefile: admin_user, ssh_public_key, k3s_version, private_ip). Runs once; for a running VM
-# make the same change over SSH and keep this file in line (main.tf ignores user_data changes). Checked by
-# bootstrap/hosted/Test-HostBaseline.ps1.
+# First boot of the hosted VM after a (re)install (Contabo user_data; Terraform templatefile: admin_user, ssh_public_key, k3s_version,
+# node_ip). Runs once; for a running VM make the same change over SSH and keep this file in line (main.tf ignores user_data changes).
+# Checked by bootstrap/hosted/Test-HostBaseline.ps1.
 #  - one non-root sudo user, SSH key only: no password login, no root login, no keyboard-interactive, only that user;
 #  - fail2ban on sshd (journal backend; OpenSSH >= 9.8 logs failed logins as sshd-session under ssh.service);
 #  - unattended security upgrades (no automatic reboot: a reboot is a deliberate step, it restarts the whole demo);
-#  - k3s pinned (download and install retried), started only once the private address is up; the API server, the kubelet and
-#    kube-proxy's health port bound to the private address only (the API is reached through an SSH tunnel); kubelet graceful shutdown
-#    60 s (20 s of it for critical pods) and the same memory reservations as the local cluster (bootstrap/common.ps1).
+#  - k3s pinned (download and install retried); the node address ${node_ip} lives on a dummy interface (Contabo's private networks are
+#    a paid add-on), created before k3s starts on every boot; the API server, the kubelet and kube-proxy's health port listen only on
+#    it (the API is reached through an SSH tunnel); kubelet graceful shutdown 60 s (20 s of it for critical pods); memory reservations
+#    sized for the 24 GB VM.
 
 users:
   - name: ${admin_user}
@@ -77,8 +78,10 @@ write_files:
       Unattended-Upgrade::Automatic-Reboot "false";
       Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 
-  # The kubelet's graceful node shutdown needs logind to wait that long (Ubuntu's default InhibitDelayMaxSec is 5 s).
-  - path: /etc/systemd/logind.conf.d/50-kubelet-shutdown.conf
+  # The kubelet's graceful node shutdown needs logind to wait that long. logind reads its drop-ins from /etc, /run and /usr/lib sorted by
+  # file name, the last one winning: unattended-upgrades ships "unattended-upgrades-logind-maxdelay.conf" (30 s) and the kubelet writes
+  # "99-kubelet.conf" (60 s), so this file must sort after both.
+  - path: /etc/systemd/logind.conf.d/zz-procure-kubelet-shutdown.conf
     permissions: "0644"
     content: |
       [Login]
@@ -87,15 +90,15 @@ write_files:
   - path: /etc/rancher/k3s/config.yaml
     permissions: "0600"
     content: |
-      # The node and the API on the private address only: nothing of Kubernetes listens on the public interfaces except Traefik's
-      # 80/443 (ServiceLB host ports), and the Hetzner firewall drops everything but 22, 80 and 443 anyway.
-      node-ip: ${private_ip}
-      advertise-address: ${private_ip}
-      bind-address: ${private_ip}
+      # The node and the API on the dummy node address only: nothing of Kubernetes listens on the public interfaces except Traefik's
+      # 80/443 (ServiceLB host ports), and Contabo's firewall drops everything but 22, 80 and 443 anyway.
+      node-ip: ${node_ip}
+      advertise-address: ${node_ip}
+      bind-address: ${node_ip}
       write-kubeconfig-mode: "0600"
-      # kube-proxy's health endpoint (10256) on the private address too (its metrics stay on 127.0.0.1).
+      # kube-proxy's health endpoint (10256) on the node address too (its metrics stay on 127.0.0.1).
       kube-proxy-arg:
-        - "healthz-bind-address=${private_ip}:10256"
+        - "healthz-bind-address=${node_ip}:10256"
       # Secrets encrypted at rest in the datastore.
       secrets-encryption: true
 
@@ -106,39 +109,39 @@ write_files:
     content: |
       apiVersion: kubelet.config.k8s.io/v1beta1
       kind: KubeletConfiguration
-      # The kubelet API (10250) on the private address only; the API server and metrics-server reach it by the node's InternalIP.
-      address: ${private_ip}
+      # The kubelet API (10250) on the node address only; the API server and metrics-server reach it by the node's InternalIP.
+      address: ${node_ip}
       shutdownGracePeriod: 60s
       shutdownGracePeriodCriticalPods: 20s
+      # 24 GB VM: 1.5 GiB kept for k3s itself (API server, etcd-less sqlite, kubelet, containerd in one process), 512 MiB for the OS
+      # (sshd, fail2ban, unattended upgrades), eviction below 1 GiB free.
       kubeReserved:
-        memory: 1Gi
+        memory: 1536Mi
       systemReserved:
-        memory: 256Mi
+        memory: 512Mi
       evictionHard:
         memory.available: 1Gi
         nodefs.available: 5%
         imagefs.available: 5%
 
-  # k3s binds the private address: on every boot it starts only once that address is configured (Hetzner's private interface comes up
-  # by DHCP, possibly after network-online.target). Up to 3 minutes, then k3s fails and systemd restarts it (Restart=always).
-  - path: /usr/local/sbin/wait-private-ip.sh
+  # k3s binds the node address: before k3s starts (every boot), the dummy interface procure0 gets it. Idempotent, independent of the
+  # network manager the image uses (netplan, networkd or ifupdown).
+  - path: /usr/local/sbin/ensure-node-ip.sh
     permissions: "0755"
     content: |
       #!/bin/sh
-      i=0
-      until ip -4 -o addr show | grep -q " inet ${private_ip}/"; do
-        i=$((i + 1))
-        if [ "$i" -ge 90 ]; then echo "private address ${private_ip} not up after 180 s" >&2; exit 1; fi
-        sleep 2
-      done
-  - path: /etc/systemd/system/k3s.service.d/10-wait-private-ip.conf
+      set -eu
+      ip link show procure0 >/dev/null 2>&1 || ip link add procure0 type dummy
+      ip addr replace ${node_ip}/32 dev procure0
+      ip link set procure0 up
+  - path: /etc/systemd/system/k3s.service.d/10-node-ip.conf
     permissions: "0644"
     content: |
       [Unit]
       Wants=network-online.target
       After=network-online.target
       [Service]
-      ExecStartPre=/usr/local/sbin/wait-private-ip.sh
+      ExecStartPre=/usr/local/sbin/ensure-node-ip.sh
 
   # The install script of the pinned release (it checks the binary's sha256 against the release's checksums). The whole download and
   # install is tried up to 3 times (a GitHub or DNS hiccup on the first boot must not leave the VM without k3s).
@@ -164,4 +167,5 @@ runcmd:
   - [systemctl, restart, ssh]
   - [systemctl, enable, --now, fail2ban]
   - [systemctl, enable, --now, unattended-upgrades]
+  - [/usr/local/sbin/ensure-node-ip.sh]
   - [/usr/local/sbin/install-k3s.sh]
