@@ -2,21 +2,27 @@
 # bootstrap/common.ps1); the rest are the approved defaults. The Hetzner API token comes from the environment (HCLOUD_TOKEN), never a file.
 
 variable "server_type" {
-  description = "Hetzner server type. Only the type Dale approved (plan 08 D2, 2026-11-07: EUR 15.99 net per month in fsn1, plus the IPv4)."
+  description = "Hetzner server type. Only the types Dale approved (plan 08, 2026-11-07): cx43 (EUR 15.99 net per month) or cx53 (EUR 29.49 net), whichever is in stock; plus the IPv4."
   type        = string
   default     = "cx43"
 
   validation {
-    # A bigger type costs more: change this list only with Dale's OK (CLAUDE.md "What Claude may do").
-    condition     = contains(["cx43"], var.server_type)
-    error_message = "Only cx43 is approved (8 shared vCPU, 16 GB, 160 GB). Ask Dale before changing the server type."
+    # A bigger type costs more: change this list only with Dale's OK (CLAUDE.md "What Claude may do"; also bootstrap/common.ps1
+    # HostedApprovedTypes, which holds the approved prices).
+    condition     = contains(["cx43", "cx53"], var.server_type)
+    error_message = "Only cx43 and cx53 are approved. Ask Dale before using another server type."
   }
 }
 
 variable "location" {
-  description = "Hetzner location (Falkenstein, Germany)."
+  description = "Hetzner location: Falkenstein (fsn1), Nuremberg (nbg1) or Helsinki (hel1), all in network zone eu-central."
   type        = string
   default     = "fsn1"
+
+  validation {
+    condition     = contains(["fsn1", "nbg1", "hel1"], var.location)
+    error_message = "Only fsn1, nbg1 and hel1 (network zone eu-central) are approved."
+  }
 }
 
 variable "network_zone" {
@@ -74,4 +80,31 @@ variable "private_ip" {
   description = "The server's fixed address in the subnet (node IP, API bind address; open-tunnel.ps1 forwards to it)."
   type        = string
   default     = "10.0.1.2"
+}
+
+# --- Cloudflare DNS (Dale's decision 2026-11-07: the whole hosted setup in this one Terraform root) ---------------------------------
+# Token from the environment variable CLOUDFLARE_API_TOKEN: the account-owned token claude-dns (DNS Write + Zone Read, daleabels.com only).
+
+variable "cloudflare_zone_id" {
+  description = "Cloudflare zone ID of daleabels.com."
+  type        = string
+  default     = "93c854c6f17e0cbb8f2b7e9395f7828c"
+}
+
+variable "domain" {
+  description = "The zone's domain; the records are <host>.<domain>. The apex and every other record are left alone."
+  type        = string
+  default     = "daleabels.com"
+}
+
+variable "dns_hosts" {
+  description = "Host names that point at the server (A and AAAA each): the app, Keycloak and the Aspire dashboard."
+  type        = list(string)
+  default     = ["procure", "auth", "dashboard"]
+}
+
+variable "dns_ttl" {
+  description = "TTL of the records in seconds (short: a recreated server gets new addresses)."
+  type        = number
+  default     = 300
 }

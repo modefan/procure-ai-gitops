@@ -32,3 +32,8 @@ output "admin_user" {
   description = "The SSH user."
   value       = var.admin_user
 }
+
+output "dns_names" {
+  description = "The host names that point at the server."
+  value       = sort(distinct([for r in cloudflare_dns_record.host : r.name]))
+}

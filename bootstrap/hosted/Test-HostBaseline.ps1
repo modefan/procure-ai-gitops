@@ -5,15 +5,19 @@
 .DESCRIPTION
     Over SSH (the VM's own key, bootstrap/hosted/):
       - sshd's effective settings: no root login, no password or keyboard-interactive login, only public keys, only the admin user;
-      - fail2ban guards sshd;
+      - fail2ban guards sshd and its filter reads the journal of ssh.service including sshd-session (OpenSSH >= 9.8);
       - unattended security upgrades on (APT::Periodic::Unattended-Upgrade 1, service enabled);
       - k3s runs the pinned release (bootstrap/common.ps1 HostedK3sVersion) and the node is Ready;
       - the kubelet's live configuration: shutdownGracePeriod 60s, shutdownGracePeriodCriticalPods 20s; logind waits long enough;
-      - the API port 6443 listens only on the private address (or loopback), never on a public interface or a wildcard.
+      - the API (6443), the kubelet (10250) and kube-proxy's health port (10256) listen only on the private address (or loopback),
+        never on a public interface or a wildcard;
+      - WARN (not a failure) when a kernel or library update waits for a reboot (/var/run/reboot-required).
     From the PC, against the public IPv4 (and IPv6 when the PC has a route):
       - root and password logins are refused (the server offers only publickey);
       - 22, 80 and 443 answer; 6443 and the other Kubernetes ports (6444, 10250, 10256, 2379, 2380, 8472/udp is not checked) do not.
-    Through the Hetzner API: the server is cx43 in fsn1, the firewall applied to it has exactly in/tcp 22, 80, 443.
+    Through the Hetzner API: the server has the type and location in host.json, both approved (bootstrap/common.ps1), and the firewall
+    applied to it has exactly in/tcp 22, 80, 443. Through the Cloudflare API: exactly A and AAAA for procure, auth and dashboard
+    .daleabels.com, pointing at the server's IPv4 and IPv6, not proxied.
     Prints PASS/FAIL per check and exits 1 when any check fails. Prints no secret.
 #>
 [CmdletBinding()]
@@ -71,10 +75,12 @@ Add-Check 'from the PC: root and password logins refused (server offers publicke
     "root refused; methods offered: $methods"
 }
 
-Add-Check 'fail2ban guards sshd' {
-    $out = Get-Ssh 'systemctl is-active fail2ban && sudo fail2ban-client status sshd | head -1'
+Add-Check 'fail2ban guards sshd (journal of ssh.service, sshd-session lines)' {
+    $out = Get-Ssh 'systemctl is-active fail2ban && sudo fail2ban-client status sshd | head -1 && sudo fail2ban-client get sshd journalmatch'
     if (-not ($out -contains 'active') -or -not ($out -match 'sshd')) { throw ($out -join ' ') }
-    'fail2ban active, jail sshd'
+    if (-not ($out -match '_SYSTEMD_UNIT=ssh\.service')) { throw "journalmatch does not read ssh.service: $($out -join ' ')" }
+    $failed = (Get-Ssh 'sudo fail2ban-client status sshd' | Where-Object { $_ -match 'Total failed' }) -join ' '
+    "fail2ban active, jail sshd on ssh.service; $($failed.Trim())"
 }
 
 Add-Check 'unattended security upgrades on' {
@@ -105,12 +111,24 @@ Add-Check 'kubelet: shutdownGracePeriod 60s, shutdownGracePeriodCriticalPods 20s
     "shutdownGracePeriod $($kc.shutdownGracePeriod), critical $($kc.shutdownGracePeriodCriticalPods), logind $([int]($usec / 1e6)) s"
 }
 
-Add-Check 'API port 6443 listens only on the private address, not on a public interface' {
-    $listeners = @(Get-Ssh "ss -Hltn 'sport = :6443' | awk '{print `$4}'" | Where-Object { $_ })
-    if (-not $listeners) { throw 'nothing listens on 6443' }
-    $bad = @($listeners | Where-Object { $_ -notin @("$($hostInfo.privateIp):6443", '127.0.0.1:6443', '[::1]:6443') })
-    if ($bad) { throw "6443 listens on $($bad -join ', ')" }
-    "listens on $($listeners -join ', ')"
+foreach ($port in 6443, 10250, 10256) {
+    Add-Check "port $port listens only on the private address, not on a public interface" {
+        $listeners = @(Get-Ssh "ss -Hltn 'sport = :$port' | awk '{print `$4}'" | Where-Object { $_ })
+        if (-not $listeners) { throw "nothing listens on $port" }
+        $bad = @($listeners | Where-Object { $_ -notin @("$($hostInfo.privateIp):$port", "127.0.0.1:$port", "[::1]:$port") })
+        if ($bad) { throw "$port listens on $($bad -join ', ')" }
+        "listens on $($listeners -join ', ')"
+    }
+}
+
+# A warning only: unattended upgrades install kernel fixes, but the VM reboots only when Dale (or Claude) decides (docs/hosting.md).
+if ($hostInfo) {
+    try {
+        $pending = Get-Ssh 'if [ -f /var/run/reboot-required ]; then echo yes; cat /var/run/reboot-required.pkgs 2>/dev/null | head -5; else echo no; fi'
+        if ($pending[0] -eq 'yes') {
+            $results.Add([pscustomobject]@{ Result = 'WARN'; Check = 'reboot required (updates installed, not active until a reboot)'; Detail = ($pending | Select-Object -Skip 1) -join ', ' })
+        }
+    } catch { }
 }
 
 $addresses = @()
@@ -133,18 +151,36 @@ foreach ($address in $addresses) {
 }
 if (-not $hostInfo) { Add-Check 'from the PC: public address answers on 22, 80, 443 only' { throw 'no VM (host.json missing)' } }
 
-Add-Check 'Hetzner API: server cx43 in fsn1, firewall with exactly in/tcp 22, 80, 443 applied' {
+Add-Check 'Hetzner API: server of the approved type and location in host.json, firewall with exactly in/tcp 22, 80, 443 applied' {
     if (-not $hostInfo) { throw 'no VM (host.json missing)' }
-    $token = $env:HCLOUD_TOKEN ?? [Environment]::GetEnvironmentVariable('HCLOUD_TOKEN', 'User')
-    $headers = @{ Authorization = "Bearer $token" }
-    $server = (Invoke-RestMethod -Headers $headers "https://api.hetzner.cloud/v1/servers/$($hostInfo.serverId)").server
-    if ($server.server_type.name -ne 'cx43' -or $server.datacenter.location.name -ne 'fsn1') { throw "server $($server.server_type.name) in $($server.datacenter.location.name)" }
+    $server = (Invoke-HetznerApi "servers/$($hostInfo.serverId)").server
+    $type = $server.server_type.name; $location = $server.location.name
+    if ($type -ne $hostInfo.type -or $location -ne $hostInfo.location) { throw "server is $type in $location, host.json says $($hostInfo.type) in $($hostInfo.location)" }
+    if (-not $HostedApprovedTypes.Contains($type) -or $location -notin $HostedApprovedLocations) { throw "$type in $location is not approved" }
+    if ($server.backup_window) { throw 'backups are on' }
     $firewallIds = @($server.public_net.firewalls | Where-Object status -eq 'applied' | ForEach-Object id)
     if ($firewallIds.Count -ne 1) { throw "firewalls applied: $($firewallIds.Count)" }
-    $fw = (Invoke-RestMethod -Headers $headers "https://api.hetzner.cloud/v1/firewalls/$($firewallIds[0])").firewall
+    $fw = (Invoke-HetznerApi "firewalls/$($firewallIds[0])").firewall
     $rules = @($fw.rules | ForEach-Object { "$($_.direction)/$($_.protocol)/$($_.port)" } | Sort-Object)
     if (($rules -join ',') -ne 'in/tcp/22,in/tcp/443,in/tcp/80') { throw "rules: $($rules -join ', ')" }
-    "server $($server.name) $($server.server_type.name) $($server.datacenter.location.name); firewall $($fw.name): $($rules -join ', ')"
+    "server $($server.name) $type $location; firewall $($fw.name): $($rules -join ', ')"
+}
+
+Add-Check 'Cloudflare API: A and AAAA for procure, auth, dashboard point at the server, not proxied' {
+    if (-not $hostInfo) { throw 'no VM (host.json missing)' }
+    $records = Get-HostedDnsRecords
+    $ipv6 = ($hostInfo.ipv6 -split '/')[0]
+    $problems = @()
+    foreach ($h in $HostedDnsHosts) {
+        foreach ($t in @(@('A', $hostInfo.ipv4), @('AAAA', $ipv6))) {
+            $r = @($records | Where-Object { $_.name -eq "$h.$HostedDomain" -and $_.type -eq $t[0] })
+            if ($r.Count -ne 1) { $problems += "$($t[0]) $h.$($HostedDomain): $($r.Count) records"; continue }
+            if ($r[0].content -ne $t[1]) { $problems += "$($t[0]) $h.$($HostedDomain) -> $($r[0].content), server is $($t[1])" }
+            if ($r[0].proxied) { $problems += "$($t[0]) $h.$($HostedDomain) is proxied" }
+        }
+    }
+    if ($problems) { throw ($problems -join '; ') }
+    "$($records.Count) records, all to $($hostInfo.ipv4) / $ipv6, DNS only"
 }
 
 $results | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host

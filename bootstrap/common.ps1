@@ -53,6 +53,15 @@ $script:HostedTunnelPort = 16443
 # Pinned k3s release of the hosted VM: the local cluster's minor (K3sImage above), the newest patch when the VM was created (a public
 # node gets the security fixes). Changing it needs an upgrade on the VM (or a new VM), not only this line.
 $script:HostedK3sVersion = 'v1.35.10+k3s1'
+# What Dale approved (plan 08, DALE DECISION 2026-11-07 14:05): cx43 or cx53, whichever Hetzner has in stock first, in fsn1, nbg1 or hel1,
+# at these monthly net prices (EUR, per the Hetzner API on 2026-11-07). new-hosted-cluster.ps1 refuses any other type, location or a
+# higher API price; infra/hetzner/variables.tf validates the same lists. Order = preference (-WaitForStock tries them in this order).
+$script:HostedApprovedTypes = [ordered]@{ cx43 = 15.99; cx53 = 29.49 }
+$script:HostedApprovedLocations = @('fsn1', 'nbg1', 'hel1')
+# The Cloudflare DNS records Terraform keeps (A and AAAA each, DNS only): <host>.<domain> -> the server.
+$script:HostedDomain = 'daleabels.com'
+$script:HostedDnsHosts = @('procure', 'auth', 'dashboard')
+$script:HostedCloudflareZoneId = '93c854c6f17e0cbb8f2b7e9395f7828c'
 
 # kubectl and helm arguments that select the cluster; every kubectl/helm call of the bootstrap uses them (never the current context).
 $script:KubectlArgs = @('--context', $script:KubeContext)
@@ -77,6 +86,43 @@ function Get-HostedHost {
     # host.json, written by new-hosted-cluster.ps1 from the Terraform outputs: serverId, ipv4, ipv6, privateIp, user.
     if (-not (Test-Path $script:HostedHostFile)) { throw "No $script:HostedHostFile. Run bootstrap/hosted/new-hosted-cluster.ps1 first." }
     Get-Content -Raw $script:HostedHostFile | ConvertFrom-Json
+}
+
+function Get-ApiToken([string] $name) {
+    # A token from the process environment or, for a shell started before it was set, the user env vars. Never printed.
+    $value = [Environment]::GetEnvironmentVariable($name) ?? [Environment]::GetEnvironmentVariable($name, 'User')
+    if ([string]::IsNullOrWhiteSpace($value)) { throw "The user env var $name is not set (DEMO PASSWORDS.txt names the token)." }
+    $value
+}
+
+function Invoke-HetznerApi([string] $path) {
+    # GET on the Hetzner Cloud API (project procure-ai, token HCLOUD_TOKEN).
+    Invoke-RestMethod -Headers @{ Authorization = "Bearer $(Get-ApiToken 'HCLOUD_TOKEN')" } "https://api.hetzner.cloud/v1/$path"
+}
+
+function Invoke-CloudflareApi([string] $path) {
+    # GET on the Cloudflare API with the DNS token (CLOUDFLARE_API_TOKEN: DNS Write + Zone Read on daleabels.com only).
+    Invoke-RestMethod -Headers @{ Authorization = "Bearer $(Get-ApiToken 'CLOUDFLARE_API_TOKEN')" } "https://api.cloudflare.com/client/v4/$path"
+}
+
+function Get-HostedDnsRecords {
+    # The zone's A/AAAA records for the hosted host names (type, name, content, proxied).
+    $names = $script:HostedDnsHosts | ForEach-Object { "$_.$script:HostedDomain" }
+    $all = (Invoke-CloudflareApi "zones/$script:HostedCloudflareZoneId/dns_records?per_page=100").result
+    @($all | Where-Object { $_.name -in $names -and $_.type -in 'A', 'AAAA' })
+}
+
+function Get-HostedServerPrice([string] $type, [string] $location) {
+    # Monthly net and gross price (EUR) of a server type in a location and of a primary IPv4 there, from the Hetzner API.
+    $typeInfo = (Invoke-HetznerApi "server_types?name=$type").server_types | Select-Object -First 1
+    if (-not $typeInfo) { throw "Hetzner has no server type $type." }
+    $price = $typeInfo.prices | Where-Object location -eq $location
+    $ipv4 = ((Invoke-HetznerApi 'pricing').pricing.primary_ips | Where-Object type -eq 'ipv4').prices | Where-Object location -eq $location
+    [pscustomobject]@{
+        Net = [double] $price.price_monthly.net; Gross = [double] $price.price_monthly.gross
+        Ipv4Net = [double] $ipv4.price_monthly.net; Ipv4Gross = [double] $ipv4.price_monthly.gross
+        Available = [bool] (@($typeInfo.locations | Where-Object { $_.name -eq $location -and $_.available }).Count)
+    }
 }
 
 function Get-HostedSshArgs {

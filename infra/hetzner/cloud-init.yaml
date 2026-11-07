@@ -3,10 +3,11 @@
 # make the same change over SSH and keep this file in line (main.tf ignores user_data changes). Checked by
 # bootstrap/hosted/Test-HostBaseline.ps1.
 #  - one non-root sudo user, SSH key only: no password login, no root login, no keyboard-interactive, only that user;
-#  - fail2ban on sshd (journal backend);
+#  - fail2ban on sshd (journal backend; OpenSSH >= 9.8 logs failed logins as sshd-session under ssh.service);
 #  - unattended security upgrades (no automatic reboot: a reboot is a deliberate step, it restarts the whole demo);
-#  - k3s pinned, the API server bound to the private address only (reached through an SSH tunnel), kubelet graceful shutdown 60 s
-#    (20 s of it for critical pods) and the same memory reservations as the local cluster (bootstrap/common.ps1).
+#  - k3s pinned (download and install retried), started only once the private address is up; the API server, the kubelet and
+#    kube-proxy's health port bound to the private address only (the API is reached through an SSH tunnel); kubelet graceful shutdown
+#    60 s (20 s of it for critical pods) and the same memory reservations as the local cluster (bootstrap/common.ps1).
 
 users:
   - name: ${admin_user}
@@ -53,12 +54,15 @@ write_files:
   - path: /etc/fail2ban/jail.d/sshd.local
     permissions: "0644"
     content: |
+      # Ubuntu runs sshd as ssh.service, and OpenSSH >= 9.8 logs the failed logins from the per-connection sshd-session process:
+      # match the unit's whole journal and both process names, or the jail never sees a failure.
       [sshd]
       enabled = true
       backend = systemd
-      maxretry = 5
+      filter = sshd[_daemon="sshd(?:-session)?", journalmatch="_SYSTEMD_UNIT=ssh.service"]
+      maxretry = 6
       findtime = 10m
-      bantime = 1h
+      bantime = 30m
 
   - path: /etc/apt/apt.conf.d/20auto-upgrades
     permissions: "0644"
@@ -89,6 +93,9 @@ write_files:
       advertise-address: ${private_ip}
       bind-address: ${private_ip}
       write-kubeconfig-mode: "0600"
+      # kube-proxy's health endpoint (10256) on the private address too (its metrics stay on 127.0.0.1).
+      kube-proxy-arg:
+        - "healthz-bind-address=${private_ip}:10256"
       # Secrets encrypted at rest in the datastore.
       secrets-encryption: true
 
@@ -99,6 +106,8 @@ write_files:
     content: |
       apiVersion: kubelet.config.k8s.io/v1beta1
       kind: KubeletConfiguration
+      # The kubelet API (10250) on the private address only; the API server and metrics-server reach it by the node's InternalIP.
+      address: ${private_ip}
       shutdownGracePeriod: 60s
       shutdownGracePeriodCriticalPods: 20s
       kubeReserved:
@@ -110,17 +119,45 @@ write_files:
         nodefs.available: 5%
         imagefs.available: 5%
 
-  # The install script of the pinned release (it checks the binary's sha256 against the release's checksums).
+  # k3s binds the private address: on every boot it starts only once that address is configured (Hetzner's private interface comes up
+  # by DHCP, possibly after network-online.target). Up to 3 minutes, then k3s fails and systemd restarts it (Restart=always).
+  - path: /usr/local/sbin/wait-private-ip.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      i=0
+      until ip -4 -o addr show | grep -q " inet ${private_ip}/"; do
+        i=$((i + 1))
+        if [ "$i" -ge 90 ]; then echo "private address ${private_ip} not up after 180 s" >&2; exit 1; fi
+        sleep 2
+      done
+  - path: /etc/systemd/system/k3s.service.d/10-wait-private-ip.conf
+    permissions: "0644"
+    content: |
+      [Unit]
+      Wants=network-online.target
+      After=network-online.target
+      [Service]
+      ExecStartPre=/usr/local/sbin/wait-private-ip.sh
+
+  # The install script of the pinned release (it checks the binary's sha256 against the release's checksums). The whole download and
+  # install is tried up to 3 times (a GitHub or DNS hiccup on the first boot must not leave the VM without k3s).
   - path: /usr/local/sbin/install-k3s.sh
     permissions: "0755"
     content: |
       #!/bin/sh
-      set -eu
+      set -u
       version='${k3s_version}'
       tag=$(printf '%s' "$version" | sed 's/+/%2B/')
-      curl -sfL "https://raw.githubusercontent.com/k3s-io/k3s/$tag/install.sh" -o /tmp/k3s-install.sh
-      INSTALL_K3S_VERSION="$version" INSTALL_K3S_SKIP_ENABLE=false sh /tmp/k3s-install.sh server
-      rm -f /tmp/k3s-install.sh
+      for attempt in 1 2 3; do
+        if curl -sfL --retry 5 --retry-delay 5 --retry-all-errors "https://raw.githubusercontent.com/k3s-io/k3s/$tag/install.sh" -o /tmp/k3s-install.sh           && INSTALL_K3S_VERSION="$version" sh /tmp/k3s-install.sh server; then
+          rm -f /tmp/k3s-install.sh
+          exit 0
+        fi
+        echo "k3s install attempt $attempt failed" >&2
+        sleep 20
+      done
+      exit 1
 
 runcmd:
   - [systemctl, restart, systemd-logind]

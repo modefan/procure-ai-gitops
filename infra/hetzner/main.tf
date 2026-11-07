@@ -1,7 +1,8 @@
 # The hosted demo VM on Hetzner Cloud (plan 08 ruling 10): one server with k3s (installed by cloud-init), a private network that the
 # Kubernetes API listens on, a firewall that lets in only SSH, HTTP and HTTPS, and the SSH key. Billed: the server and its primary IPv4
-# (created with the server). Free: the firewall, the network and the SSH key. A stopped server still bills; `terraform destroy` pauses
-# the cost (procure-ai docs/hosting.md).
+# (created with the server). Free: the firewall, the network and the SSH key; and the Cloudflare DNS records procure, auth and dashboard
+# .daleabels.com (A and AAAA, DNS only). A stopped server still bills; `new-hosted-cluster.ps1 -Destroy` pauses the cost (procure-ai
+# docs/hosting.md).
 #
 # State is local and outside every repo: bootstrap/hosted/new-hosted-cluster.ps1 runs
 #   terraform init -backend-config="path=%USERPROFILE%\.procure-ai\hosted\terraform.tfstate"
@@ -14,6 +15,10 @@ terraform {
       source  = "hetznercloud/hcloud"
       version = "1.70.2"
     }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "5.28.1"
+    }
   }
 
   # Path given at init time (partial configuration), so no state file can land in this repo.
@@ -22,6 +27,9 @@ terraform {
 
 # Token from the environment variable HCLOUD_TOKEN (project procure-ai, Read & Write).
 provider "hcloud" {}
+
+# Token from the environment variable CLOUDFLARE_API_TOKEN (account-owned token claude-dns: DNS Write + Zone Read on daleabels.com only).
+provider "cloudflare" {}
 
 locals {
   labels = {
@@ -80,6 +88,8 @@ resource "hcloud_server" "node" {
   labels      = local.labels
 
   firewall_ids = [hcloud_firewall.public.id]
+  # No paid extras (Dale's OK covers the server and its IPv4 only): backups would add 20 % to the server price.
+  backups = false
 
   public_net {
     ipv4_enabled = true
@@ -106,4 +116,27 @@ resource "hcloud_server" "node" {
   }
 
   depends_on = [hcloud_network_subnet.private]
+}
+
+# A and AAAA for each host, straight to the server (DNS only: Traefik terminates TLS with Let's Encrypt, Task 12). Only these six
+# records are managed here; the apex and anything else in the zone are not touched.
+locals {
+  dns_records = merge([
+    for host in var.dns_hosts : {
+      "${host}-A"    = { name = "${host}.${var.domain}", type = "A", content = hcloud_server.node.ipv4_address }
+      "${host}-AAAA" = { name = "${host}.${var.domain}", type = "AAAA", content = hcloud_server.node.ipv6_address }
+    }
+  ]...)
+}
+
+resource "cloudflare_dns_record" "host" {
+  for_each = local.dns_records
+
+  zone_id = var.cloudflare_zone_id
+  name    = each.value.name
+  type    = each.value.type
+  content = each.value.content
+  ttl     = var.dns_ttl
+  proxied = false
+  comment = "procure-ai hosted VM (Terraform, procure-ai-gitops infra/hetzner)"
 }
