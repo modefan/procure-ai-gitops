@@ -90,6 +90,25 @@ write_files:
       [Login]
       InhibitDelayMaxSec=75
 
+  # Ubuntu 26.04 (AppArmor 5, kernel.apparmor_restrict_unprivileged_unconfined=1) lets an unconfined, unprivileged process change its
+  # profile only by stacking. k3s's bundled runc has no profile, so for every non-root container runc's init (already unprivileged when it
+  # applies the container's profile) gets "cri-containerd.apparmor.d//&unconfined", and the container's processes may not signal each
+  # other: Postgres and MongoDB could not stop their own first-start servers (plan 08 Task 12: "pg_ctl: could not send stop signal:
+  # Permission denied", half-initialised volumes). Ubuntu solves this for its own /usr/sbin/runc with the `runc` profile (unconfined flag,
+  # userns); this file is that profile with k3s's runc path added, and Ubuntu's file is disabled so only one `runc` definition loads.
+  # The kernel restriction stays on; containerd's profile already accepts signals from `runc` (stopping containers works).
+  - path: /etc/apparmor.d/procure-k3s-runc
+    permissions: "0644"
+    content: |
+      abi <abi/5.0>,
+      include <tunables/global>
+
+      profile runc /{usr/{bin,sbin},var/lib/rancher/k3s/data/*/bin}/runc flags=(unconfined) {
+        userns,
+        @{exec_path} mr,
+        include if exists <local/runc>
+      }
+
   - path: /etc/rancher/k3s/config.yaml
     permissions: "0600"
     content: |
@@ -215,6 +234,9 @@ write_files:
 
 runcmd:
   - [systemctl, daemon-reload]
+  # The k3s runc profile (write_files above) before k3s starts its first container; Ubuntu's own runc file is disabled for it.
+  - [ln, -sf, /etc/apparmor.d/runc, /etc/apparmor.d/disable/runc]
+  - [apparmor_parser, -r, /etc/apparmor.d/procure-k3s-runc]
   - [systemctl, enable, --now, procure-host-firewall.service]
   - [sh, -c, "if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi"]
   - [systemctl, restart, systemd-logind]

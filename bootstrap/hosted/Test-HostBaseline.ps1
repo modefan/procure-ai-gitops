@@ -144,16 +144,21 @@ foreach ($port in 6443, 10250, 10256) {
     }
 }
 
-Add-Check 'every TCP/UDP listener is on loopback or allowed (22 anywhere; 6443, 10250, 10256 on the node address); IPv6: only SSH' {
+Add-Check 'every TCP/UDP listener is on loopback or allowed (22 anywhere; 6443, 10250, 10256 on the node address; Traefik''s health check node port); IPv6: only SSH' {
     $lines = @(Get-Ssh "ss -Hlntu | awk '{print `$1, `$5}'" | Where-Object { $_ })
     $node = $hostInfo.nodeIp
+    # Plan 08 Task 12: Traefik's Service has externalTrafficPolicy Local, so kube-proxy serves its healthCheckNodePort on every address
+    # (it answers only how many Traefik pods run here). Both firewalls drop it (input allows 22/80/443 only; Test-PublicSurface.ps1 scans
+    # every NodePort from outside), so exactly that port is allowed.
+    $healthPort = ((Get-Ssh "sudo k3s kubectl -n kube-system get service traefik -o jsonpath='{.spec.healthCheckNodePort}'") -join '').Trim()
     $bad = foreach ($line in $lines) {
         $proto, $local = "$line" -split ' ', 2
         $address = $local -replace ':\d+$|:\*$', '' -replace '%[^\]]+', ''
         $port = ($local -split ':')[-1]
         $loopback = $address -match '^127\.' -or $address -in '[::1]', '::1'
         $allowed = $loopback -or ($proto -eq 'tcp' -and $port -eq '22' -and $address -in '0.0.0.0', '[::]', '*') -or
-            ($proto -eq 'tcp' -and $address -eq $node -and $port -in '6443', '10250', '10256')
+            ($proto -eq 'tcp' -and $address -eq $node -and $port -in '6443', '10250', '10256') -or
+            ($proto -eq 'tcp' -and $healthPort -match '^\d+$' -and $port -eq $healthPort -and $address -in '*', '0.0.0.0', '[::]')
         if (-not $allowed) { "$proto $local" }
     }
     if ($bad) { throw "not allowed: $($bad -join ', ')" }
@@ -161,7 +166,28 @@ Add-Check 'every TCP/UDP listener is on loopback or allowed (22 anywhere; 6443, 
     $v6 = ($hostInfo.ipv6 -split '/')[0]
     $http = Get-Ssh "for p in 80 443; do curl -6 -s -o /dev/null --max-time 5 http://[$v6]:`$p/; echo `$?; done"
     if (@($http | Where-Object { $_ -ne '7' }).Count) { throw "IPv6 [$v6]:80/443 answer (curl exit codes $($http -join ', ')), but there are no AAAA records" }
-    "$($lines.Count) listeners, all on loopback or allowed; IPv6 [$v6]: 80/443 refused, only SSH"
+    "$($lines.Count) listeners, all on loopback or allowed$(if ($healthPort) { " (Traefik health check node port $healthPort, firewalled)" }); IPv6 [$v6]: 80/443 refused, only SSH"
+}
+
+Add-Check 'AppArmor: restrictions on, k3s runc has the runc profile, no stacked container labels, no container signal denials' {
+    # Plan 08 Task 12 (cloud-init.yaml, /etc/apparmor.d/procure-k3s-runc): without the profile every non-root container ran as
+    # cri-containerd.apparmor.d//&unconfined and could not signal its own processes (Postgres and MongoDB init failed).
+    $out = Get-Ssh @'
+sysctl -n kernel.apparmor_restrict_unprivileged_unconfined kernel.apparmor_restrict_unprivileged_userns
+echo "attach=$(grep -o 'var/lib/rancher/k3s/data/\*/bin' /etc/apparmor.d/procure-k3s-runc 2>/dev/null | head -1) loaded=$(sudo grep -c '^runc (unconfined)$' /sys/kernel/security/apparmor/profiles)"
+test -L /etc/apparmor.d/disable/runc && echo ubuntu-runc-disabled || echo ubuntu-runc-enabled
+ps -eo label= | grep -c '//&unconfined' || true
+sudo journalctl -k --since "-10 min" --no-pager | grep -c 'apparmor="DENIED" operation="signal" class="signal" profile="cri-containerd' || true
+'@
+    $lines = @($out | Where-Object { "$_".Trim() -ne '' } | ForEach-Object { "$_".Trim() })
+    $problems = @()
+    if ($lines[0] -ne '1' -or $lines[1] -ne '1') { $problems += "restrict_unprivileged_unconfined $($lines[0]), restrict_unprivileged_userns $($lines[1]) (both must stay 1)" }
+    if ($lines[2] -notmatch 'attach=\S*k3s/data\S* loaded=1$') { $problems += "the runc profile (/etc/apparmor.d/procure-k3s-runc) is missing or not loaded: '$($lines[2])'" }
+    if ($lines[3] -ne 'ubuntu-runc-disabled') { $problems += "/etc/apparmor.d/disable/runc missing (two runc definitions)" }
+    if ([int] $lines[4] -gt 0) { $problems += "$($lines[4]) processes with a stacked //&unconfined label (containers started without the profile; restart them)" }
+    if ([int] $lines[5] -gt 0) { $problems += "$($lines[5]) container signal denials in the kernel log of the last 10 minutes" }
+    if ($problems) { throw ($problems -join '; ') }
+    'restrictions 1/1; runc profile attaches to k3s runc; no stacked labels; no signal denials (10 min)'
 }
 
 Add-Check 'flannel uses host-gw (no VXLAN socket)' {
