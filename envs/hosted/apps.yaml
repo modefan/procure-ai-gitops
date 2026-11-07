@@ -1,0 +1,14 @@
+# Values of the app of apps (apps/) for the hosted VM (Hetzner, bootstrap/hosted/). The revision is in release.yaml.
+# PLACEHOLDER of plan 08 Task 11: only Argo CD (managing itself) runs; Task 12 adds platform.yaml, procure-ai.yaml and observability.yaml
+# (ingress hosts, certificates, sizes) and turns the three Applications on.
+env: hosted
+argocd:
+  # A public host (plan 08 ruling 4): no admin user and no ingress; the UI only through kubectl port-forward over the SSH tunnel.
+  adminEnabled: false
+  ingressEnabled: false
+platform:
+  enabled: false
+observability:
+  enabled: false
+procureAi:
+  enabled: false

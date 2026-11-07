@@ -31,21 +31,87 @@ $script:LocalCaDir = Join-Path $env:USERPROFILE '.procure-ai\local-ca'
 $script:DeployKeyDir = Join-Path $env:USERPROFILE '.procure-ai\deploy-keys'
 # The AppHost's UserSecretsId (src/AppHost/ProcureAi.AppHost/ProcureAi.AppHost.csproj): the one source of the secrets.
 $script:AppHostUserSecretsId = 'procure-ai-apphost'
+# The user-secrets store the bootstrap reads (Select-ProcureCluster switches it): the AppHost's for the local cluster, a separate one for
+# the hosted cluster (plan 08 ruling 11), so the public demo shares no secret with Dale's PC.
+$script:UserSecretsId = $script:AppHostUserSecretsId
+
+# --- The hosted VM (plan 08 Task 11, ruling 10): Hetzner Cloud, Terraform in infra/hetzner, k3s by cloud-init. ------------------------
+# Everything that must stay off the repos lives here (current user only; listed by name in DEMO PASSWORDS.txt): the SSH key pair
+# procure-hosted_ed25519(.pub), known_hosts, the Terraform state terraform.tfstate, host.json (addresses, user) and the kubeconfig.
+$script:HostedDir = Join-Path $env:USERPROFILE '.procure-ai\hosted'
+$script:HostedSshKey = Join-Path $script:HostedDir 'procure-hosted_ed25519'
+$script:HostedKnownHosts = Join-Path $script:HostedDir 'known_hosts'
+$script:HostedKubeconfig = Join-Path $script:HostedDir 'kubeconfig'
+$script:HostedHostFile = Join-Path $script:HostedDir 'host.json'
+$script:HostedTunnelPidFile = Join-Path $script:HostedDir 'tunnel.pid'
+$script:HostedStateFile = Join-Path $script:HostedDir 'terraform.tfstate'
+$script:HostedKubeContext = 'procure-hosted'
+$script:HostedUserSecretsId = 'procure-ai-hosted'
+# The Kubernetes API listens only on the VM's private address (infra/hetzner, k3s bind-address); open-tunnel.ps1 forwards this loopback
+# port of Dale's PC to it over SSH. Not 6550 (the local cluster's API port), so both clusters can be used side by side.
+$script:HostedTunnelPort = 16443
+# Pinned k3s release of the hosted VM: the local cluster's minor (K3sImage above), the newest patch when the VM was created (a public
+# node gets the security fixes). Changing it needs an upgrade on the VM (or a new VM), not only this line.
+$script:HostedK3sVersion = 'v1.35.10+k3s1'
+
+# kubectl and helm arguments that select the cluster; every kubectl/helm call of the bootstrap uses them (never the current context).
+$script:KubectlArgs = @('--context', $script:KubeContext)
+$script:HelmArgs = @('--kube-context', $script:KubeContext)
+
+function Select-ProcureCluster {
+    # Points the bootstrap at the cluster of an environment: 'hosted' is the VM (its own kubeconfig through the SSH tunnel, opened when it
+    # is not up yet; the hosted user-secrets store), anything else the local k3d cluster. Changes nothing outside this PowerShell session's
+    # script scope: no KUBECONFIG variable, no current context.
+    param([Parameter(Mandatory)] [string] $Environment)
+    if ($Environment -ne 'hosted') { return }
+    $script:ClusterName = 'procure-hosted'
+    $script:KubeContext = $script:HostedKubeContext
+    $script:KubectlArgs = @('--kubeconfig', $script:HostedKubeconfig, '--context', $script:KubeContext)
+    $script:HelmArgs = @('--kubeconfig', $script:HostedKubeconfig, '--kube-context', $script:KubeContext)
+    $script:UserSecretsId = $script:HostedUserSecretsId
+    if (-not (Test-Path $script:HostedKubeconfig)) { throw "No hosted kubeconfig at $script:HostedKubeconfig. Run bootstrap/hosted/new-hosted-cluster.ps1 first." }
+    if (-not (Test-ClusterReachable)) { & (Join-Path $PSScriptRoot 'hosted/open-tunnel.ps1') | Out-Host }
+}
+
+function Get-HostedHost {
+    # host.json, written by new-hosted-cluster.ps1 from the Terraform outputs: serverId, ipv4, ipv6, privateIp, user.
+    if (-not (Test-Path $script:HostedHostFile)) { throw "No $script:HostedHostFile. Run bootstrap/hosted/new-hosted-cluster.ps1 first." }
+    Get-Content -Raw $script:HostedHostFile | ConvertFrom-Json
+}
+
+function Get-HostedSshArgs {
+    # ssh options for the VM: its own key and known_hosts only (nothing from ~/.ssh), no prompts, no agent.
+    @('-i', $script:HostedSshKey, '-o', "UserKnownHostsFile=$script:HostedKnownHosts", '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+        '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15')
+}
+
+function Invoke-HostedSsh {
+    # Runs a command on the VM as the admin user and returns its output lines; throws on a non-zero exit unless -AllowFailure (then
+    # $LASTEXITCODE tells). Only for commands whose output holds no secret (the kubeconfig is fetched by new-hosted-cluster.ps1 itself).
+    param([Parameter(Mandatory)] [string] $Command, [switch] $AllowFailure)
+    $hostInfo = Get-HostedHost
+    $out = & ssh @(Get-HostedSshArgs) "$($hostInfo.user)@$($hostInfo.ipv4)" $Command 2>&1
+    if ($LASTEXITCODE -ne 0 -and -not $AllowFailure) { throw "ssh '$Command' failed ($LASTEXITCODE): $($out -join [Environment]::NewLine)" }
+    $out | ForEach-Object { "$_" }
+}
 
 function Invoke-Kubectl {
     # kubectl against the procure cluster only, never whatever context happens to be current.
-    $out = & kubectl --context $script:KubeContext @args 2>&1
+    $out = & kubectl @KubectlArgs @args 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kubectl $($args -join ' ') failed: $($out -join [Environment]::NewLine)" }
     $out
 }
 
 function Test-ClusterReachable {
-    & kubectl --context $script:KubeContext get --raw /readyz 2>&1 | Out-Null
+    & kubectl @KubectlArgs get --raw /readyz 2>&1 | Out-Null
     $LASTEXITCODE -eq 0
 }
 
 function Assert-ClusterReachable {
     if (-not (Test-ClusterReachable)) {
+        if ($script:KubeContext -eq $script:HostedKubeContext) {
+            throw "The hosted cluster is not reachable through the tunnel (127.0.0.1:$script:HostedTunnelPort). Run bootstrap/hosted/open-tunnel.ps1 and check the VM."
+        }
         throw "Cluster '$script:ClusterName' is not reachable (context $script:KubeContext). Run bootstrap/new-cluster.ps1 (or 'k3d cluster start $script:ClusterName') first."
     }
 }
@@ -63,7 +129,7 @@ function Invoke-ServerSideApply {
     # Secret: its data). Input is a file path or JSON on stdin; returns kubectl's line, e.g. "secret/procure-redis serverside-applied".
     # A no-op apply leaves resourceVersion unchanged (the idempotency check compares it).
     param([string] $Json, [string] $Path, [Parameter(Mandatory)] [string] $Description)
-    $applyArgs = @('--context', $script:KubeContext, 'apply', '--server-side', '--field-manager', $script:FieldManager)
+    $applyArgs = @($script:KubectlArgs) + @('apply', '--server-side', '--field-manager', $script:FieldManager)
     $out = if ($Path) { & kubectl @applyArgs -f $Path 2>&1 } else { $Json | & kubectl @applyArgs -f - 2>&1 }
     if ($LASTEXITCODE -ne 0) {
         # kubectl's error names the object and the problem; it does not echo data values.
@@ -76,10 +142,10 @@ function Remove-LastAppliedAnnotation {
     # Objects first made by client-side apply (before server-side apply was used) still carry the annotation; drop it once.
     param([Parameter(Mandatory)] [string] $Kind, [Parameter(Mandatory)] [string] $Name, [string] $Namespace)
     $nsArgs = if ($Namespace) { @('-n', $Namespace) } else { @() }
-    $annotations = & kubectl --context $script:KubeContext @nsArgs get $Kind $Name -o jsonpath='{.metadata.annotations}' 2>&1
+    $annotations = & kubectl @KubectlArgs @nsArgs get $Kind $Name -o jsonpath='{.metadata.annotations}' 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kubectl get $Kind $Name failed: $annotations" }
     if ("$annotations" -like "*$script:LastAppliedAnnotation*") {
-        $out = & kubectl --context $script:KubeContext @nsArgs annotate $Kind $Name "$script:LastAppliedAnnotation-" 2>&1
+        $out = & kubectl @KubectlArgs @nsArgs annotate $Kind $Name "$script:LastAppliedAnnotation-" 2>&1
         if ($LASTEXITCODE -ne 0) { throw "removing $script:LastAppliedAnnotation from $Kind $Name failed: $out" }
         "$($Kind.ToLowerInvariant())/$Name annotation $script:LastAppliedAnnotation removed"
     }
@@ -238,10 +304,14 @@ function Get-Gh {
     throw 'gh (GitHub CLI) not found.'
 }
 
-# The AppHost user secrets (the one source of every secret, plan 07 Global Constraints) as a hashtable key -> value. Never print it.
+# The user secrets of the selected cluster ($UserSecretsId: the AppHost's for local, procure-ai-hosted for hosted; the one source of
+# every secret, plan 07 Global Constraints) as a hashtable key -> value. Never print it.
 function Read-UserSecrets {
-    $raw = & dotnet user-secrets list --json --id $AppHostUserSecretsId 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "dotnet user-secrets list --id $AppHostUserSecretsId failed." }
+    # A store that was never written has no file yet: empty (the hosted store before the first new-secrets.ps1 -Environment hosted).
+    $store = Join-Path $env:APPDATA "Microsoft\UserSecrets\$script:UserSecretsId\secrets.json"
+    if (-not (Test-Path $store)) { return @{} }
+    $raw = & dotnet user-secrets list --json --id $script:UserSecretsId 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "dotnet user-secrets list --id $script:UserSecretsId failed." }
     $text = ($raw | ForEach-Object { "$_" }) -join "`n"
     $begin = $text.IndexOf('//BEGIN'); $end = $text.IndexOf('//END')
     if ($begin -lt 0 -or $end -lt $begin) { throw 'Unexpected output from dotnet user-secrets list --json.' }

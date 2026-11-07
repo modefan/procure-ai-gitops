@@ -30,12 +30,22 @@
       procure-connection-strings one key per AppHost connection name (ConnectionStrings__<name>): the Postgres databases, suppliersdb,
                                  assistantchatdb, rabbitmq, redis, auditlog; in-cluster host names; MongoDB with tls=true. Each
                                  database as its service's own role or user (<service>_app), never the superuser or root
-      ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io from `gh auth token` (plan 07 ruling 7)
+      ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io: local from `gh auth token` (plan 07 ruling 7); hosted from
+                                 the user env var GHCR_READ_TOKEN (classic PAT, read:packages only; plan 08 D4)
     In namespace observability (a pod reads Secrets of its own namespace only):
       procure-keycloak           dashboard-secret only (the Aspire dashboard's Keycloak client aspire-dashboard)
+
+    -Environment hosted (plan 08 ruling 11): the same Secrets on the hosted VM (bootstrap/hosted/, through the SSH tunnel), from a separate
+    user-secrets store `procure-ai-hosted` that shares no value with the AppHost. Every value is generated there on the first run (32
+    letters and digits; the admin API key 64, its SHA-256 derived from it; the MongoDB keyfile 48 random bytes in base64) and kept, so a
+    second run changes nothing. Rotate a value by removing it from that store (dotnet user-secrets remove --id procure-ai-hosted
+    Parameters:<name>) and running the script again, then restart the pods that use it.
 #>
 [CmdletBinding()]
 param(
+    # local: the k3d cluster and the AppHost user secrets. hosted: the VM through the SSH tunnel and the procure-ai-hosted user secrets.
+    [ValidateSet('local', 'hosted')]
+    [string] $Environment = 'local',
     # The GitHub account whose token pulls the GHCR images.
     [string] $GhcrUser = 'modefan',
     # Remove the keys (and Secrets) this script no longer writes. Only after Argo CD synced and rolled every pod that used them.
@@ -43,7 +53,10 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
+Select-ProcureCluster $Environment
 Assert-ClusterReachable
+$hosted = $Environment -eq 'hosted'
+$storeName = if ($hosted) { "hosted user secrets ($UserSecretsId)" } else { "AppHost user secrets ($UserSecretsId)" }
 
 $secrets = Read-UserSecrets
 
@@ -54,19 +67,46 @@ $capturedServices = 'access', 'approvals', 'assistant', 'budgets', 'invoicing', 
 $databasePasswords = @($postgresServices + 'suppliers' | ForEach-Object { "db-$_-password" }) +
     @($capturedServices | ForEach-Object { "db-$_-cdc-password" }) + 'db-assistant-mongo-password'
 
-# New in plan 07 and 08: generated once, stored in the AppHost user secrets first (stdin JSON merges into the store, no value on a command
-# line). The AppHost generates the same names on its first run (persisted parameters); whichever runs first, both then share the value.
+$required = 'postgres-password', 'rabbitmq-password', 'redis-password', 'mongo-password', 'mongo-keyfile-content',
+    'keycloak-admin-password', 'keycloak-demo-password', 'keycloak-gateway-secret', 'keycloak-internal-secret',
+    'keycloak-access-admin-secret', 'keycloak-demo-login-secret', 'keycloak-dashboard-secret', 'keycloak-db-password',
+    'debezium-mongo-password', 'admin-api-key', 'admin-api-key-sha256', 'simulator-api-key',
+    'supplier-webhook-secret', 'audit-log-reader-password'
+$required += $databasePasswords
+
+function New-RandomText([int] $length) {
+    [Security.Cryptography.RandomNumberGenerator]::GetString([char[]] 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', $length)
+}
+function Test-Missing([string] $name) { -not $secrets.ContainsKey("Parameters:$name") -or [string]::IsNullOrEmpty($secrets["Parameters:$name"]) }
+
+# Generated once, stored in the user secrets first (stdin JSON merges into the store, no value on a command line). Local: only the values
+# new in plan 07 and 08; the AppHost generates the same names on its first run (persisted parameters), whichever runs first, both then
+# share the value. Hosted: every value (the store is this script's alone), plus the user name the hosted RabbitMQ uses.
 $generated = [ordered]@{}
-foreach ($name in @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords) {
-    if (-not $secrets.ContainsKey("Parameters:$name") -or [string]::IsNullOrEmpty($secrets["Parameters:$name"])) {
-        $generated["Parameters:$name"] = [Security.Cryptography.RandomNumberGenerator]::GetString(
-            [char[]] 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', 32)
+$toGenerate = if ($hosted) { $required } else { @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords }
+foreach ($name in $toGenerate) {
+    if (-not (Test-Missing $name)) { continue }
+    switch ($name) {
+        'admin-api-key' { $generated["Parameters:$name"] = New-RandomText 64 }
+        'admin-api-key-sha256' { }  # derived from the key below
+        'mongo-keyfile-content' { $generated["Parameters:$name"] = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48)) }
+        default { $generated["Parameters:$name"] = New-RandomText 32 }
     }
 }
+if ($hosted) {
+    # The services compare the SHA-256 (hex) of the admin API key: derived whenever the key is new or the hash is missing.
+    $apiKey = if ($generated.Contains('Parameters:admin-api-key')) { $generated['Parameters:admin-api-key'] } else { $secrets['Parameters:admin-api-key'] }
+    if ($generated.Contains('Parameters:admin-api-key') -or (Test-Missing 'admin-api-key-sha256')) {
+        $generated['Parameters:admin-api-key-sha256'] = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($apiKey))).ToLowerInvariant()
+    }
+    # RabbitMQ's default user `guest` may log in from localhost only; the hosted cluster gets its own user name.
+    if (Test-Missing 'rabbitmq-username') { $generated['Parameters:rabbitmq-username'] = 'procure' }
+}
 if ($generated.Count -gt 0) {
-    $generated | ConvertTo-Json -Compress | & dotnet user-secrets set --id $AppHostUserSecretsId | Out-Null
+    $generated | ConvertTo-Json -Compress | & dotnet user-secrets set --id $UserSecretsId | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'dotnet user-secrets set failed.' }
-    Write-Host "Generated and stored in the AppHost user secrets: $($generated.Keys -join ', ')"
+    Write-Host "Generated and stored in the $($storeName): $($generated.Keys -join ', ')"
     $secrets = Read-UserSecrets
 }
 
@@ -74,19 +114,13 @@ function Get-Parameter([string] $name, $default = $null) {
     $value = $secrets["Parameters:$name"]
     if ([string]::IsNullOrEmpty($value)) {
         if ($null -ne $default) { return $default }
-        throw "AppHost user secret Parameters:$name is missing. Run the AppHost once (it generates most values) or set it with 'dotnet user-secrets set --id $AppHostUserSecretsId Parameters:$name <value>'."
+        throw "User secret Parameters:$name is missing in the $storeName. Run the AppHost once (it generates most values) or set it with 'dotnet user-secrets set --id $UserSecretsId Parameters:$name <value>'."
     }
     $value
 }
 
-$required = 'postgres-password', 'rabbitmq-password', 'redis-password', 'mongo-password', 'mongo-keyfile-content',
-    'keycloak-admin-password', 'keycloak-demo-password', 'keycloak-gateway-secret', 'keycloak-internal-secret',
-    'keycloak-access-admin-secret', 'keycloak-demo-login-secret', 'keycloak-dashboard-secret', 'keycloak-db-password',
-    'debezium-mongo-password', 'admin-api-key', 'admin-api-key-sha256', 'simulator-api-key',
-    'supplier-webhook-secret', 'audit-log-reader-password'
-$required += $databasePasswords
 $missing = @($required | Where-Object { [string]::IsNullOrEmpty($secrets["Parameters:$_"]) })
-if ($missing) { throw "AppHost user secrets missing: $(($missing | ForEach-Object { "Parameters:$_" }) -join ', '). Run the AppHost once, then this script again." }
+if ($missing) { throw "$storeName missing: $(($missing | ForEach-Object { "Parameters:$_" }) -join ', '). Run the AppHost once, then this script again." }
 
 # User names: the AppHost sets none, so Aspire's defaults apply (an override in the user secrets wins, as in the AppHost).
 $rabbitUser = Get-Parameter 'rabbitmq-username' 'guest'
@@ -106,7 +140,7 @@ function Get-LiveSecretData([string] $namespace, [string] $name) {
     # stderr (deprecation, version skew) goes to a temporary file and is shown only when kubectl fails.
     $errFile = New-TemporaryFile
     try {
-        $json = & kubectl --context $KubeContext -n $namespace get secret $name -o json --ignore-not-found 2>$errFile
+        $json = & kubectl @KubectlArgs -n $namespace get secret $name -o json --ignore-not-found 2>$errFile
         if ($LASTEXITCODE -ne 0) { throw "kubectl get secret $namespace/$name failed: $((Get-Content -Raw $errFile).Trim())" }
     } finally {
         Remove-Item $errFile -ErrorAction SilentlyContinue
@@ -213,15 +247,21 @@ Set-ProcureSecret procure-connection-strings $connectionStrings
 # Older bootstraps also made a Secret procure-audit-log-reader that nothing reads (the password is in procure-connection-strings/auditlog);
 # -Prune removes it so there is one place to rotate.
 if ($Prune) {
-    $stale = & kubectl --context $KubeContext -n procure delete secret procure-audit-log-reader --ignore-not-found 2>&1
+    $stale = & kubectl @KubectlArgs -n procure delete secret procure-audit-log-reader --ignore-not-found 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kubectl delete secret procure-audit-log-reader failed: $stale" }
     if ($stale) { $results.Add("$stale") }
 }
 
-# --- GHCR pull secret (plan 07 ruling 7): the token in Dale's gh keyring; plan 08 replaces it with a read:packages-only token. ---
-$gh = (Get-Command gh -ErrorAction SilentlyContinue)?.Source ?? 'C:\Program Files\GitHub CLI\gh.exe'
-$token = (& $gh auth token 2>$null | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) { throw "'gh auth token' returned no token; sign in with 'gh auth login' first." }
+# --- GHCR pull secret. Local (plan 07 ruling 7): the token in Dale's gh keyring. Hosted (plan 08 D4): the classic PAT with only
+# read:packages in the user env var GHCR_READ_TOKEN, never the gh token (which can write to every repo). ---
+if ($hosted) {
+    $token = [Environment]::GetEnvironmentVariable('GHCR_READ_TOKEN', 'User') ?? $env:GHCR_READ_TOKEN
+    if ([string]::IsNullOrWhiteSpace($token)) { throw 'The user env var GHCR_READ_TOKEN (GHCR read-only PAT, DEMO PASSWORDS.txt) is not set.' }
+} else {
+    $gh = (Get-Command gh -ErrorAction SilentlyContinue)?.Source ?? 'C:\Program Files\GitHub CLI\gh.exe'
+    $token = (& $gh auth token 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) { throw "'gh auth token' returned no token; sign in with 'gh auth login' first." }
+}
 $token = $token.Trim()
 $dockerConfig = [ordered]@{ auths = [ordered]@{ 'ghcr.io' = [ordered]@{
     username = $GhcrUser

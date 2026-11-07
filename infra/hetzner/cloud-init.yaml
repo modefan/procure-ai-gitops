@@ -1,0 +1,130 @@
+#cloud-config
+# First boot of the hosted VM (Terraform templatefile: admin_user, ssh_public_key, k3s_version, private_ip). Runs once; for a running VM
+# make the same change over SSH and keep this file in line (main.tf ignores user_data changes). Checked by
+# bootstrap/hosted/Test-HostBaseline.ps1.
+#  - one non-root sudo user, SSH key only: no password login, no root login, no keyboard-interactive, only that user;
+#  - fail2ban on sshd (journal backend);
+#  - unattended security upgrades (no automatic reboot: a reboot is a deliberate step, it restarts the whole demo);
+#  - k3s pinned, the API server bound to the private address only (reached through an SSH tunnel), kubelet graceful shutdown 60 s
+#    (20 s of it for critical pods) and the same memory reservations as the local cluster (bootstrap/common.ps1).
+
+users:
+  - name: ${admin_user}
+    gecos: procure-ai admin
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+disable_root: true
+ssh_pwauth: false
+
+package_update: true
+package_upgrade: true
+packages:
+  - unattended-upgrades
+  - fail2ban
+  - python3-systemd
+
+write_files:
+  # sshd takes the first value it reads, and Ubuntu's sshd_config includes sshd_config.d/*.conf at the top: 00- wins over cloud-init's
+  # own 50-cloud-init.conf. Local forwarding stays on (the Kubernetes API tunnel); nothing else is forwarded.
+  - path: /etc/ssh/sshd_config.d/00-procure-hardening.conf
+    permissions: "0644"
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+      AuthenticationMethods publickey
+      PermitEmptyPasswords no
+      AllowUsers ${admin_user}
+      AllowTcpForwarding local
+      AllowAgentForwarding no
+      AllowStreamLocalForwarding no
+      PermitTunnel no
+      X11Forwarding no
+      GatewayPorts no
+      MaxAuthTries 3
+      LoginGraceTime 30
+
+  - path: /etc/fail2ban/jail.d/sshd.local
+    permissions: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+
+  - path: /etc/apt/apt.conf.d/52procure-unattended-upgrades
+    permissions: "0644"
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "false";
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+
+  # The kubelet's graceful node shutdown needs logind to wait that long (Ubuntu's default InhibitDelayMaxSec is 5 s).
+  - path: /etc/systemd/logind.conf.d/50-kubelet-shutdown.conf
+    permissions: "0644"
+    content: |
+      [Login]
+      InhibitDelayMaxSec=75
+
+  - path: /etc/rancher/k3s/config.yaml
+    permissions: "0600"
+    content: |
+      # The node and the API on the private address only: nothing of Kubernetes listens on the public interfaces except Traefik's
+      # 80/443 (ServiceLB host ports), and the Hetzner firewall drops everything but 22, 80 and 443 anyway.
+      node-ip: ${private_ip}
+      advertise-address: ${private_ip}
+      bind-address: ${private_ip}
+      write-kubeconfig-mode: "0600"
+      # Secrets encrypted at rest in the datastore.
+      secrets-encryption: true
+
+  # Kubelet settings as a configuration drop-in (k3s reads agent/etc/kubelet.conf.d; kubelet command-line flags for these are
+  # deprecated in favour of the configuration file).
+  - path: /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/50-procure.conf
+    permissions: "0644"
+    content: |
+      apiVersion: kubelet.config.k8s.io/v1beta1
+      kind: KubeletConfiguration
+      shutdownGracePeriod: 60s
+      shutdownGracePeriodCriticalPods: 20s
+      kubeReserved:
+        memory: 1Gi
+      systemReserved:
+        memory: 256Mi
+      evictionHard:
+        memory.available: 1Gi
+        nodefs.available: 5%
+        imagefs.available: 5%
+
+  # The install script of the pinned release (it checks the binary's sha256 against the release's checksums).
+  - path: /usr/local/sbin/install-k3s.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      version='${k3s_version}'
+      tag=$(printf '%s' "$version" | sed 's/+/%2B/')
+      curl -sfL "https://raw.githubusercontent.com/k3s-io/k3s/$tag/install.sh" -o /tmp/k3s-install.sh
+      INSTALL_K3S_VERSION="$version" INSTALL_K3S_SKIP_ENABLE=false sh /tmp/k3s-install.sh server
+      rm -f /tmp/k3s-install.sh
+
+runcmd:
+  - [systemctl, restart, systemd-logind]
+  - [systemctl, restart, ssh]
+  - [systemctl, enable, --now, fail2ban]
+  - [systemctl, enable, --now, unattended-upgrades]
+  - [/usr/local/sbin/install-k3s.sh]

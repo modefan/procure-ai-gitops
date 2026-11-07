@@ -8,7 +8,8 @@
     creates the Applications argocd (Argo CD manages itself), platform, observability and procure-ai in sync waves.
 
     1. Deploy keys (plan 07 ruling 6), ed25519, private halves in %USERPROFILE%\.procure-ai\deploy-keys\ (current user only):
-         argocd-procure-ai         read-only on modefan/procure-ai          (Argo CD reads the charts)
+         argocd-procure-ai         read-only on modefan/procure-ai          (Argo CD reads the charts; the hosted VM has its own
+                                   pair argocd-hosted-procure-ai and argocd-hosted-procure-ai-gitops)
          argocd-procure-ai-gitops  read-only on modefan/procure-ai-gitops   (Argo CD reads the values and apps/)
          ci-gitops-write           write on modefan/procure-ai-gitops       (procure-ai's publish workflow bumps appRevision); its
                                    private half is the secret GITOPS_DEPLOY_KEY of the procure-ai
@@ -35,6 +36,8 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
+# envs/hosted is the VM (bootstrap/hosted/: its kubeconfig, through the SSH tunnel); every other folder the local k3d cluster.
+Select-ProcureCluster $Environment
 Assert-ClusterReachable
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $gh = Get-Gh
@@ -91,8 +94,11 @@ function Initialize-DeployKey([string] $name, [string] $repo, [bool] $write, [st
     $new
 }
 
-Initialize-DeployKey 'argocd-procure-ai' $appRepo $false 'argocd-local (read-only)' | Out-Null
-Initialize-DeployKey 'argocd-procure-ai-gitops' $gitopsRepo $false 'argocd-local (read-only)' | Out-Null
+# Argo CD's read-only keys: one pair per cluster, so the hosted VM's can be revoked without touching the local cluster's.
+$argoKeyPrefix = if ($Environment -eq 'hosted') { 'argocd-hosted-' } else { 'argocd-' }
+$argoKeyTitle = if ($Environment -eq 'hosted') { 'argocd-hosted (read-only)' } else { 'argocd-local (read-only)' }
+Initialize-DeployKey "${argoKeyPrefix}procure-ai" $appRepo $false $argoKeyTitle | Out-Null
+Initialize-DeployKey "${argoKeyPrefix}procure-ai-gitops" $gitopsRepo $false $argoKeyTitle | Out-Null
 $ciKeyNew = Initialize-DeployKey 'ci-gitops-write' $gitopsRepo $true 'procure-ai publish workflow (write)'
 $retentionKeyNew = Initialize-DeployKey 'gitops-retention-read' $gitopsRepo $false 'procure-ai retention workflow (read-only)'
 
@@ -161,7 +167,7 @@ $adminEnabled = Get-ArgoCdSwitch 'adminEnabled'
 $ingressEnabled = Get-ArgoCdSwitch 'ingressEnabled'
 
 Write-Host "Installing Argo CD (chart argo-cd $chartVersion; admin user $(if ($adminEnabled) { 'on' } else { 'off' }), ingress $(if ($ingressEnabled) { 'on' } else { 'off' }))..."
-$out = & helm --kube-context $KubeContext upgrade --install argocd argo-cd --repo $chartRepo --version $chartVersion `
+$out = & helm @HelmArgs upgrade --install argocd argo-cd --repo $chartRepo --version $chartVersion `
     --namespace argocd -f (Join-Path $repoRoot 'argocd/values.yaml') `
     --set "configs.cm.admin\.enabled=$($adminEnabled.ToString().ToLowerInvariant())" `
     --set "server.ingress.enabled=$($ingressEnabled.ToString().ToLowerInvariant())" --wait --timeout 10m 2>&1
@@ -170,8 +176,8 @@ Write-Host "Argo CD is running."
 
 # --- 3. Repository Secrets -----------------------------------------------------------------------------------------------------------
 foreach ($repo in @(
-        @{ Name = 'repo-procure-ai'; Url = "git@github.com:$appRepo.git"; Key = 'argocd-procure-ai' },
-        @{ Name = 'repo-procure-ai-gitops'; Url = "git@github.com:$gitopsRepo.git"; Key = 'argocd-procure-ai-gitops' })) {
+        @{ Name = 'repo-procure-ai'; Url = "git@github.com:$appRepo.git"; Key = "${argoKeyPrefix}procure-ai" },
+        @{ Name = 'repo-procure-ai-gitops'; Url = "git@github.com:$gitopsRepo.git"; Key = "${argoKeyPrefix}procure-ai-gitops" })) {
     $secret = New-SecretObject -Namespace argocd -Name $repo.Name `
         -Data ([ordered]@{ type = 'git'; url = $repo.Url }) `
         -FileData ([ordered]@{ sshPrivateKey = (Join-Path $DeployKeyDir $repo.Key) })
@@ -201,4 +207,8 @@ $root = [ordered]@{
     }
 }
 Write-Host (Invoke-Apply $root)
-Write-Host "Argo CD now brings up envs/$Environment (kubectl --context $KubeContext -n argocd get applications). UI: https://argocd.procure.localtest.me (admin; password in Secret argocd/argocd-initial-admin-secret)."
+if ($Environment -eq 'hosted') {
+    Write-Host "Argo CD now brings up envs/$Environment (kubectl --kubeconfig $HostedKubeconfig --context $KubeContext -n argocd get applications). UI: kubectl port-forward svc/argocd-server through the tunnel (no public ingress, plan 08 ruling 4)."
+} else {
+    Write-Host "Argo CD now brings up envs/$Environment (kubectl --context $KubeContext -n argocd get applications). UI: https://argocd.procure.localtest.me (admin; password in Secret argocd/argocd-initial-admin-secret)."
+}
