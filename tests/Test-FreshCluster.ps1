@@ -123,7 +123,11 @@ function Get-Pods {
         $json = & kubectl @KubectlArgs -n $ns get pods -o json 2>$null
         if ($LASTEXITCODE -eq 0) { $all += @(($json | Out-String | ConvertFrom-Json).items) }
     }
-    $all
+    # Pods the kubelet's graceful node shutdown ended (a VM reboot, plan 08 Task 12) stay as Failed objects with this reason and message
+    # until deleted; their Deployment or StatefulSet has replaced them. They are not broken pods of the running system.
+    @($all | Where-Object {
+            -not ($_.status.phase -eq 'Failed' -and $_.status.PSObject.Properties['reason'] -and $_.status.reason -eq 'Terminated' -and
+                $_.status.PSObject.Properties['message'] -and "$($_.status.message)" -like '*imminent node shutdown*') })
 }
 
 function Get-ContainerStatuses($pod) {
@@ -299,10 +303,15 @@ foreach ($name in 'platform', 'procure-ai') {
 }
 $platformDone = [datetimeoffset] $byName['platform'].status.operationState.finishedAt
 $appsStarted = [datetimeoffset] $byName['procure-ai'].status.operationState.startedAt
-if ($appsStarted -lt $platformDone) {
+if ($WatchOnly -and $appsStarted -lt [datetimeoffset] $suiteStart) {
+    # Nothing synced during this watch (e.g. after a VM reboot the pods restart but no sync runs): the last operations may come from
+    # different rollouts or a manual sync, so their order says nothing.
+    Write-Host "Wave order: no procure-ai sync during this watch (its last started $($appsStarted.ToLocalTime().ToString('HH:mm:ss'))); not checked."
+} elseif ($appsStarted -lt $platformDone) {
     Stop-Test "procure-ai's sync started at $($appsStarted.ToLocalTime().ToString('HH:mm:ss')), before the platform's sync finished at $($platformDone.ToLocalTime().ToString('HH:mm:ss'))"
+} else {
+    Write-Host "Wave order ok: platform's sync finished $($platformDone.ToLocalTime().ToString('HH:mm:ss')), procure-ai's started $($appsStarted.ToLocalTime().ToString('HH:mm:ss')) (both at $($appRevision.Substring(0, 7)))."
 }
-Write-Host "Wave order ok: platform's sync finished $($platformDone.ToLocalTime().ToString('HH:mm:ss')), procure-ai's started $($appsStarted.ToLocalTime().ToString('HH:mm:ss')) (both at $($appRevision.Substring(0, 7)))."
 
 # --- 3. Stable: nothing restarts or drops out of Ready -------------------------------------------------------------------------------
 function Get-RestartCounts($pods) {
