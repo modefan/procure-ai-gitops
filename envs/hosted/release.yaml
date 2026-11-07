@@ -1,5 +1,7 @@
-# What is deployed to the hosted VM (same shape as envs/local/release.yaml). PLACEHOLDER of plan 08 Task 11: the Applications that use it
-# are off in apps.yaml until Task 12; the apps chart requires a valid revision, so this is the local one at the time of writing.
+# What is deployed to the hosted VM (the public demo; same shape as envs/local/release.yaml). Written by procure-ai's publish workflow
+# after CI passed and the images were pushed (since plan 08 Task 12 it bumps local and hosted in one commit; it never moves a file
+# backwards, so pinning an older revision here by hand holds until a newer commit is published). Roll back by setting a revision whose
+# images are in GHCR (the retention workflow keeps every tag of envs/*/release.yaml's recent history).
 appRevision: "ea1f3c5f8cebf0893882b879692a5271b0adf461"
 platformImageTags:
   postgres: "4eb631f845098f2eb5636b43ede8ef74975f9dfd"

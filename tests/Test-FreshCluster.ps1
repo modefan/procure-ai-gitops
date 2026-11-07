@@ -20,6 +20,10 @@
     given: then they must be in the local Docker engine under those names (deploy/scripts/build-images.ps1 -Tag <appRevision>
     -Registry ghcr.io/modefan, in a procure-ai checkout of that revision) and are imported into the new cluster before Argo CD starts,
     for a check before CI has published the revision. Exit code 1 on any failure.
+
+    -Environment hosted works with -WatchOnly only (the hosted VM is never deleted by a test): it watches the hosted cluster through the
+    SSH tunnel and reports the node's peak memory from `kubectl top node` instead of docker stats; the smoke checks run with
+    -Environment hosted.
 #>
 [CmdletBinding()]
 param(
@@ -36,6 +40,9 @@ param(
 )
 
 . (Join-Path $PSScriptRoot '..\bootstrap\common.ps1')
+$hosted = $Environment -eq 'hosted'
+if ($hosted -and -not $WatchOnly) { throw '-Environment hosted needs -WatchOnly: a test never deletes the hosted cluster.' }
+Select-ProcureCluster $Environment
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $bootstrap = Join-Path $repoRoot 'bootstrap'
 $watchedNamespaces = @('procure', 'argocd', 'observability')
@@ -75,6 +82,15 @@ function ConvertFrom-DockerSize([string] $text) {
 }
 
 function Measure-Memory {
+    if ($hosted) {
+        # The VM's node as the kubelet sees it (metrics-server), e.g. "vmi3735351  420m  5%  6123Mi  26%".
+        $top = & kubectl @KubectlArgs top node --no-headers 2>$null
+        if ($LASTEXITCODE -eq 0 -and "$top" -match '\s(\d+)Mi\s') {
+            $bytes = [int64] $Matches[1] * 1MB
+            if ($bytes -gt $script:peakNodeBytes) { $script:peakNodeBytes = $bytes }
+        }
+        return
+    }
     $usage = & docker stats --no-stream --format '{{.MemUsage}}' "k3d-$ClusterName-server-0" 2>$null
     if ($LASTEXITCODE -eq 0 -and $usage) {
         $bytes = ConvertFrom-DockerSize (("$usage" -split '/')[0].Trim())
@@ -88,12 +104,15 @@ function Measure-Memory {
 function Write-Summary {
     Write-Host ''
     if ($script:convergedAfter) { Write-Host ("Converged {0:mm\:ss} after install-argocd.ps1 started." -f $script:convergedAfter) }
-    if ($script:peakNodeBytes -gt 0) { Write-Host ("Node memory peak (docker stats): {0:N2} GiB of {1}." -f ($script:peakNodeBytes / 1GB), $NodeMemory) }
+    if ($script:peakNodeBytes -gt 0) {
+        if ($hosted) { Write-Host ("Node memory peak (kubectl top node): {0:N2} GiB." -f ($script:peakNodeBytes / 1GB)) }
+        else { Write-Host ("Node memory peak (docker stats): {0:N2} GiB of {1}." -f ($script:peakNodeBytes / 1GB), $NodeMemory) }
+    }
     if ($script:minFreeGB -lt [double]::MaxValue) { Write-Host ("Windows free memory, lowest seen: {0:N1} GB." -f $script:minFreeGB) }
     if (Test-ClusterReachable) {
-        $out = & kubectl --context $KubeContext -n argocd get applications -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,OPERATION:.status.operationState.phase,REVISION:.status.sync.revisions[0]' 2>&1
+        $out = & kubectl @KubectlArgs -n argocd get applications -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,OPERATION:.status.operationState.phase,REVISION:.status.sync.revisions[0]' 2>&1
         Write-Host ($out -join "`n")
-        $top = & kubectl --context $KubeContext top pods -n argocd --no-headers 2>&1
+        $top = & kubectl @KubectlArgs top pods -n argocd --no-headers 2>&1
         if ($LASTEXITCODE -eq 0) { Write-Host "Argo CD pods (kubectl top):`n$($top -join "`n")" }
     }
 }
@@ -101,7 +120,7 @@ function Write-Summary {
 function Get-Pods {
     $all = @()
     foreach ($ns in $watchedNamespaces) {
-        $json = & kubectl --context $KubeContext -n $ns get pods -o json 2>$null
+        $json = & kubectl @KubectlArgs -n $ns get pods -o json 2>$null
         if ($LASTEXITCODE -eq 0) { $all += @(($json | Out-String | ConvertFrom-Json).items) }
     }
     $all
@@ -134,8 +153,8 @@ function Get-OwnerKind($pod) {
 function Show-ContainerLog($pod, [string] $container) {
     $ns = $pod.metadata.namespace; $name = $pod.metadata.name
     Write-Host "--- last log lines of $ns/$name ($container), previous run:" -ForegroundColor Yellow
-    $log = & kubectl --context $KubeContext -n $ns logs $name -c $container --previous --tail 30 2>&1
-    if ($LASTEXITCODE -ne 0) { $log = & kubectl --context $KubeContext -n $ns logs $name -c $container --tail 30 2>&1 }
+    $log = & kubectl @KubectlArgs -n $ns logs $name -c $container --previous --tail 30 2>&1
+    if ($LASTEXITCODE -ne 0) { $log = & kubectl @KubectlArgs -n $ns logs $name -c $container --tail 30 2>&1 }
     Write-Host ($log -join "`n")
 }
 
@@ -178,7 +197,7 @@ function Assert-NoBrokenPods($pods) {
 }
 
 function Get-AppState {
-    $json = & kubectl --context $KubeContext -n argocd get applications -o json 2>$null
+    $json = & kubectl @KubectlArgs -n argocd get applications -o json 2>$null
     if ($LASTEXITCODE -ne 0) { return @{} }
     $state = @{}
     foreach ($app in ($json | Out-String | ConvertFrom-Json).items) {
@@ -197,7 +216,7 @@ function Get-AppState {
 $suiteStart = Get-Date
 $importTime = [TimeSpan]::Zero
 # --- 1. From nothing --------------------------------------------------------------------------------------------------------------
-Assert-DockerRunning
+if (-not $hosted) { Assert-DockerRunning }
 Measure-Memory
 if (-not $WatchOnly) {
 Write-Step "Deleting cluster '$ClusterName' (all its data) and bootstrapping envs/$Environment at appRevision $appRevision"
@@ -312,7 +331,7 @@ Write-Host "Stable for $StableSeconds s. Restarts while converging (allowed): $(
 
 # --- 4. Smoke --------------------------------------------------------------------------------------------------------------------
 Write-Step 'Test-Smoke.ps1'
-& (Join-Path $PSScriptRoot 'Test-Smoke.ps1')
+& (Join-Path $PSScriptRoot 'Test-Smoke.ps1') -Environment $Environment
 if ($LASTEXITCODE -ne 0) { Stop-Test 'smoke checks failed.' }
 
 Write-Summary

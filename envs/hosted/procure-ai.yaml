@@ -1,0 +1,42 @@
+# Values of the procure-ai umbrella chart (procure-ai deploy/charts/procure-ai) for the hosted VM: the public live demo at
+# https://procure.daleabels.com (plan 08 Task 12). No secrets here: the chart references the Secrets bootstrap/new-secrets.ps1
+# -Environment hosted creates (procure-ai-provider holds the Azure Foundry key).
+global:
+  imageRegistry: ghcr.io/modefan
+  # The chart's default rollout (a new pod next to the old one, then the switch): the 24 GB VM has room for it, so a deploy does not take
+  # an API away for its restart as on the 10 GB local node.
+  hosts:
+    app: procure.daleabels.com
+    keycloak: auth.daleabels.com
+  # The live demo for reviewers: seeded data, one-click demo login, the nightly reset (02:00 Africa/Johannesburg) and the "behind the
+  # scenes" panel.
+  demo:
+    seed: true
+    reset: true
+    devPanel: true
+    login: true
+
+# The real model (plan 08 Task 9, D1): Azure Foundry, OpenAI-compatible /openai/v1/ endpoint, deployments `chat` (gpt-5-mini) and
+# `embeddings` (text-embedding-3-small, 1536 dimensions natively). The key is Secret procure-ai-provider (from the user env var
+# AZURE_FOUNDRY_API_KEY). gpt-5-mini is a reasoning model: no reasoning (the Task 9 evaluation ran with it), no temperature, and every call
+# gets at least 256 output tokens (a small limit is otherwise used up by reasoning and the reply comes back empty). The daily token cap per
+# tenant stays at the app's default (AI:DailyTokenCapPerTenant 200 000) until Task 13 sizes it.
+assistant:
+  env:
+    AI__Provider: AzureFoundry
+    AI__Endpoint: https://procureai-foundry-862eee.openai.azure.com/openai/v1/
+    AI__Chat__Model: chat
+    AI__Embedding__Model: embeddings
+    AI__Chat__ReasoningEffort: None
+    AI__Chat__SupportsTemperature: "false"
+    AI__Chat__MinOutputTokens: "256"
+  secretEnv:
+    AI__ApiKey: { secret: procure-ai-provider, key: api-key }
+
+# The web app's runtime config.json: the dashboard link of the "behind the scenes" panel and the dev panel itself.
+web:
+  configJson:
+    observability:
+      dashboardUrl: https://dashboard.daleabels.com
+    devPanel:
+      enabled: true

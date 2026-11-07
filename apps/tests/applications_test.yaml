@@ -211,3 +211,20 @@ tests:
             server:
               ingress:
                 enabled: false
+
+  # Task 3 review minor, done in Task 12: a quoted value ("false") is a string, which `ne .adminEnabled false` read as on. The switches
+  # must be YAML booleans; anything else fails the render (fail closed) instead of opening Argo CD on a public host.
+  - it: a quoted argo cd switch fails the render instead of turning it on
+    set:
+      argocd:
+        adminEnabled: "false"
+    asserts:
+      - failedTemplate:
+          errorPattern: argocd.adminEnabled must be true or false \(a YAML boolean, not a string\)
+  - it: a quoted argo cd ingress switch fails the render
+    set:
+      argocd:
+        ingressEnabled: "no"
+    asserts:
+      - failedTemplate:
+          errorPattern: argocd.ingressEnabled must be true or false \(a YAML boolean, not a string\)

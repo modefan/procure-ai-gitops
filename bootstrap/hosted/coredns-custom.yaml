@@ -1,0 +1,14 @@
+# The hosted VM's twin of bootstrap/coredns-custom.yaml (plan 07 ruling 8). Tokens carry iss = https://auth.daleabels.com/realms/procure;
+# inside the cluster that name answers with the Traefik Service, so pods reach Keycloak through the same ingress, host name and
+# certificate as the browser, without a round trip through the VM's public address. Applied by bootstrap/hosted/install-cert-manager.ps1.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  procure.override: |
+    rewrite stop {
+      name exact auth.daleabels.com. traefik.kube-system.svc.cluster.local.
+      answer auto
+    }

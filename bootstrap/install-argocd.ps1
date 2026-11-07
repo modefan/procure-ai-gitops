@@ -158,7 +158,10 @@ function Get-ArgoCdSwitch([string] $name) {
         $inBlock = $false
         foreach ($line in Get-Content $file) {
             if ($line -match '^[A-Za-z]') { $inBlock = $line -match '^argocd:\s*(#.*)?$'; continue }
-            if ($inBlock -and $line -match "^\s+$($name):\s*(true|false)\s*(#.*)?$") { $value = $Matches[1] -eq 'true' }
+            if (-not $inBlock -or $line -notmatch "^\s+$($name):") { continue }
+            # Fail closed (as the apps chart does): only a bare YAML boolean; a quoted "false" must never leave the switch on.
+            if ($line -notmatch "^\s+$($name):\s*(true|false)\s*(#.*)?$") { throw "argocd.$name in $file must be true or false (a YAML boolean): '$($line.Trim())'" }
+            $value = $Matches[1] -eq 'true'
         }
     }
     $value

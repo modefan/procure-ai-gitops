@@ -1,14 +1,15 @@
-# Values of the app of apps (apps/) for the hosted VM (Contabo VPS, bootstrap/hosted/). The revision is in release.yaml.
-# PLACEHOLDER of plan 08 Task 11: only Argo CD (managing itself) runs; Task 12 adds platform.yaml, procure-ai.yaml and observability.yaml
-# (ingress hosts, certificates, sizes) and turns the three Applications on.
+# Values of the app of apps (apps/) for the hosted VM (Contabo VPS, bootstrap/hosted/): the public live demo at https://procure.daleabels.com.
+# The revision is in release.yaml. Before the first sync: bootstrap/hosted/install-cert-manager.ps1 (edge, certificate),
+# bootstrap/new-local-ca.ps1 -Environment hosted (the internal CA for MongoDB's TLS) and bootstrap/new-secrets.ps1 -Environment hosted.
 env: hosted
 argocd:
   # A public host (plan 08 ruling 4): no admin user and no ingress; the UI only through kubectl port-forward over the SSH tunnel.
   adminEnabled: false
   ingressEnabled: false
 platform:
-  enabled: false
+  enabled: true
 observability:
-  enabled: false
+  # The collector and the Aspire dashboard at https://dashboard.daleabels.com (Keycloak sign-in, dashboard-viewer only).
+  enabled: true
 procureAi:
-  enabled: false
+  enabled: true

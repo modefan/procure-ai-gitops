@@ -19,17 +19,25 @@
       procure and observability/ConfigMap procure-ca   (key <openssl subject hash>.0 for SSL_CERT_DIR, and ca.crt)
     Browsers do not trust this CA unless Dale imports it himself (trust-local-ca.ps1, optional).
     -CaDir and -FilesOnly (tests/Test-LocalCa.ps1): write the files into another folder and leave the cluster alone.
+
+    -Environment hosted (plan 08 Task 12): the hosted VM's own internal CA in %USERPROFILE%\.procure-ai\hosted\internal-ca\ (shares
+    nothing with the local one), for MongoDB's TLS only: its name constraints hold only the in-cluster MongoDB names, localhost and
+    127.0.0.1 (no localtest.me), and it issues no ingress certificate and writes no procure-tls / TLSStore (the public certificate is Let's
+    Encrypt's, bootstrap/hosted/install-cert-manager.ps1). It writes mongo-tls and the procure-ca ConfigMaps on the hosted cluster.
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet('local', 'hosted')]
+    [string] $Environment = 'local',
     [string] $CaDir,
     # Only the files: no cluster needed, no cluster objects written.
     [switch] $FilesOnly
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
-if (-not $CaDir) { $CaDir = $LocalCaDir }
-if (-not $FilesOnly) { Assert-ClusterReachable }
+$hosted = $Environment -eq 'hosted'
+if (-not $CaDir) { $CaDir = if ($hosted) { Join-Path $HostedDir 'internal-ca' } else { $LocalCaDir } }
+if (-not $FilesOnly) { Select-ProcureCluster $Environment; Assert-ClusterReachable }
 $openssl = Get-OpenSsl
 
 Set-CurrentUserOnlyAcl $CaDir
@@ -37,6 +45,9 @@ Set-CurrentUserOnlyAcl $CaDir
 # What the CA may sign (see the description); Test-LocalCa.ps1 checks the same list.
 $permittedNames = @('DNS:localtest.me', 'DNS:mongo', 'DNS:mongo.procure', 'DNS:mongo.procure.svc', 'DNS:procure.svc.cluster.local',
     'DNS:localhost', 'IP:127.0.0.1/255.255.255.255')
+# The hosted CA vouches for MongoDB's in-cluster names only (no host a browser opens).
+if ($hosted) { $permittedNames = @($permittedNames | Where-Object { $_ -ne 'DNS:localtest.me' }) }
+$caName = if ($hosted) { 'procure-ai hosted internal CA' } else { 'procure-ai local CA' }
 
 function Invoke-OpenSsl {
     $out = & $openssl @args 2>&1
@@ -68,9 +79,9 @@ if ($caExists -and -not (Test-CaConstrained $caCrt)) {
     $caExists = $false
 }
 if (-not $caExists) {
-    Write-Host 'Creating the local CA...'
+    Write-Host "Creating the $caName..."
     Invoke-OpenSsl req -x509 -new -newkey rsa:3072 -noenc -keyout $caKey -out $caCrt -days 3650 -sha256 `
-        -subj '/O=procure-ai/CN=procure-ai local CA' `
+        -subj "/O=procure-ai/CN=$caName" `
         -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' `
         -addext 'keyUsage=critical,keyCertSign,cRLSign' `
         -addext 'subjectKeyIdentifier=hash' `
@@ -108,7 +119,7 @@ function New-LeafCertificate([string] $name, [string] $commonName, [string[]] $a
     $true
 }
 
-New-LeafCertificate 'procure' 'procure.localtest.me' @('procure.localtest.me', '*.procure.localtest.me') 'serverAuth' | Out-Null
+if (-not $hosted) { New-LeafCertificate 'procure' 'procure.localtest.me' @('procure.localtest.me', '*.procure.localtest.me') 'serverAuth' | Out-Null }
 # mongod presents this to the services (mongo / the FQDN) and to itself (localhost, for mongosh in the pod and the init Job);
 # mongo-0.mongo... covers a headless StatefulSet member name if the replica set is initiated with it.
 $mongoIssued = New-LeafCertificate 'mongo' 'mongo.procure.svc.cluster.local' @(
@@ -130,17 +141,19 @@ if ($FilesOnly) {
 $hash = (& $openssl x509 -subject_hash -noout -in $caCrt).Trim()
 if ($LASTEXITCODE -ne 0 -or $hash -notmatch '^[0-9a-f]{8}$') { throw 'Could not compute the CA subject hash.' }
 
-Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name procure-tls -Type 'kubernetes.io/tls' -FileData ([ordered]@{
-    'tls.crt' = Join-Path $CaDir 'procure.crt'
-    'tls.key' = Join-Path $CaDir 'procure.key'
-})))
-Write-Host (Invoke-Apply ([ordered]@{
-    apiVersion = 'traefik.io/v1alpha1'
-    kind       = 'TLSStore'
-    # Traefik only uses the store named "default"; it becomes the certificate for every ingress without its own.
-    metadata   = [ordered]@{ name = 'default'; namespace = 'procure'; labels = [ordered]@{ 'app.kubernetes.io/managed-by' = 'procure-bootstrap' } }
-    spec       = [ordered]@{ defaultCertificate = [ordered]@{ secretName = 'procure-tls' } }
-}))
+if (-not $hosted) {
+    Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name procure-tls -Type 'kubernetes.io/tls' -FileData ([ordered]@{
+        'tls.crt' = Join-Path $CaDir 'procure.crt'
+        'tls.key' = Join-Path $CaDir 'procure.key'
+    })))
+    Write-Host (Invoke-Apply ([ordered]@{
+        apiVersion = 'traefik.io/v1alpha1'
+        kind       = 'TLSStore'
+        # Traefik only uses the store named "default"; it becomes the certificate for every ingress without its own.
+        metadata   = [ordered]@{ name = 'default'; namespace = 'procure'; labels = [ordered]@{ 'app.kubernetes.io/managed-by' = 'procure-bootstrap' } }
+        spec       = [ordered]@{ defaultCertificate = [ordered]@{ secretName = 'procure-tls' } }
+    }))
+}
 Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name mongo-tls -Type 'kubernetes.io/tls' -FileData ([ordered]@{
     'tls.crt'   = Join-Path $CaDir 'mongo.crt'
     'tls.key'   = Join-Path $CaDir 'mongo.key'
@@ -157,4 +170,4 @@ foreach ($namespace in 'procure', 'observability') {
         data       = [ordered]@{ "$hash.0" = $caPem; 'ca.crt' = $caPem }
     }))
 }
-Write-Host "Local CA in $CaDir (subject hash $hash)."
+Write-Host "$(if ($hosted) { 'Hosted internal' } else { 'Local' }) CA in $CaDir (subject hash $hash)."

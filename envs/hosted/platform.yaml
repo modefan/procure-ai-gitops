@@ -1,0 +1,31 @@
+# Values of the procure-platform chart (procure-ai deploy/charts/procure-platform) for the hosted VM (public live demo, plan 08 Task 12).
+# No secrets here: the chart references the Secrets bootstrap/new-secrets.ps1 -Environment hosted creates. The certificate is not set here
+# either: every Ingress gets Traefik's default certificate, the Let's Encrypt one of bootstrap/hosted/install-cert-manager.ps1.
+global:
+  imageRegistry: ghcr.io/modefan
+
+storageClassName: local-path
+ingressClassName: traefik
+
+hosts:
+  app: procure.daleabels.com
+  keycloak: auth.daleabels.com
+  dashboard: dashboard.daleabels.com
+
+# The VM's disk is 290 GB; the demo data is small. Postgres also holds the WAL the Debezium slots keep (max_slot_wal_keep_size 1GB each).
+postgres:
+  storage: 20Gi
+mongo:
+  storage: 5Gi
+rabbitmq:
+  storage: 2Gi
+
+keycloak:
+  ingress:
+    # Plan 08 ruling 4: only Keycloak's public paths of the procure realm (no admin console, admin REST API, master realm or welcome page).
+    publicPathsOnly: true
+
+mailpit:
+  ingress:
+    # Plan 08 ruling 4: no public Mailpit; kubectl port-forward svc/mailpit 8025 over the SSH tunnel.
+    enabled: false

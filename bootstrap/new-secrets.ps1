@@ -30,6 +30,9 @@
       procure-connection-strings one key per AppHost connection name (ConnectionStrings__<name>): the Postgres databases, suppliersdb,
                                  assistantchatdb, rabbitmq, redis, auditlog; in-cluster host names; MongoDB with tls=true. Each
                                  database as its service's own role or user (<service>_app), never the superuser or root
+      procure-ai-provider        api-key: hosted only (plan 08 Task 12), the Azure Foundry key of the Assistant (AI__ApiKey, envs/hosted/
+                                 procure-ai.yaml), from the user env var AZURE_FOUNDRY_API_KEY on every run (rotate: change the env var, rerun,
+                                 restart assistant-api); the local cluster runs the Fake provider and has no such Secret
       ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io: local from `gh auth token` (plan 07 ruling 7); hosted from
                                  the user env var GHCR_READ_TOKEN (classic PAT, read:packages only; plan 08 D4)
     In namespace observability (a pod reads Secrets of its own namespace only):
@@ -214,6 +217,13 @@ Set-ProcureSecret procure-api-keys ([ordered]@{
     'simulator-api-key'       = Get-Parameter 'simulator-api-key'
     'supplier-webhook-secret' = Get-Parameter 'supplier-webhook-secret'
 })
+
+# --- The model provider's key (hosted only; the Fake provider needs none). Never stored in the user secrets: the env var is its one place. ---
+if ($hosted) {
+    $aiKey = [Environment]::GetEnvironmentVariable('AZURE_FOUNDRY_API_KEY', 'User') ?? $env:AZURE_FOUNDRY_API_KEY
+    if ([string]::IsNullOrWhiteSpace($aiKey)) { throw 'The user env var AZURE_FOUNDRY_API_KEY (Azure Foundry key, DEMO PASSWORDS.txt) is not set.' }
+    Set-ProcureSecret procure-ai-provider ([ordered]@{ 'api-key' = $aiKey.Trim() })
+}
 
 # --- Connection strings (controller ruling R2): the names the AppHost gives the apps (ConnectionStrings__<name>), in-cluster hosts. ---
 function New-NpgsqlConnectionString([string] $user, [string] $password, [string] $database) {

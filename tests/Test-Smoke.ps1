@@ -33,25 +33,44 @@
     TLS is verified against the local CA (%USERPROFILE%\.procure-ai\local-ca\ca.crt) with curl (not .NET: ESET on this PC intercepts TLS
     from pwsh). The admin key goes to curl in a header file that only the current user can read, never on a command line; nothing
     secret is printed. Exit code 1 on any failure.
+
+    -Environment hosted (plan 08 Task 12): the hosted VM through the SSH tunnel, the public host names (procure, auth,
+    dashboard.daleabels.com), certificates verified against Windows' trusted roots (Let's Encrypt), the admin key from the user env var
+    DEMO_ADMIN_API_KEY_HOSTED and the demo password from the hosted user secrets (procure-ai-hosted). Check 9 (loopback) is the local
+    cluster's; the hosted surface is tests/Test-PublicSurface.ps1.
 #>
 [CmdletBinding()]
 param(
-    [string] $AppHost = 'procure.localtest.me',
-    [string] $KeycloakHost = 'auth.procure.localtest.me',
-    [string] $DashboardHost = 'dashboard.procure.localtest.me',
+    [ValidateSet('local', 'hosted')]
+    [string] $Environment = 'local',
+    [string] $AppHost,
+    [string] $KeycloakHost,
+    [string] $DashboardHost,
     [string] $Tenant = 'acme'
 )
 
 . (Join-Path $PSScriptRoot '..\bootstrap\common.ps1')
+Select-ProcureCluster $Environment
+$hosted = $Environment -eq 'hosted'
+$baseDomain = if ($hosted) { $HostedDomain } else { 'procure.localtest.me' }
+if (-not $AppHost) { $AppHost = if ($hosted) { "procure.$HostedDomain" } else { 'procure.localtest.me' } }
+if (-not $KeycloakHost) { $KeycloakHost = "auth.$baseDomain" }
+if (-not $DashboardHost) { $DashboardHost = "dashboard.$baseDomain" }
+$adminKeyVar = if ($hosted) { 'DEMO_ADMIN_API_KEY_HOSTED' } else { 'DEMO_ADMIN_API_KEY' }
 $failures = [System.Collections.Generic.List[string]]::new()
 function Fail([string] $message) { $failures.Add($message); Write-Host "FAIL: $message" -ForegroundColor Red }
 function Pass([string] $message) { Write-Host "ok:   $message" -ForegroundColor Green }
 
 # Git for Windows' curl, else Windows' curl.exe. Both use Schannel here: --cacert pins the local CA, --ssl-no-revoke because it has no CRL.
+# Hosted: Let's Encrypt certificates, verified against Windows' trusted roots (no --cacert).
 $curl = @('C:\Program Files\Git\mingw64\bin\curl.exe', "$env:SystemRoot\System32\curl.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $curl) { throw 'curl not found.' }
-$caFile = Join-Path $LocalCaDir 'ca.crt'
-if (-not (Test-Path $caFile)) { throw "Local CA $caFile not found (bootstrap/new-local-ca.ps1)." }
+$tlsArgs = @('--ssl-no-revoke')
+if (-not $hosted) {
+    $caFile = Join-Path $LocalCaDir 'ca.crt'
+    if (-not (Test-Path $caFile)) { throw "Local CA $caFile not found (bootstrap/new-local-ca.ps1)." }
+    $tlsArgs += @('--cacert', $caFile)
+}
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("procure-smoke-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 Set-CurrentUserOnlyAcl $work
@@ -61,7 +80,7 @@ function Invoke-Curl {
     # Returns @{ Status; Body }. Extra curl arguments after the URL.
     param([Parameter(Mandatory)] [string] $Url, [string[]] $Extra = @())
     $bodyFile = Join-Path $work 'body.txt'
-    $status = & $curl -sS --max-time 20 --ssl-no-revoke --cacert $caFile -o $bodyFile -w '%{http_code}' -b $jar -c $jar @Extra $Url 2>&1
+    $status = & $curl -sS --max-time 20 @tlsArgs -o $bodyFile -w '%{http_code}' -b $jar -c $jar @Extra $Url 2>&1
     $code = if ("$status" -match '(\d{3})$') { [int] $Matches[1] } else { 0 }
     $body = if (Test-Path $bodyFile) { Get-Content -Raw $bodyFile } else { '' }
     if ($code -eq 0) { $body = "$status" }
@@ -86,7 +105,7 @@ function Invoke-DashboardSignIn {
     $userJar = Join-Path $work "dashboard-$($User.Split('@')[0]).txt"
     $page = Join-Path $work 'dashboard-page.html'
     function Step([string[]] $curlArgs) {
-        $written = & $curl -sS --max-time 20 --ssl-no-revoke --cacert $caFile -c $userJar -b $userJar -o $page -w '%{http_code} %{url_effective}' @curlArgs 2>&1
+        $written = & $curl -sS --max-time 20 @tlsArgs -c $userJar -b $userJar -o $page -w '%{http_code} %{url_effective}' @curlArgs 2>&1
         $parts = "$written" -split ' ', 2
         [pscustomobject]@{ Status = [int]($parts[0] -replace '\D', '0'); Url = if ($parts.Count -gt 1) { $parts[1] } else { '' }; Body = if (Test-Path $page) { Get-Content -Raw $page } else { '' } }
     }
@@ -118,10 +137,12 @@ function Invoke-DashboardSignIn {
 }
 
 try {
-    # --- 9. Loopback only (first: the checks below go through these ports) ------------------------------------------------------
-    $exposure = @(Get-ClusterPortExposure)
-    if ($exposure) { foreach ($line in $exposure) { Fail "published port not on loopback only: $line" } }
-    else { Pass "ports $($PublishedPorts -join ', ') listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners)" }
+    # --- 9. Loopback only (first: the checks below go through these ports; the local cluster's, see Test-PublicSurface.ps1 for hosted) ---
+    if (-not $hosted) {
+        $exposure = @(Get-ClusterPortExposure)
+        if ($exposure) { foreach ($line in $exposure) { Fail "published port not on loopback only: $line" } }
+        else { Pass "ports $($PublishedPorts -join ', ') listen on 127.0.0.1 / ::1 only (docker bindings and Windows listeners)" }
+    }
 
     # --- 1. Gateway readiness through Traefik ---------------------------------------------------------------------------------------
     $r = Invoke-Curl "https://$AppHost/health/ready"
@@ -152,9 +173,9 @@ try {
     }
 
     # --- 4. Seeded requests with the admin key -------------------------------------------------------------------------------------
-    $key = [Environment]::GetEnvironmentVariable('DEMO_ADMIN_API_KEY', 'Process')
-    if (-not $key) { $key = [Environment]::GetEnvironmentVariable('DEMO_ADMIN_API_KEY', 'User') }
-    if (-not $key) { Fail 'user env var DEMO_ADMIN_API_KEY is not set' }
+    $key = [Environment]::GetEnvironmentVariable($adminKeyVar, 'Process')
+    if (-not $key) { $key = [Environment]::GetEnvironmentVariable($adminKeyVar, 'User') }
+    if (-not $key) { Fail "user env var $adminKeyVar is not set" }
     else {
         $headers = Join-Path $work 'headers.txt'
         Set-Content -Path $headers -Value @("X-Api-Key: $key", "X-Tenant-Id: $Tenant") -NoNewline:$false
@@ -170,7 +191,7 @@ try {
     }
 
     # --- 5. The observability Application ------------------------------------------------------------------------------------------
-    $appJson = & kubectl --context $KubeContext -n argocd get application observability -o json 2>&1
+    $appJson = & kubectl @KubectlArgs -n argocd get application observability -o json 2>&1
     if ($LASTEXITCODE -ne 0) { Fail "Argo CD Application observability not found: $appJson" }
     else {
         $app = ($appJson -join "`n") | ConvertFrom-Json
@@ -220,7 +241,7 @@ try {
     # current-user-only work folder (--data-urlencode password@file), never on a command line.
     $passwordFile = Join-Path $work 'password.txt'
     $demoPassword = (Read-UserSecrets)['Parameters:keycloak-demo-password']
-    if (-not $demoPassword) { Fail 'AppHost user secret Parameters:keycloak-demo-password is missing' }
+    if (-not $demoPassword) { Fail "user secret Parameters:keycloak-demo-password is missing in $UserSecretsId" }
     else {
         [IO.File]::WriteAllText($passwordFile, $demoPassword)
         $demoPassword = $null
@@ -251,9 +272,12 @@ echo "PROBE control $c $e"
 xff='X-Forwarded-For: 203.0.113.9'
 c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "$xff" http://gateway:8080/health/ready); echo "PROBE direct-gateway $c $?"
 c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "$xff" http://keycloak:8080/realms/procure/.well-known/openid-configuration); echo "PROBE direct-keycloak $c $?"
-c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H "$xff" --connect-to procure.localtest.me:443:traefik.kube-system.svc.cluster.local:443 https://procure.localtest.me/health/ready); echo "PROBE traefik-gateway $c $?"
-c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H "$xff" https://auth.procure.localtest.me/realms/procure/.well-known/openid-configuration); echo "PROBE traefik-keycloak $c $?"
+c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 __CA__ -H "$xff" --connect-to __APP__:443:traefik.kube-system.svc.cluster.local:443 https://__APP__/health/ready); echo "PROBE traefik-gateway $c $?"
+c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 __CA__ -H "$xff" https://__AUTH__/realms/procure/.well-known/openid-configuration); echo "PROBE traefik-keycloak $c $?"
 '@
+    # Local: the local CA from ConfigMap procure-ca; hosted: Let's Encrypt, which the curl image trusts. The auth host reaches Traefik through
+    # the CoreDNS rewrite (bootstrap/coredns-custom.yaml, bootstrap/hosted/coredns-custom.yaml).
+    $probeScript = $probeScript.Replace('__CA__', $(if ($hosted) { '' } else { '--cacert /ca/ca.crt' })).Replace('__APP__', $AppHost).Replace('__AUTH__', $KeycloakHost)
     $probePod = 'smoke-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
     $overrides = [ordered]@{
         apiVersion = 'v1'
@@ -271,9 +295,9 @@ c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --cacert /ca/ca.crt -H 
             volumes                      = @([ordered]@{ name = 'ca'; configMap = [ordered]@{ name = 'procure-ca' } })
         }
     } | ConvertTo-Json -Depth 10 -Compress
-    $out = & kubectl --context $KubeContext -n procure run $probePod --image=docker.io/curlimages/curl:8.23.0 --restart=Never --rm -i --quiet `
+    $out = & kubectl @KubectlArgs -n procure run $probePod --image=docker.io/curlimages/curl:8.23.0 --restart=Never --rm -i --quiet `
         --labels='app.kubernetes.io/name=smoke-probe' --overrides=$overrides --pod-running-timeout=2m 2>&1 | ForEach-Object { "$_" }
-    & kubectl --context $KubeContext -n procure delete pod $probePod --ignore-not-found --wait=false 2>&1 | Out-Null
+    & kubectl @KubectlArgs -n procure delete pod $probePod --ignore-not-found --wait=false 2>&1 | Out-Null
     $probes = @{}
     foreach ($line in $out) { if ($line -match '^PROBE (\S+) (\d{3}) (\d+)$') { $probes[$Matches[1]] = @{ Code = $Matches[2]; Exit = [int] $Matches[3] } } }
     function Show([string] $name) { if ($probes.ContainsKey($name)) { "HTTP $($probes[$name].Code), curl exit $($probes[$name].Exit)" } else { 'no result' } }
@@ -312,7 +336,7 @@ SELECT DISTINCT database_name || '|' || user_name FROM log, roles_run
 FROM unnest(ARRAY['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']) AS day
 WHERE (pg_stat_file('log/postgresql-' || day || '.csv', true)).size IS NOT NULL \gexec
 '@
-    $rows = $pgauditSql -replace "`r", '' | & kubectl --context $KubeContext -n procure exec -i postgres-0 -c postgres -- psql -X -q -tA -v ON_ERROR_STOP=1 -U postgres -d auditdb 2>&1
+    $rows = $pgauditSql -replace "`r", '' | & kubectl @KubectlArgs -n procure exec -i postgres-0 -c postgres -- psql -X -q -tA -v ON_ERROR_STOP=1 -U postgres -d auditdb 2>&1
     if ($LASTEXITCODE -ne 0) { Fail "reading the pgaudit logs in postgres-0 failed: $(($rows | Select-Object -Last 3) -join ' | ')" }
     else {
         $seen = @($rows | Where-Object { "$_" -match '^(\w+db)\|(\S+)$' } | ForEach-Object { [pscustomobject]@{ Database = $Matches[1]; Role = $Matches[2] } })
@@ -337,10 +361,10 @@ export KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD"; k=/opt/keycloak/bin/kcadm
 $k config credentials --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --config $c >/dev/null &&
   $k create partial-export -r procure -q exportClients=true -q exportGroupsAndRoles=true -o --config $c; rc=$?; rm -f $c; exit $rc
 '@
-    $realmText = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- cat /opt/keycloak/data/import/procure-realm.json 2>&1
+    $realmText = & kubectl @KubectlArgs -n procure exec deploy/keycloak -c keycloak -- cat /opt/keycloak/data/import/procure-realm.json 2>&1
     $realmOk = $LASTEXITCODE -eq 0
     # stdout is the export; stderr (kcadm's "Logging into ..." and any error) stays apart for the FAIL message.
-    $exportOut = & kubectl --context $KubeContext -n procure exec deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '') 2>&1
+    $exportOut = & kubectl @KubectlArgs -n procure exec deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '') 2>&1
     $exportExit = $LASTEXITCODE
     $liveText = @($exportOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     $exportErr = @($exportOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })

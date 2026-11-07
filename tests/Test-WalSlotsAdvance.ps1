@@ -14,13 +14,25 @@
     3. Waits at most -IdleMinutes, polling every -HeartbeatMs (at least 5 s), until every slot's lag is below -MaxLagMB.
     4. Asserts: every slot's lag < -MaxLagMB, every slot's wal_status is `reserved`, and max_slot_wal_keep_size is not -1 (unlimited).
     The SQL runs with psql inside postgres-0 (kubectl exec, the pod's own credentials); nothing secret is printed. Exit code 1 on any failure.
+
+    -WatchWholeWindow (plan 08 Review Focus 1, the long idle run on the hosted VM): after every slot caught up, keep watching until
+    -IdleMinutes have passed, polling every -WatchPollSeconds; every poll's lag must stay below -MaxLagMB (the largest seen per slot is
+    reported). A dropped SSH tunnel is reopened (up to -MaxPollErrors failed polls in a row are tolerated).
+    -Environment hosted: the hosted VM through the SSH tunnel (bootstrap/hosted/open-tunnel.ps1); no Docker, no Windows memory check.
 .EXAMPLE
     ./tests/Test-WalSlotsAdvance.ps1 -IdleMinutes 20 -HeartbeatMs 10000
+.EXAMPLE
+    ./tests/Test-WalSlotsAdvance.ps1 -Environment hosted -IdleMinutes 360 -WatchWholeWindow
 #>
 [CmdletBinding()]
 param(
-    # How long the slots may take to catch up after the WAL was written.
+    [ValidateSet('local', 'hosted')]
+    [string] $Environment = 'local',
+    # How long the slots may take to catch up after the WAL was written (with -WatchWholeWindow: how long the whole idle watch lasts).
     [int] $IdleMinutes = 20,
+    [switch] $WatchWholeWindow,
+    [int] $WatchPollSeconds = 300,
+    [int] $MaxPollErrors = 3,
     # The heartbeat interval expected on the cluster; also the polling interval (at least 5 s).
     [int] $HeartbeatMs = 60000,
     [int] $WalMB = 200,
@@ -29,6 +41,8 @@ param(
 )
 
 . (Join-Path $PSScriptRoot '..\bootstrap\common.ps1')
+Select-ProcureCluster $Environment
+$hosted = $Environment -eq 'hosted'
 $failures = [System.Collections.Generic.List[string]]::new()
 function Fail([string] $message) { $failures.Add($message); Write-Host "FAIL: $message" -ForegroundColor Red }
 function Pass([string] $message) { Write-Host "ok:   $message" -ForegroundColor Green }
@@ -38,7 +52,7 @@ $scratch = 'walcheck_scratch'
 
 function Invoke-Psql([string] $database, [string] $sql) {
     # The SQL is the shell's $2 (no quoting through kubectl); the password is the pod's own POSTGRES_PASSWORD.
-    $out = & kubectl --context $KubeContext -n procure exec postgres-0 -c postgres -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U postgres -d "$1" -At -F "|" -c "$2"' sh $database $sql 2>&1
+    $out = & kubectl @KubectlArgs -n procure exec postgres-0 -c postgres -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U postgres -d "$1" -At -F "|" -c "$2"' sh $database $sql 2>&1
     if ($LASTEXITCODE -ne 0) { throw "psql on $database failed: $($out -join ' ')" }
     @($out | ForEach-Object { "$_" } | Where-Object { $_ })
 }
@@ -63,12 +77,13 @@ function Write-Slots($slots) {
 }
 
 function Assert-Memory {
+    if ($hosted) { return }
     $free = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
     if ($free -lt $MinFreeGB) { throw ("Windows has only {0:N1} GB free memory (minimum {1} GB): stopping so the PC stays responsive." -f $free, $MinFreeGB) }
 }
 
 try {
-    Assert-DockerRunning
+    if (-not $hosted) { Assert-DockerRunning }
     Assert-ClusterReachable
     Assert-Memory
 
@@ -123,6 +138,33 @@ try {
         Write-Host ("  {0:N0} s: {1} of {2} slot(s) behind{3}" -f ((Get-Date) - $started).TotalSeconds, $behind.Count, $now.Count,
             $(if ($behind) { " ($($behind -join ', '))" } else { '' }))
     } while ($behind -and (Get-Date) -lt $deadline)
+
+    # --- 3b. The whole idle window (-WatchWholeWindow) ----------------------------------------------------------------------------
+    if ($WatchWholeWindow -and -not $behind) {
+        Write-Step "Every slot caught up; watching until $($deadline.ToString('HH:mm:ss')) (every $WatchPollSeconds s), each lag must stay below $MaxLagMB MB"
+        $peak = @{}
+        $errorsInARow = 0
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds ([Math]::Min($WatchPollSeconds, [Math]::Max(1, [int]($deadline - (Get-Date)).TotalSeconds)))
+            try {
+                $now = Get-Slots
+                $errorsInARow = 0
+            } catch {
+                $errorsInARow++
+                Write-Host "  poll failed ($errorsInARow in a row): $_" -ForegroundColor Yellow
+                if ($errorsInARow -gt $MaxPollErrors) { throw "$errorsInARow polls in a row failed" }
+                if ($hosted) { try { & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') | Out-Host } catch { Write-Host "  tunnel: $_" -ForegroundColor Yellow } }
+                continue
+            }
+            foreach ($name in $now.Keys) { if (-not $peak.ContainsKey($name) -or $now[$name].LagMB -gt $peak[$name]) { $peak[$name] = $now[$name].LagMB } }
+            $over = @($now.Keys | Where-Object { $now[$_].LagMB -ge $MaxLagMB })
+            Write-Host ("  {0}: largest lag now {1:N1} MB{2}" -f (Get-Date -Format HH:mm), (($now.Values | Measure-Object LagMB -Maximum).Maximum),
+                $(if ($over) { " - OVER $MaxLagMB MB: $($over -join ', ')" } else { '' }))
+            foreach ($name in $over) { Fail ("{0}: lag {1:N1} MB at {2} during the idle window (must stay < {3} MB)" -f $name, $now[$name].LagMB, (Get-Date -Format HH:mm), $MaxLagMB) }
+        }
+        foreach ($name in $peak.Keys | Sort-Object) { Write-Host ("  {0,-26} largest lag in the window {1,8:N1} MB" -f $name, $peak[$name]) }
+        Pass ("watched the idle window to its end ({0} min from the WAL burst)" -f $IdleMinutes)
+    }
 
     # --- 4. After -------------------------------------------------------------------------------------------------------------------
     Write-Step 'Slots after the wait'

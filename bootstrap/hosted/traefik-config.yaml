@@ -1,0 +1,28 @@
+# k3s's bundled Traefik (chart traefik 40.x, Traefik 3.7) on the hosted VM, through k3s's HelmChartConfig (merged over the chart values k3s
+# ships; k3s reinstalls Traefik with them). Applied by bootstrap/hosted/install-cert-manager.ps1; the local cluster keeps k3s's defaults.
+#  - http:// answers with a permanent redirect to https:// (path and query kept) for every host. Let's Encrypt's HTTP-01 check follows
+#    the redirect to port 443, where cert-manager's solver Ingress answers (the websecure entry point serves every router with TLS).
+#  - externalTrafficPolicy Local: k3s's ServiceLB forwards to Traefik on this node without SNAT, so Traefik sees the visitor's address
+#    and puts it in X-Forwarded-For (the gateway trusts that from the pod network only; plan 08 ruling 5, Review Focus 5).
+#  - Traefik trusts no incoming X-Forwarded-* (the chart's default: no forwardedHeaders.trustedIPs, no insecure mode); nothing sits in
+#    front of the VM, so a visitor cannot choose the address the gateway logs and rate-limits by.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: procure-bootstrap
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
+    service:
+      spec:
+        externalTrafficPolicy: Local

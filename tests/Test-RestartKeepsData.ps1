@@ -19,10 +19,21 @@
        within -CaptureSeconds, attributed to the app (not "outside the app").
     Counts are read with psql / mongosh inside the database pods (kubectl exec, the pods' own credentials); nothing secret is printed.
     The admin key (user env var DEMO_ADMIN_API_KEY) goes to curl in a header file only the current user can read. Exit code 1 on any failure.
+
+    -Environment hosted -Reboot (plan 08 Review Focus 4): step 2 reboots the hosted VM instead (`sudo systemctl reboot` over SSH; the
+    kubelet's graceful node shutdown stops the pods first), waits for SSH, reopens the tunnel and waits until the cluster has converged
+    again (Test-FreshCluster.ps1 -Environment hosted -WatchOnly), which must happen within -ConvergeMinutes of the reboot. Postgres must
+    have shut down cleanly: crash recovery in its log after the reboot FAILS (with k3d it is only reported: `k3d cluster stop` kills it).
+    Hosted: the public host name, Let's Encrypt certificates (Windows' trusted roots) and the admin key from DEMO_ADMIN_API_KEY_HOSTED.
 #>
 [CmdletBinding()]
 param(
-    [string] $AppHost = 'procure.localtest.me',
+    [ValidateSet('local', 'hosted')]
+    [string] $Environment = 'local',
+    # Hosted only: reboot the VM (the only restart a hosted cluster has; required with -Environment hosted).
+    [switch] $Reboot,
+    [int] $ConvergeMinutes = 15,
+    [string] $AppHost,
     [int] $SettleSeconds = 60,
     [int] $CaptureSeconds = 30,
     [double] $MinFreeGB = 3.5
@@ -36,20 +47,26 @@ function Write-Step([string] $text) { Write-Host "`n== $(Get-Date -Format HH:mm:
 
 $curl = @('C:\Program Files\Git\mingw64\bin\curl.exe', "$env:SystemRoot\System32\curl.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $curl) { throw 'curl not found.' }
-$caFile = Join-Path $LocalCaDir 'ca.crt'
-$key = [Environment]::GetEnvironmentVariable('DEMO_ADMIN_API_KEY', 'Process')
-if (-not $key) { $key = [Environment]::GetEnvironmentVariable('DEMO_ADMIN_API_KEY', 'User') }
-if (-not $key) { throw 'User env var DEMO_ADMIN_API_KEY is not set.' }
+$hosted = $Environment -eq 'hosted'
+if ($hosted -ne [bool] $Reboot) { throw '-Reboot goes with -Environment hosted (the local cluster restarts with k3d stop/start).' }
+Select-ProcureCluster $Environment
+if (-not $AppHost) { $AppHost = if ($hosted) { "procure.$HostedDomain" } else { 'procure.localtest.me' } }
+$tlsArgs = @('--ssl-no-revoke')
+if (-not $hosted) { $tlsArgs += @('--cacert', (Join-Path $LocalCaDir 'ca.crt')) }
+$keyVar = if ($hosted) { 'DEMO_ADMIN_API_KEY_HOSTED' } else { 'DEMO_ADMIN_API_KEY' }
+$key = [Environment]::GetEnvironmentVariable($keyVar, 'Process')
+if (-not $key) { $key = [Environment]::GetEnvironmentVariable($keyVar, 'User') }
+if (-not $key) { throw "User env var $keyVar is not set." }
 
 function Invoke-Psql([string] $database, [string] $sql) {
     # The SQL is the shell's $1 (no quoting through kubectl); the password is the pod's own POSTGRES_PASSWORD.
-    $out = & kubectl --context $KubeContext -n procure exec postgres-0 -c postgres -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U postgres -d "$1" -At -F "|" -c "$2"' sh $database $sql 2>&1
+    $out = & kubectl @KubectlArgs -n procure exec postgres-0 -c postgres -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U postgres -d "$1" -At -F "|" -c "$2"' sh $database $sql 2>&1
     if ($LASTEXITCODE -ne 0) { throw "psql on $database failed: $($out -join ' ')" }
     @($out | ForEach-Object { "$_" } | Where-Object { $_ })
 }
 
 function Invoke-Mongo([string] $script) {
-    $out = & kubectl --context $KubeContext -n procure exec mongo-0 -c mongo -- sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --tls --tlsAllowInvalidCertificates --eval "$1"' sh $script 2>&1
+    $out = & kubectl @KubectlArgs -n procure exec mongo-0 -c mongo -- sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --tls --tlsAllowInvalidCertificates --eval "$1"' sh $script 2>&1
     if ($LASTEXITCODE -ne 0) { throw "mongosh failed: $($out -join ' ')" }
     @($out | ForEach-Object { "$_" } | Where-Object { $_ })
 }
@@ -81,7 +98,7 @@ function Get-Slots {
 
 function Wait-Converged([string] $why) {
     Write-Step "Waiting until the cluster has converged again ($why)"
-    & (Join-Path $PSScriptRoot 'Test-FreshCluster.ps1') -WatchOnly -StableSeconds 60 -MinFreeGB $MinFreeGB
+    & (Join-Path $PSScriptRoot 'Test-FreshCluster.ps1') -Environment $Environment -WatchOnly -StableSeconds 60 -MinFreeGB $MinFreeGB
     if ($LASTEXITCODE -ne 0) { throw "the cluster did not converge after $why (Test-FreshCluster.ps1 -WatchOnly failed)." }
 }
 
@@ -103,7 +120,7 @@ function Get-DebeziumPods {
 $work = Join-Path ([IO.Path]::GetTempPath()) ("procure-restart-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 Set-CurrentUserOnlyAcl $work
 try {
-    Assert-DockerRunning
+    if (-not $hosted) { Assert-DockerRunning }
     Assert-ClusterReachable
 
     # --- 1. Before ----------------------------------------------------------------------------------------------------------------------
@@ -115,27 +132,61 @@ try {
     if ($slotsBefore.Count -eq 0) { Fail 'no logical replication slot found (is Debezium running?)' }
     if (-not ($before.Keys | Where-Object { $_ -like 'requests *' })) { Fail 'no purchase requests to count (is the demo seed done?)' }
 
-    # --- 2. Cluster stop and start ----------------------------------------------------------------------------------------------------
-    Write-Step "k3d cluster stop $ClusterName"
-    $stoppedAt = [datetime]::UtcNow
-    & k3d cluster stop $ClusterName
-    if ($LASTEXITCODE -ne 0) { throw 'k3d cluster stop failed.' }
-    Write-Step "k3d cluster start $ClusterName"
-    & k3d cluster start $ClusterName
-    if ($LASTEXITCODE -ne 0) { throw 'k3d cluster start failed.' }
-    $deadline = (Get-Date).AddMinutes(3)
-    while (-not (Test-ClusterReachable)) {
-        if ((Get-Date) -gt $deadline) { throw 'the API server did not come back within 3 minutes.' }
-        Start-Sleep -Seconds 5
+    # --- 2. Cluster stop and start (local) or VM reboot (hosted) ------------------------------------------------------------------------
+    if ($hosted) {
+        Write-Step 'Rebooting the hosted VM (sudo systemctl reboot)'
+        $bootBefore = (Invoke-HostedSsh -Command 'cat /proc/sys/kernel/random/boot_id') -join ''
+        $stoppedAt = [datetime]::UtcNow
+        Invoke-HostedSsh -Command 'sudo systemctl reboot' -AllowFailure | Out-Null
+        & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') -Close | Out-Host
+        $deadline = (Get-Date).AddMinutes(10)
+        $bootAfter = $null
+        while (-not $bootAfter -or $bootAfter -eq $bootBefore) {
+            if ((Get-Date) -gt $deadline) { throw 'the VM did not come back over SSH within 10 minutes (Contabo panel / VNC).' }
+            Start-Sleep -Seconds 10
+            $bootAfter = (Invoke-HostedSsh -Command 'cat /proc/sys/kernel/random/boot_id' -AllowFailure) -join ''
+            if ($LASTEXITCODE -ne 0 -or $bootAfter -notmatch '^[0-9a-f-]{36}$') { $bootAfter = $null }
+        }
+        Write-Host ("  the VM is back over SSH {0:N0} s after the reboot (new boot id)" -f ([datetime]::UtcNow - $stoppedAt).TotalSeconds)
+        $deadline = (Get-Date).AddMinutes(5)
+        while ($true) {
+            try { & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') | Out-Host; if (Test-ClusterReachable) { break } } catch { }
+            if ((Get-Date) -gt $deadline) { throw 'the Kubernetes API did not answer through the tunnel within 5 minutes of SSH coming back.' }
+            Start-Sleep -Seconds 10
+        }
+        Wait-Converged 'the VM reboot'
+        $took = [datetime]::UtcNow - $stoppedAt
+        if ($took.TotalMinutes -le $ConvergeMinutes) { Pass ("the cluster converged on its own {0:mm\:ss} after the reboot (limit {1} min)" -f $took, $ConvergeMinutes) }
+        else { Fail ("the cluster converged only {0:mm\:ss} after the reboot (limit {1} min)" -f $took, $ConvergeMinutes) }
+    } else {
+        Write-Step "k3d cluster stop $ClusterName"
+        $stoppedAt = [datetime]::UtcNow
+        & k3d cluster stop $ClusterName
+        if ($LASTEXITCODE -ne 0) { throw 'k3d cluster stop failed.' }
+        Write-Step "k3d cluster start $ClusterName"
+        & k3d cluster start $ClusterName
+        if ($LASTEXITCODE -ne 0) { throw 'k3d cluster start failed.' }
+        $deadline = (Get-Date).AddMinutes(3)
+        while (-not (Test-ClusterReachable)) {
+            if ((Get-Date) -gt $deadline) { throw 'the API server did not come back within 3 minutes.' }
+            Start-Sleep -Seconds 5
+        }
+        Wait-Converged 'the cluster restart'
     }
-    Wait-Converged 'the cluster restart'
     # For the record: did Postgres shut down cleanly with the node, or recover from its WAL (then slot positions fall back to the last checkpoint)?
-    $pgLog = & kubectl --context $KubeContext -n procure logs postgres-0 -c postgres --tail 400 2>&1
+    $pgLog = & kubectl @KubectlArgs -n procure logs postgres-0 -c postgres --tail 400 2>&1
     # Only lines written since the stop (the log can hold older lines): they start with "yyyy-MM-dd HH:mm:ss.fff UTC".
     $recovered = @($pgLog | Where-Object {
             "$_" -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+ UTC .*(not properly shut down|was interrupted|automatic recovery)' -and
             [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture) -ge $stoppedAt.AddSeconds(-1) })
     Write-Host "  Postgres after the cluster start: $(if ($recovered) { "crash recovery from the WAL ($("$($recovered[0])".Trim()))" } else { 'clean start' })"
+    if ($hosted) {
+        # Review Focus 4: the kubelet's graceful node shutdown gives Postgres its grace period, so it must not recover from the WAL.
+        $startLines = @($pgLog | Where-Object { "$_" -match 'database system was shut down at|database system is ready to accept connections' })
+        if ($recovered) { Fail "Postgres recovered from the WAL after the reboot: it did not shut down cleanly ($("$($recovered[0])".Trim()))" }
+        elseif (-not $startLines) { Fail 'the Postgres log after the reboot shows no start (cannot tell a clean start)' }
+        else { Pass "Postgres started cleanly after the reboot (no crash recovery): $("$($startLines[0])".Trim())" }
+    }
 
     # --- 3. Database pods deleted ---------------------------------------------------------------------------------------------------
     Write-Step 'Deleting the postgres-0 and mongo-0 pods'
@@ -184,7 +235,7 @@ try {
     @{ title = "Restart check $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"; costCenterCode = 'IT-200'; supplierId = 'contoso-hardware'
         lines = @(@{ sku = 'MON-27'; quantity = 1 }) } | ConvertTo-Json -Depth 5 | Set-Content -Path $body
     $response = Join-Path $work 'response.json'
-    $status = & $curl -sS --max-time 20 --ssl-no-revoke --cacert $caFile -o $response -w '%{http_code}' -H "@$headers" --data "@$body" "https://$AppHost/api/v1/requests" 2>&1
+    $status = & $curl -sS --max-time 20 @tlsArgs -o $response -w '%{http_code}' -H "@$headers" --data "@$body" "https://$AppHost/api/v1/requests" 2>&1
     if ("$status" -ne '201') { Fail "creating a request answered $status $(Get-Content -Raw $response -ErrorAction SilentlyContinue)" }
     else {
         $id = (Get-Content -Raw $response | ConvertFrom-Json).id
@@ -193,7 +244,7 @@ try {
         $found = $null
         while (((Get-Date) - $created).TotalSeconds -lt $CaptureSeconds) {
             Start-Sleep -Seconds 2
-            $status = & $curl -sS --max-time 10 --ssl-no-revoke --cacert $caFile -o $response -w '%{http_code}' -H "@$headers" "https://$AppHost/api/v1/audit/requests/$id/data-changes" 2>&1
+            $status = & $curl -sS --max-time 10 @tlsArgs -o $response -w '%{http_code}' -H "@$headers" "https://$AppHost/api/v1/audit/requests/$id/data-changes" 2>&1
             if ("$status" -eq '200') {
                 $page = Get-Content -Raw $response | ConvertFrom-Json
                 $insert = @($page.items | Where-Object { $_.table -eq 'purchase_requests' -and $_.operation -eq 'Insert' -and $_.attribution -ne 'Pending' })
