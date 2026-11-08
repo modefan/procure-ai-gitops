@@ -99,6 +99,13 @@ $problems = 0
 foreach ($dest in $Destination) {
     $dest = [IO.Path]::GetFullPath($dest).TrimEnd([char]92)
     Assert-NotInRepository $dest
+    # Never a destination that is, contains or lies inside an original (re-review m6): the mirror would delete the run-time files of
+    # the original hosted folder as "extras" and copy files onto themselves.
+    foreach ($item in $items) {
+        $src = [IO.Path]::GetFullPath($item.Source).TrimEnd([char]92)
+        $inside = { param($a, $b) $a -eq $b -or $a.StartsWith($b + [char]92, [StringComparison]::OrdinalIgnoreCase) }
+        if ((& $inside $dest $src) -or (& $inside $src $dest)) { throw "Destination $dest overlaps the original $src. Nothing copied." }
+    }
     if (-not (Test-Path -LiteralPath $dest -PathType Container)) {
         if ($Check) { Write-Host "MISSING  $dest (the folder itself)"; $problems++; continue }
         New-Item -ItemType Directory -Path $dest | Out-Null

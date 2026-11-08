@@ -21,10 +21,12 @@
     8. The dashboard redirects to Keycloak's sign-in for client aspire-dashboard, and its telemetry API answers 404.
     9. The app (https://procure.<domain>/) answers 200. Every host sends Strict-Transport-Security (max-age at least 180 days, no preload),
        and no Server header names a version (nginx/1.2.3).
-   9b. The Keycloak host's rate limit (fix wave rulings R6b/R6c) covers every path, also spellings that miss the token endpoint's own
-       Ingress: -RateLimitBurst parallel requests (default 150) to each of a sign-in path with a matrix parameter
-       (/realms/procure/protocol/openid-connect/auth;x=1) and a non-sign-in path (the procure realm's discovery) must get some 429s. It
-       runs last on that host (it uses up this PC's bucket for about a minute). -SkipRateLimit leaves it out.
+   9b. The Keycloak host's rate limit (fix wave rulings R6b/R6c). Traefik keeps one bucket per router, i.e. per path prefix
+       (/realms/procure/, /realms/ops/, /resources/, each token endpoint), so each prefix gets its own burst of -RateLimitBurst parallel
+       requests (default 150) and must answer some 429s. The first burst goes to /realms/procure/protocol/openid-connect/token/../auth
+       (sent as is): it must land in the stricter bucket of /realms/procure/ (burst 60), not in the token endpoint's (burst 120), so it
+       needs at least 20 x 429. Then a sign-in path with a matrix parameter, realm ops' discovery and a /resources/ path. It runs last on
+       that host (it uses up this PC's buckets for about a minute). -SkipRateLimit leaves it out.
    10. The client address (Review Focus 5): Traefik must see the visitor's own address, not a ServiceLB or node address (k3s's svclb pod
        masquerades). Through the SSH tunnel (kubectl), a throwaway namespace gets an echo pod (traefik/whoami) behind an Ingress on a random
        path of the app host; one request from this PC must come back with X-Forwarded-For equal to this PC's public IPv4 address (asked from
@@ -249,15 +251,22 @@ try {
     # --- 9b. The Keycloak host's rate limit covers every path ------------------------------------------------------------------------
     if (-not $SkipRateLimit) {
         Write-Step "The rate limit on https://$KeycloakHost (every path, path variants included)"
-        foreach ($path in '/realms/procure/protocol/openid-connect/auth;x=1', '/realms/procure/.well-known/openid-configuration') {
+        $bursts = [ordered]@{
+            # Path cleaning sends this to the auth endpoint; routing must use the stricter /realms/procure/ bucket (burst 60).
+            '/realms/procure/protocol/openid-connect/token/../auth' = 20
+            '/realms/procure/protocol/openid-connect/auth;x=1'      = 1
+            '/realms/ops/.well-known/openid-configuration'          = 1
+            '/resources/x'                                           = 1
+        }
+        foreach ($path in $bursts.Keys) {
             # One curl process, many transfers in parallel; only the status codes come back.
             $urls = @(1..$RateLimitBurst | ForEach-Object { "https://$KeycloakHost$path"; '-o'; 'NUL' })
             $codes = @(& $curl -s -k --ssl-no-revoke --max-time 20 --path-as-is --parallel --parallel-max 30 -w '%{http_code}\n' @urls 2>$null |
                 ForEach-Object { "$_".Trim() } | Where-Object { $_ })
             $limited = @($codes | Where-Object { $_ -eq '429' }).Count
             $summary = ($codes | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Count) x $($_.Name)" }) -join ', '
-            if ($limited -gt 0) { Pass "$path`: $summary (rate-limited)" }
-            else { Fail "$path`: $summary, no 429: this path is not rate-limited (keycloak.ingress.rateLimit, R6c)" }
+            if ($limited -ge $bursts[$path]) { Pass "$path`: $summary (rate-limited)" }
+            else { Fail "$path`: $summary, fewer than $($bursts[$path]) x 429: not rate-limited as expected (keycloak.ingress.rateLimit, R6c)" }
         }
     }
 

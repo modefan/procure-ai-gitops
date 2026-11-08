@@ -6,12 +6,11 @@
 .DESCRIPTION
     The Keycloak group argocd-admins (realm ops since fix wave ruling R6c) is what gives Argo CD's role:admin, and the script is the path
     a human uses to fill it. Every case below must be refused with the group's members unchanged:
-      1. a demo user's address (tom@acme.test; the demo users live in realm procure, so here it would be created): refused as a demo
+      1. a demo user's e-mail (tom@acme.test; the demo users live in realm procure, so here it would be created): refused as a demo
          domain, and not created;
-      2. admin@acme.test (its password is published on the demo login page);
-      3. a new user with a *.test address (no user may be created either);
-      4. the e-mail fallback: -UserName names nobody and -Email names an existing ordinary user (a probe made here);
-      5. the mismatch: -UserName names one address, -Email another (the existing probe user).
+      2. admin@acme.test as e-mail (its password is published on the demo login page);
+      3. an e-mail address as user name (realm ops signs in by private user names only, review m4): refused, nothing created;
+      4. the e-mail fallback: a new -UserName with the -Email of an existing ordinary user (a probe made here).
     A positive control then adds a new ordinary probe user (it must land in the group, with the required action Configure OTP) and takes
     it out again with -Remove.
     Probe users are named t12c-probe-<kind>-<random>@example.com, created and deleted by this test (also after a failure); any member the
@@ -77,9 +76,9 @@ function Invoke-AddAdmin([hashtable] $arguments) {
 }
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
-$victim = "t12c-probe-victim-$suffix@example.com"
-$okUser = "t12c-probe-ok-$suffix@example.com"
-$newTestUser = "t12c-probe-new-$suffix@example.test"
+$victim = "t12c-probe-victim-$suffix"
+$okUser = "t12c-probe-ok-$suffix"
+$newTestUser = "t12c-probe-new-$suffix"
 $before = @(Get-GroupMembers)
 Write-Host "Script under test: $Script"
 Write-Host "argocd-admins before: $($before.Count) member(s)."
@@ -107,21 +106,20 @@ kc delete "users/$U/groups/$GID"
 try {
     # A probe user: an ordinary one (the e-mail fallback's victim).
     Invoke-Kc @'
-kc create users -s username="$1" -s email="$1" -s firstName=Probe -s lastName=Victim -s enabled=true >/dev/null
+kc create users -s username="$1" -s email="$1@example.com" -s firstName=Probe -s lastName=Victim -s enabled=true >/dev/null
 '@ @($victim) | Out-Null
     Write-Host 'Probe user created (victim).'
 
-    Assert-Refused '1. demo user tom@acme.test' @{ UserName = 'tom@acme.test' } @('demo domain')
-    if (Get-UserId 'tom@acme.test') { Fail '1. tom@acme.test was created in realm ops' } else { Pass '1. tom@acme.test was not created in realm ops' }
-    Assert-Refused '2. admin@acme.test (published password)' @{ UserName = 'admin@acme.test' } @('demo domain')
-    Assert-Refused '3. new user with a *.test address' @{ UserName = $newTestUser } @('demo domain')
-    if (Get-UserId $newTestUser) { Fail '3. the *.test user was created' } else { Pass '3. no *.test user was created' }
-    Assert-Refused '4. e-mail fallback (-UserName names nobody, -Email an existing user)' @{ UserName = "t12c-probe-nobody-$suffix"; Email = $victim } @('UserName')
-    Assert-Refused '5. -UserName and -Email name different addresses' @{ UserName = $okUser; Email = $victim } @('differ')
-    if (Get-UserId $okUser) { Fail '5. a user was created for the mismatched -UserName' } else { Pass '5. no user created for the mismatch' }
+    Assert-Refused '1. demo user e-mail tom@acme.test' @{ UserName = $newTestUser; Email = 'tom@acme.test' } @('demo domain')
+    if (Get-UserId $newTestUser) { Fail '1. a user with a *.test e-mail was created in realm ops' } else { Pass '1. no user with a *.test e-mail was created' }
+    Assert-Refused '2. admin@acme.test as e-mail (published password)' @{ UserName = $newTestUser; Email = 'admin@acme.test' } @('demo domain')
+    Assert-Refused '3. an e-mail address as user name' @{ UserName = 'tom@acme.test'; Email = 'x@example.com' } @('UserName')
+    if (Get-UserId 'tom@acme.test') { Fail '3. a user named tom@acme.test was created' } else { Pass '3. no user named with an e-mail address was created' }
+    Assert-Refused '4. e-mail fallback (a new -UserName with an existing user''s -Email)' @{ UserName = $okUser; Email = "$victim@example.com" } @('identifier mismatch')
+    if (Get-UserId $okUser) { Fail '4. a user was created with the other user''s e-mail' } else { Pass '4. no user created for the e-mail fallback' }
 
     # Positive control: an ordinary new user is added (and removed again).
-    $result = Invoke-AddAdmin @{ UserName = $okUser; FirstName = 'Probe'; LastName = 'Ok' }
+    $result = Invoke-AddAdmin @{ UserName = $okUser; Email = "$okUser@example.com"; FirstName = 'Probe'; LastName = 'Ok' }
     $after = @(Get-GroupMembers)
     if (-not $result.Refused -and $okUser -in $after) { Pass 'positive control: a new ordinary user is added to argocd-admins' }
     else { Fail "positive control: the ordinary user was not added: $($result.Output)" }
