@@ -59,8 +59,9 @@ a month; plan 08 fix wave ruling R2); going public (plan 08 Task 17) moves it to
 Maintenance of the VM (procure-ai `docs/hosting.md` has the runbooks): `bootstrap/hosted/upgrade-k3s.ps1` (plans a k3s patch upgrade: the
 embedded containerd, runc and Traefik versions; `-Apply` upgrades, re-fetches the kubeconfig and reruns the baseline),
 `new-hosted-cluster.ps1 -KubeconfigOnly`, `new-hosted-cluster.ps1 -Import` (adopts the existing VM, firewall, key and DNS records into a
-lost Terraform state without a reinstall) and `bootstrap/hosted/backup-hosted.ps1 -Destination <folder>` (a gpg-encrypted offline copy
-of the SSH key, the state, the deploy keys, the CAs, both user-secrets stores and DEMO PASSWORDS.txt; where to keep it is Dale's choice).
+lost Terraform state without a reinstall) and `bootstrap/hosted/backup-hosted.ps1` (a plain mirror, Dale's decision 2026-11-08, of the SSH key,
+the state, the deploy keys, the CAs, both user-secrets stores, the Contabo recovery codes and DEMO PASSWORDS.txt into
+`%USERPROFILE%\OneDrive\procure-ai secrets` and `%USERPROFILE%\Documents\procure-ai secrets`, SHA-256-checked; `-Check` only compares).
 
 **Before every push here that changes `envs/`, `apps/` or `argocd/`: `./tests/Test-RenderEnvs.ps1`.** This repo has no CI, so nothing
 else renders the values before Argo CD does on the cluster (for `envs/hosted`, the public demo). It renders the app of apps, procure-ai's

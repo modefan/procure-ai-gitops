@@ -39,7 +39,7 @@
       afterwards). The plan must then import, not create: any create (except a DNS record that does not exist at all), delete or replace,
       and any change to the instance, is refused. The apply writes only the state; nothing on the VM, the firewall or the DNS changes.
       With -PlanOnly it stops after the plan (proof run). The SSH key must be the one on the VM (%USERPROFILE%\.procure-ai\hosted\, restored
-      from the offline backup, procure-ai docs/hosting.md "Recovering the hosted setup"); with a new key Terraform would only update the
+      from the backup copies of backup-hosted.ps1, procure-ai docs/hosting.md "Backup copies and recovery"); with a new key Terraform would only update the
       key secret and SSH would still be refused (the VM keeps the old key).
     -KubeconfigOnly: only fetches the kubeconfig again (no Terraform): after a k3s upgrade or restart, or when k3s renewed its client
       certificates and the PC's copy stopped working (bootstrap/hosted/upgrade-k3s.ps1 runs it).
@@ -73,6 +73,9 @@ $tfDir = Join-Path $repoRoot 'infra\hosted'
 if ($StateFile) { $HostedStateFile = [IO.Path]::GetFullPath($StateFile) }
 if ($Import -and $Reinstall) { throw '-Import keeps the VM as it is; -Reinstall reinstalls it. Use one.' }
 $importFile = Join-Path $tfDir '_import.tf'
+# A leftover from a run that failed before its cleanup must never feed a later run's plan (a normal run would then import under the normal
+# guard, not the import guard): removed before anything else, -Import writes its own afresh.
+Remove-Item -LiteralPath $importFile -ErrorAction SilentlyContinue
 
 function Update-HostedKubeconfig([string] $target) {
     # k3s's admin kubeconfig from the VM, pointed at the tunnel (127.0.0.1:16443) and renamed to the procure-hosted context. The file holds
@@ -323,8 +326,8 @@ if ($Reinstall -and $managed) {
     $managed = $false
 }
 
-$rootSecretId = Get-RootPasswordSecretId
 try {
+$rootSecretId = Get-RootPasswordSecretId
 $tfVars = @('-var', "ssh_public_key_path=$HostedSshKey.pub", '-var', "k3s_version=$HostedK3sVersion", '-var', "root_password_secret_id=$rootSecretId")
 $planFile = Join-Path $HostedDir 'tfplan'
 Invoke-Terraform plan -input=false -no-color "-out=$planFile" @tfVars | Out-Null

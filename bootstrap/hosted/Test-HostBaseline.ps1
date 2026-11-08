@@ -93,18 +93,21 @@ Add-Check 'from the PC: root and password logins refused (server offers publicke
     # known_hosts is neither read nor written. Every connection that matters (Invoke-HostedSsh) checks the key strictly. A throwaway file,
     # not NUL: Windows OpenSSH wrote "NUL" as a file into the current folder (found in the plan 08 fix wave).
     $throwawayKnownHosts = New-TemporaryFile
-    $common = @('-o', "UserKnownHostsFile=$($throwawayKnownHosts.FullName)", '-o', 'StrictHostKeyChecking=no', '-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15')
-    # Root with the right key: refused (AllowUsers and PermitRootLogin).
-    $root = & ssh @common -i $HostedSshKey -o IdentitiesOnly=yes "root@$ip" true 2>&1
-    if ($LASTEXITCODE -eq 0) { throw 'root logged in with the admin key' }
-    # No key at all: the server must list only publickey as a method (no password, no keyboard-interactive).
-    $nokey = & ssh @common -o PubkeyAuthentication=no -o 'PreferredAuthentications=password,keyboard-interactive' "$user@$ip" true 2>&1
-    $denied = ($nokey | ForEach-Object { "$_" }) -match 'Permission denied \(([^)]*)\)'
-    if ($LASTEXITCODE -eq 0 -or -not $denied) { throw "unexpected answer without a key: $($nokey -join ' ')" }
-    $methods = ([regex]::Match(($nokey -join ' '), 'Permission denied \(([^)]*)\)')).Groups[1].Value
-    Remove-Item -LiteralPath $throwawayKnownHosts.FullName -ErrorAction SilentlyContinue
-    if ($methods -ne 'publickey') { throw "server offers: $methods" }
-    "root refused; methods offered: $methods"
+    try {
+        $common = @('-o', "UserKnownHostsFile=$($throwawayKnownHosts.FullName)", '-o', 'StrictHostKeyChecking=no', '-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15')
+        # Root with the right key: refused (AllowUsers and PermitRootLogin).
+        $root = & ssh @common -i $HostedSshKey -o IdentitiesOnly=yes "root@$ip" true 2>&1
+        if ($LASTEXITCODE -eq 0) { throw 'root logged in with the admin key' }
+        # No key at all: the server must list only publickey as a method (no password, no keyboard-interactive).
+        $nokey = & ssh @common -o PubkeyAuthentication=no -o 'PreferredAuthentications=password,keyboard-interactive' "$user@$ip" true 2>&1
+        $denied = ($nokey | ForEach-Object { "$_" }) -match 'Permission denied \(([^)]*)\)'
+        if ($LASTEXITCODE -eq 0 -or -not $denied) { throw "unexpected answer without a key: $($nokey -join ' ')" }
+        $methods = ([regex]::Match(($nokey -join ' '), 'Permission denied \(([^)]*)\)')).Groups[1].Value
+        if ($methods -ne 'publickey') { throw "server offers: $methods" }
+        "root refused; methods offered: $methods"
+    } finally {
+        Remove-Item -LiteralPath $throwawayKnownHosts.FullName -ErrorAction SilentlyContinue
+    }
 }
 
 Add-Check 'fail2ban guards sshd (journal of ssh.service, sshd-session lines)' {

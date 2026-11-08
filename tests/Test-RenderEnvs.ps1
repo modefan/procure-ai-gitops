@@ -13,8 +13,9 @@
          `helm dependency build` runs only for a dependency missing from charts/ (the umbrella's file:// procure-app);
       3. Argo CD's own chart (apps/values.yaml chartRepo/chartVersion, OCI) with argocd/values.yaml, envs/<env>/argocd.yaml and the
          environment's switches.
-    Every render goes through `kubeconform -strict` (Kubernetes schemas; custom resources whose schema kubeconform does not know, such as
-    Argo CD's and cert-manager's, are skipped and counted). Exit code 1 when a render or a validation fails.
+    Every render goes through `kubeconform -strict`: Kubernetes schemas, and custom resources (Traefik's Middleware, Argo CD's) against the
+    community CRD schema catalog (datreeio/CRDs-catalog); a custom resource neither knows is skipped and counted. Exit code 1 when a
+    render or a validation fails.
 
     Run it before every push to this repo that changes envs/, apps/ or argocd/ (procure-ai docs/hosting.md, "Changing the hosted values"),
     and after a procure-ai chart change that needs new values (-AppRef WORKTREE in that change's worktree). procure-ai's CI charts job
@@ -73,7 +74,8 @@ function Invoke-Render([string] $label, [string[]] $helmArgs) {
         if ($LASTEXITCODE -ne 0) { Fail "$label`: helm template failed: $((Get-Content $errFile | Select-Object -First 5) -join ' ')"; return }
     } finally { Remove-Item $errFile -ErrorAction SilentlyContinue }
     $yaml = ($out | ForEach-Object { "$_" }) -join "`n"
-    $result = $yaml | & kubeconform -strict -ignore-missing-schemas -summary -output text 2>&1
+    $crds = 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+    $result = $yaml | & kubeconform -strict -ignore-missing-schemas -schema-location default -schema-location $crds -summary -output text 2>&1
     $summary = ($result | Where-Object { "$_" -match '^Summary:' }) -join ''
     if ($LASTEXITCODE -ne 0) { Fail "$label`: kubeconform: $(($result | Select-Object -First 6) -join ' | ')"; return }
     Pass "$label`: $($summary -replace '^Summary:\s*', '')"
@@ -96,7 +98,7 @@ function Export-Charts([string] $ref) {
         & git -C $AppRepo archive --format=tar -o $archive $ref deploy/charts
         if ($LASTEXITCODE -ne 0) { throw "git archive $ref deploy/charts failed." }
         # Windows' own tar (bsdtar): a GNU tar from Git's tools reads 'C:' in the path as a remote host.
-        $tar = @("$env:SystemRoot\System32	ar.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+        $tar = @("$env:SystemRoot\System32\tar.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
         if ($tar) { & $tar -xf $archive -C $dir } else { & tar --force-local -xf $archive -C $dir }
         if ($LASTEXITCODE -ne 0) { throw 'tar -xf failed.' }
         Remove-Item $archive

@@ -24,6 +24,11 @@ keycloak:
   ingress:
     # Plan 08 ruling 4: only Keycloak's public paths of the procure realm (no admin console, admin REST API, master realm or welcome page).
     publicPathsOnly: true
+    # Plan 08 fix wave ruling R6b: per-client-address rate limits on the procure realm's sign-in paths (numbers: the chart's defaults,
+    # deploy/charts/procure-platform/values.yaml keycloak.ingress.rateLimit). Keycloak's own brute-force lockout stays off: it let anyone
+    # keep the shared demo users locked.
+    rateLimit:
+      enabled: true
 
 mailpit:
   ingress:

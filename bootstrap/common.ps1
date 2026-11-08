@@ -487,8 +487,7 @@ function Sync-DemoPasswordSection {
     $changed = 0
     foreach ($label in $Entries.Keys) {
         $value = "$($Entries[$label])"
-        if ($value -match '[
-]') { throw "The value of '$label' must be one line." }
+        if ($value -match '[\r\n]') { throw "The value of '$label' must be one line." }
         $entry = "$($label): $value"
         $end = $lines.Count
         for ($i = $start + 1; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith('===')) { $end = $i; break } }

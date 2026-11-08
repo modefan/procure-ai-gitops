@@ -81,8 +81,12 @@ if (-not $Apply) {
 
 # --- Apply -----------------------------------------------------------------------------------------------------------------------------
 Write-Host "Upgrading k3s on $($hostInfo.ipv4) to $Version (the API is away for a few seconds; pods keep running)..."
-$out = Invoke-HostedSsh -Command "sudo sed -i ""s/^version='.*'$/version='$Version'/"" /usr/local/sbin/install-k3s.sh && grep -q ""^version='$Version'$"" /usr/local/sbin/install-k3s.sh && sudo /usr/local/sbin/install-k3s.sh 2>&1 | tail -5"
+# The installer's exit code decides (not tail's): its output goes to a log, the last lines are shown, and a failure throws here at once
+# instead of after the 5-minute Ready wait.
+$out = Invoke-HostedSsh -AllowFailure -Command "sudo sed -i ""s/^version='.*'$/version='$Version'/"" /usr/local/sbin/install-k3s.sh && grep -q ""^version='$Version'$"" /usr/local/sbin/install-k3s.sh && { sudo /usr/local/sbin/install-k3s.sh > /tmp/k3s-upgrade.log 2>&1; rc=`$?; tail -5 /tmp/k3s-upgrade.log; exit `$rc; }"
+$rc = $LASTEXITCODE
 $out | ForEach-Object { Write-Host "  $_" }
+if ($rc -ne 0) { throw "The k3s install script failed (exit $rc; full log: /tmp/k3s-upgrade.log on the VM). k3s may still run the old release: check sudo systemctl status k3s." }
 $deadline = (Get-Date).AddMinutes(5)
 while ($true) {
     $state = (Invoke-HostedSsh -AllowFailure -Command "k3s --version | head -1; sudo k3s kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion} {.items[0].status.conditions[?(@.type==""Ready"")].status}'") -join ' '

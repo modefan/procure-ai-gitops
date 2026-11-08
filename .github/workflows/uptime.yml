@@ -8,7 +8,7 @@
 # cert-manager renews at 30 days, so a failure here means renewal has been failing for 9 days and there is still a week to fix it before
 # browsers (HSTS: no click-through) refuse the site. Let's Encrypt sends no expiry e-mails any more, so this is the only warning.
 #
-# A failed run e-mails the repo owner (GitHub's default notification for failed workflow runs). GitHub turns off a repo's schedules
+# A failed run e-mails the repo owner (GitHub's default notification for failed workflow runs). GitHub turns off a public repo's schedules
 # after 60 days without any commit; a commit (e.g. the publish workflow's release bump) re-arms it.
 name: uptime
 
@@ -27,7 +27,9 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Worst case with every host down: 4 checks x 3 tries x (20 s curl + 20 s pause), about 8 minutes, plus the certificate step (3 hosts x
+    # at most 20 s); 12 minutes lets both steps write their ::error lines before the job would time out.
+    timeout-minutes: 12
     steps:
       - name: Gateway ready, web app, Keycloak realm and demo switch
         shell: bash
@@ -74,7 +76,7 @@ jobs:
           min_days=21
           for host in procure.daleabels.com auth.daleabels.com dashboard.daleabels.com; do
             # -servername: SNI, so Traefik picks the host's certificate (the default certificate otherwise).
-            pem=$(openssl s_client -connect "$host:443" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null) || pem=""
+            pem=$(timeout 20 openssl s_client -connect "$host:443" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null) || pem=""
             if [[ -z "$pem" ]]; then
               echo "::error title=$host certificate unreadable::no TLS certificate from $host:443"
               fail=1

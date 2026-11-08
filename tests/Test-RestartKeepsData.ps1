@@ -51,9 +51,9 @@ $curl = @('C:\Program Files\Git\mingw64\bin\curl.exe', "$env:SystemRoot\System32
 if (-not $curl) { throw 'curl not found.' }
 $hosted = $Environment -eq 'hosted'
 if ($hosted -ne [bool] $Reboot) { throw '-Reboot goes with -Environment hosted (the local cluster restarts with k3d stop/start).' }
-# Whether the SSH tunnel was already open (another script's, e.g. a WAL watch): that one is reused and never closed here (review B M9,
-# the ownership rule of open-argocd.ps1). Decided before Select-ProcureCluster, which opens a missing tunnel.
-$tunnelWasOpen = $hosted -and [bool] (Get-HostedTunnelProcess)
+# The SSH tunnel already open (another script's, e.g. a WAL watch): that one is reused and never closed here (review B M9, the ownership
+# rule of open-argocd.ps1). Recorded before Select-ProcureCluster, which opens a missing tunnel.
+$tunnelAtStart = if ($hosted) { Get-HostedTunnelProcess } else { $null }
 Select-ProcureCluster $Environment
 if (-not $AppHost) { $AppHost = if ($hosted) { "procure.$HostedDomain" } else { 'procure.localtest.me' } }
 $tlsArgs = @('--ssl-no-revoke')
@@ -267,8 +267,14 @@ try {
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
-    # Close the tunnel only when this script opened it (none was running at the start); another script's tunnel stays open.
-    if ($hosted -and -not $tunnelWasOpen) { & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') -Close | Out-Host }
+    # Close the tunnel only when this script opened it: none ran at the start, or the reboot killed the one that did and this script
+    # opened its replacement (a different ssh process). The tunnel that was running at the start, if it still runs, stays open.
+    if ($hosted) {
+        $tunnelNow = Get-HostedTunnelProcess
+        if ($tunnelNow -and (-not $tunnelAtStart -or $tunnelNow.Id -ne $tunnelAtStart.Id)) {
+            & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') -Close | Out-Host
+        }
+    }
 }
 
 if ($failures.Count -gt 0) {
