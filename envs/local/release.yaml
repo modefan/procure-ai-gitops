@@ -4,7 +4,7 @@
 # appRevision: the procure-ai commit (full SHA): its charts (deploy/charts) and its app images ghcr.io/modefan/procure-ai-<name>:<sha>.
 # platformImageTags: the platform images' tags, the git tree hash of procure-ai infra/<name> (they change only when that folder changes,
 # so an app-only deploy leaves Postgres, Keycloak and Debezium running).
-appRevision: "adb6c251ff0765da3aa630b71949e00696f26d56"
+appRevision: "8e8f6076b454fdc8466c9612e0700e7bda257506"
 platformImageTags:
   postgres: "4eb631f845098f2eb5636b43ede8ef74975f9dfd"
   keycloak: "94344e6acca4421bc4f365f45cb4341e85b08e97"
