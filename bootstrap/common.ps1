@@ -426,7 +426,8 @@ function Set-DemoPasswordEntry {
         $end = $lines.Count
         for ($i = $start + 1; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith('===')) { $end = $i; break } }
         $found = -1
-        for ($i = $start + 1; $i -lt $end; $i++) { if ($lines[$i].StartsWith($Key)) { $found = $i; break } }
+        # TrimStart: the file's readers allow indented entries (e.g. hosted/new-hosted-cluster.ps1, '^\s*VPS root password'); re-review R2.
+        for ($i = $start + 1; $i -lt $end; $i++) { if ($lines[$i].TrimStart().StartsWith($Key)) { $found = $i; break } }
         if ($found -ge 0) { $lines[$found] = $entry }
         else {
             # After the section's last non-empty line.
@@ -435,5 +436,13 @@ function Set-DemoPasswordEntry {
             $lines.Insert($at, $entry)
         }
     }
-    [IO.File]::WriteAllText($Path, (($lines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
+    # Never truncate the only store of every credential in place (re-review R2): write a temporary file next to it, then swap it in;
+    # File.Replace keeps the previous version as '<file>.bak'.
+    $temporary = "$Path.tmp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    try {
+        [IO.File]::WriteAllText($temporary, (($lines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
+        if (Test-Path $Path) { [IO.File]::Replace($temporary, $Path, "$Path.bak") } else { [IO.File]::Move($temporary, $Path) }
+    } finally {
+        Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue
+    }
 }

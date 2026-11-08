@@ -38,9 +38,15 @@ if ($Close) {
 $hostInfo = Get-HostedHost
 $kubeArgs = @('--kubeconfig', $HostedKubeconfig, '--context', $HostedKubeContext)
 if ((Get-HostedTunnelProcess) -and (Test-PortOpen $HostedTunnelPort)) {
-    & kubectl @kubeArgs get --raw /readyz 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Host "Tunnel already open: 127.0.0.1:$HostedTunnelPort -> $($hostInfo.nodeIp):6443."; return }
+    # Other scripts may be using this tunnel (e.g. a long WAL test): replace it only after three failed readyz calls a few seconds apart,
+    # not after one blip (re-review R5).
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        & kubectl @kubeArgs get --raw /readyz --request-timeout=10s 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Host "Tunnel already open: 127.0.0.1:$HostedTunnelPort -> $($hostInfo.nodeIp):6443."; return }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
+    }
     # A tunnel whose far end no longer answers (VM rebooted, network dropped): replace it.
+    Write-Host 'The open tunnel did not answer three readyz checks: replacing it.'
     Stop-Process -Id (Get-HostedTunnelProcess).Id -ErrorAction SilentlyContinue
 }
 if (Test-PortOpen $HostedTunnelPort) {

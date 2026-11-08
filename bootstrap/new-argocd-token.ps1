@@ -68,7 +68,7 @@ try {
     $key = "$envLabel claude API token"
     $expiry = if ($ExpiresInDays -gt 0) { "expires in $ExpiresInDays days" } else { 'no expiry' }
     Set-DemoPasswordEntry -Section 'Argo CD' -Key $key -Value $token `
-        -Label "$key (account claude, apiKey only, role:admin; token id $id, $expiry; user env var $envVar; new one: bootstrap/new-argocd-token.ps1 -Environment $Environment)"
+        -Label "$key (account claude, apiKey only, role admin; token id $id, $expiry; user env var $envVar; new one: bootstrap/new-argocd-token.ps1 -Environment $Environment)"
     $token = $null
     Write-Host "Token $id for account claude stored in user env var $envVar and in DEMO PASSWORDS.txt (section Argo CD, line '$key ...'); it sees $($names.Count) Applications: $($names -join ', ')."
 

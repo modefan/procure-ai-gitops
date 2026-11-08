@@ -124,7 +124,7 @@ printf '"%s"' "$U" | kc create "organizations/$ORG/members" -f - >/dev/null
     Assert-Refused '3. new user with a *.test address' @{ UserName = $newTestUser } @('demo domain')
     if (Get-UserId $newTestUser) { Fail '3. the *.test user was created' } else { Pass '3. no *.test user was created' }
     Assert-Refused '4. organization member with an ordinary address' @{ UserName = $orgUser } @('organization')
-    Assert-Refused '5. e-mail fallback (-UserName names nobody, -Email an existing user)' @{ UserName = "t12c-probe-nobody-$suffix"; Email = $victim }
+    Assert-Refused '5. e-mail fallback (-UserName names nobody, -Email an existing user)' @{ UserName = "t12c-probe-nobody-$suffix"; Email = $victim } @('UserName')
     Assert-Refused '6. -UserName and -Email name different addresses' @{ UserName = $okUser; Email = $victim } @('differ')
     if (Get-UserId $okUser) { Fail '6. a user was created for the mismatched -UserName' } else { Pass '6. no user created for the mismatch' }
 

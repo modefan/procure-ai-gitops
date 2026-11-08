@@ -103,7 +103,9 @@ else
     USERCSV=$(kc get "users/$UIDV" --fields username,email --format csv --noquotes)
     case "$USERCSV" in *.test|*.test,*) refuse "demo domain: the user's address is a *.test address";; esac
     case "$UIDV" in 00000000-0000-4000-8000-*) refuse "realm-file ID: $UIDV is a fixed ID of the realm file's demo users";; esac
-    if kc get "organizations/members/$UIDV/organizations" --fields alias | grep -q '"alias"'; then
+    # Fails closed (re-review R1): a failed lookup stops the script; anything but an empty list refuses.
+    ORGS=$(kc get "organizations/members/$UIDV/organizations" --fields alias) || { echo "organization lookup for $NAME failed: refusing, because it cannot be shown that the user is in no organization. Nothing changed."; exit 7; }
+    if [ "$(printf '%s' "$ORGS" | tr -d ' \t\r\n')" != "[]" ]; then
       refuse "organization member: the user belongs to an organization (a demo or tenant user)"
     fi
   fi
