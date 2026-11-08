@@ -51,6 +51,10 @@ baseline and `tests/Test-PublicSurface.ps1` what the internet sees; `Test-Smoke.
 `Test-RestartKeepsData.ps1 -Reboot` and `Test-WalSlotsAdvance.ps1` take `-Environment hosted`. Costs, how to cancel and every step:
 procure-ai `docs/hosting.md`.
 
+`.github/workflows/uptime.yml` is the repo's only workflow (no CI here): every 30 minutes it checks the gateway's `/health/ready`, the
+web app, Keycloak's realm and the demo switch on the public hosts, and fails (GitHub e-mails the owner) when one is down. Its schedule
+stays commented out while the repo is private, so it uses no private Actions minutes; going public (plan 08 Task 17) switches it on.
+
 ## GitOps: how a commit gets deployed
 
 ```

@@ -21,8 +21,17 @@ global:
 # The real model (plan 08 Task 9, D1): Azure Foundry, OpenAI-compatible /openai/v1/ endpoint, deployments `chat` (gpt-5-mini) and
 # `embeddings` (text-embedding-3-small, 1536 dimensions natively). The key is Secret procure-ai-provider (from the user env var
 # AZURE_FOUNDRY_API_KEY). gpt-5-mini is a reasoning model: no reasoning (the Task 9 evaluation ran with it), no temperature, and every call
-# gets at least 256 output tokens (a small limit is otherwise used up by reasoning and the reply comes back empty). The daily token cap per
-# tenant stays at the app's default (AI:DailyTokenCapPerTenant 200 000) until Task 13 sizes it.
+# gets at least 256 output tokens (a small limit is otherwise used up by reasoning and the reply comes back empty).
+#
+# Daily token cap per tenant (plan 08 Task 13): 150 000 tokens a SAST day, below the app's default of 200 000. Measured on this demo
+# (2026-11-08, gpt-5-mini): a policy question 1 732-1 869 tokens (guard classifier + answer), one with a tool call 3 326, a blocked one
+# 322; the nightly re-seed of a tenant (policy ingestion + past purchases) 7 959 (Globex). So 150 000 is about 40-80 questions a day per
+# organisation, many reviewer sessions of 10-20 questions, and the seed (counted, never stopped by the cap) is ~5 % of it.
+# Worst case, every organisation at its cap every day: 3 organisations (acme, globex, demo; self-registration is off, and would add
+# users to Demo, not organisations) x 150 000 x 30 days = 13.5 M tokens, + the 2 seeds past a cap (2 x 7 959 x 30 = 0.5 M) = 14 M.
+# Priced as if 20 % were output (measured: ~5 %): 0.8 x $0.25 + 0.2 x $2.00 = $0.60 per 1 M -> about $8.40 a month (R 139 at
+# R 16.54/$, ECB 2026-11-06), under the $10 budget alert (procure-ai-10usd). Calls already in flight when the cap is reached still finish
+# (procure-ai docs/assistant.md "Daily token cap"); the deployment's 50 000 tokens a minute bounds that overshoot.
 assistant:
   env:
     AI__Provider: AzureFoundry
@@ -32,6 +41,7 @@ assistant:
     AI__Chat__ReasoningEffort: None
     AI__Chat__SupportsTemperature: "false"
     AI__Chat__MinOutputTokens: "256"
+    AI__DailyTokenCapPerTenant: "150000"
   secretEnv:
     AI__ApiKey: { secret: procure-ai-provider, key: api-key }
 

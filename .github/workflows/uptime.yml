@@ -1,0 +1,60 @@
+# Uptime check of the public live demo (plan 08 Task 13). The only workflow in this repo: the GitOps repo has no CI (Argo CD reads it).
+#
+# OFF while the repos are private: a private repo's scheduled runs use the account's free Actions minutes (2 000 a month, procure-ai's CI
+# needs them), so the schedule below is commented out. Plan 08 Task 17 (go public) uncomments it; public repos run Actions for free.
+# `workflow_dispatch` stays, for a manual run (about one minute).
+#
+# A failed run e-mails the repo owner (GitHub's default notification for failed workflow runs). GitHub turns off a public repo's schedules
+# after 60 days without any commit; a commit (e.g. the publish workflow's release bump) re-arms it.
+name: uptime
+
+on:
+  # UPTIME-OFF until public (Task 17): uncomment the schedule.
+  # schedule:
+  #   - cron: "7,37 * * * *" # every 30 minutes, off the full hour (GitHub delays runs at :00 most)
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gateway ready, web app, Keycloak realm and demo switch
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          # check NAME URL EXPECTED-TEXT: non-2xx (after 3 tries, 20 s apart) or a body without the expected text fails the run.
+          check() {
+            local name="$1" url="$2" expect="$3" body status
+            for attempt in 1 2 3; do
+              status=$(curl -sS -o body.txt -w '%{http_code}' --max-time 20 "$url" || echo 000)
+              body=$(head -c 2000 body.txt 2>/dev/null || true)
+              if [[ "$status" =~ ^2 ]] && grep -qF -- "$expect" <<<"$body"; then
+                echo "ok   $name: HTTP $status"
+                return 0
+              fi
+              sleep 20
+            done
+            echo "::error title=$name is down::$url answered HTTP $status (expected 2xx with '$expect')"
+            fail=1
+          }
+          # The gateway's readiness (its own dependencies); /health/* is never rate-limited.
+          check "gateway"  "https://procure.daleabels.com/health/ready" "Healthy"
+          # The Angular app's files, served by the web pod through the gateway.
+          check "web app"  "https://procure.daleabels.com/" "<title>ProcureAI</title>"
+          # Keycloak's public realm (sign-in for every user).
+          check "keycloak" "https://auth.daleabels.com/realms/procure/.well-known/openid-configuration" "\"issuer\""
+          # The demo switch: read through the gateway from Access (so Access answers too). Switched off on purpose is not "down":
+          # it is reported as a notice, not a failure.
+          check "access (demo switch)" "https://procure.daleabels.com/api/v1/system/availability" "\"enabled\""
+          if grep -qF '"enabled":false' body.txt 2>/dev/null; then
+            echo "::notice title=Demo switched off::The demo switch is off (maintenance page shown on purpose)."
+          fi
+          exit $fail
