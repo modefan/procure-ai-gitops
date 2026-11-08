@@ -22,6 +22,12 @@
     A mirror: a file in a copied folder that the original no longer has is deleted from the copy (named in the output). Nothing outside
     these items is touched. Then every original file is compared with each copy by SHA-256: OK, MISMATCH, MISSING, or EXTRA (in a copied
     folder only), per destination. Exit code 1 when anything is not OK. Prints names and counts only, never contents.
+    Access: before copying, each destination folder gets the same ACL as %USERPROFILE%\.procure-ai (Set-CurrentUserOnlyAcl in
+    common.ps1: only the current user, inheritance off at the folder, every file and subfolder inheriting that one rule), so no other
+    account of the PC can read the copies; both modes then check every item under each destination and report any other identity as a
+    problem. OneDrive syncs as the current user, so syncing still works. A destination inside a git repository is refused.
+    The copies are plain files on purpose (Dale's decision 2026-11-08, with the risk explained: OneDrive holds them unencrypted; the
+    Contabo recovery codes sit in the same folder, as Dale asked).
     Run it after any secret, key, state or DEMO PASSWORDS.txt change (procure-ai docs/hosting.md, "Backup copies and recovery").
 #>
 [CmdletBinding()]
@@ -65,15 +71,40 @@ function Get-SourceFiles($item) {
 
 function Get-Hash([string] $path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
 
+function Get-AclProblems([string] $root) {
+    # Every item under $root (the folder too) that grants any identity but the current user, or a root that still inherits.
+    $me = $env:USERNAME
+    $found = @()
+    if (-not (Get-Acl -LiteralPath $root).AreAccessRulesProtected) { $found += "$root still inherits permissions from its parent" }
+    foreach ($entry in @(Get-Item -LiteralPath $root -Force) + @(Get-ChildItem -LiteralPath $root -Recurse -Force)) {
+        $others = @((Get-Acl -LiteralPath $entry.FullName).Access | Where-Object { $_.IdentityReference.Value -notlike "*\$me" } |
+            ForEach-Object { "$($_.IdentityReference.Value)" } | Sort-Object -Unique)
+        if ($others) { $found += "$($entry.FullName.Substring($root.Length).TrimStart([char]92)) also grants $($others -join ', ')" }
+    }
+    $found
+}
+
+function Assert-NotInRepository([string] $dir) {
+    # From the folder, or its nearest existing parent (checked before the folder is created).
+    $start = $dir; while ($start -and -not (Test-Path -LiteralPath $start)) { $start = Split-Path $start }
+    for ($d = Get-Item -LiteralPath $start -Force; $d; $d = $d.Parent) {
+        if (Test-Path -LiteralPath (Join-Path $d.FullName '.git')) { throw "$dir is inside the git repository $($d.FullName): never put the copies in a repo." }
+    }
+}
+
 $missingSources = @($items | Where-Object { -not (Test-Path -LiteralPath $_.Source) })
 if ($missingSources) { throw "Originals not found: $(($missingSources | ForEach-Object Source) -join ', '). Nothing copied." }
 
 $problems = 0
 foreach ($dest in $Destination) {
+    $dest = [IO.Path]::GetFullPath($dest).TrimEnd([char]92)
+    Assert-NotInRepository $dest
     if (-not (Test-Path -LiteralPath $dest -PathType Container)) {
         if ($Check) { Write-Host "MISSING  $dest (the folder itself)"; $problems++; continue }
         New-Item -ItemType Directory -Path $dest | Out-Null
     }
+    # Current user only, before a single file is copied in (new files inherit it).
+    if (-not $Check) { Set-CurrentUserOnlyAcl $dest }
     Write-Host "== $dest$(if ($Check) { ' (check only)' })"
     $ok = 0
     foreach ($item in $items) {
@@ -125,6 +156,10 @@ foreach ($dest in $Destination) {
         Set-Content -LiteralPath (Join-Path $dest 'README.txt') -Value $readme -Encoding utf8NoBOM
     }
     Write-Host "OK       $ok files identical to their originals (SHA-256)"
+    $aclProblems = @(Get-AclProblems $dest)
+    foreach ($line in $aclProblems) { Write-Host "ACCESS   $line" }
+    $problems += $aclProblems.Count
+    if (-not $aclProblems) { Write-Host "OK       only $env:USERNAME can open the folder and everything in it" }
 }
 if ($problems) { Write-Host "$problems problem(s): see the lines above." -ForegroundColor Red; exit 1 }
 Write-Host "Every copy matches its original in $($Destination.Count) folder(s)." -ForegroundColor Green
