@@ -114,7 +114,7 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
   operator uses it. Fresh telemetry through the gateway (admin key), Blazor's WebSocket Origin check (own Origin passes, a foreign one and
   http:// get 403, on `/_blazor` and `/_Blazor`), then Microsoft Edge (playwright-core, `tests/dashboard/`, installed by the first run)
   signs in as the demo admin, loads Structured logs and Traces three times each (rows within 20 s every time) and needs rows newer than 10
-  minutes from requests-api (logs and traces; the newest trace must start at the gateway). `-NoNudge` blocks the blank-table workaround of procure-ai's
+  minutes from requests-api (logs) and the gateway and requests-api (traces; some recent trace on each must start at the gateway). `-NoNudge` blocks the blank-table workaround of procure-ai's
   observability chart, to see whether a new dashboard release still needs it. **Run it after every push or deploy that reaches a
   cluster** (CLAUDE.md "Operating the live system"): `Test-FreshCluster.ps1 -Environment hosted -WatchOnly` includes it.
 - `tests/Test-LocalCa.ps1` (no cluster needed): `new-local-ca.ps1 -FilesOnly` into a temp folder; the CA's name constraints, both leaves

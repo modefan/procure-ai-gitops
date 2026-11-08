@@ -18,9 +18,10 @@
     3. In Microsoft Edge (tests/dashboard/check-dashboard.mjs, playwright-core): signs in at Keycloak as the demo admin (client role
        dashboard-viewer; the password from the user secrets), opens Structured logs and Traces -Loads times each as full page loads and
        needs rows within 20 s every time, then opens the resource pages (/structuredlogs/resource/<name> for each -LogServices,
-       /traces/resource/<name> for each -TraceServices) and needs the newest row to be at most -MaxAgeMinutes old, and the newest trace
-       to start at -TraceRoot (the gateway: the request came in through it). /traces/resource/gateway itself is not used: on dashboard
-       13.6.2 it stopped listing new gateway-rooted traces that the requests-api page lists (seen 2026-11-08).
+       /traces/resource/<name> for each -TraceServices) and needs the newest row to be at most -MaxAgeMinutes old, and on each traces
+       page some trace from that window to start at -TraceRoot (the gateway: a request came in through it). The gateway page is checked
+       on purpose: on 2026-11-08, with the plan 08b collector applied by hand, /traces/resource/gateway stopped listing new
+       gateway-rooted traces that the requests-api page listed (cause not found; plan 08b Task 1 report).
 
     -NoNudge blocks the workaround script (/_procure/virtualize-nudge.js, procure-ai deploy/charts/procure-observability): run it after an
     Aspire dashboard upgrade; when every load still shows rows, the workaround can go (dashboard.proxy.enabled: false).
@@ -33,7 +34,7 @@ param(
     [ValidateSet('local', 'hosted')]
     [string] $Environment = 'local',
     [string[]] $LogServices = @('requests-api'),
-    [string[]] $TraceServices = @('requests-api'),
+    [string[]] $TraceServices = @('gateway', 'requests-api'),
     [string] $TraceRoot = 'gateway',
     [int] $MaxAgeMinutes = 10,
     [int] $Loads = 3,
@@ -89,7 +90,9 @@ try {
     }
     foreach ($path in '/_blazor', '/_Blazor') {
         $own = Get-UpgradeStatus "$path`?id=procure-dashboard-check" "https://$dashboardHost"
-        if ($own -ne '403' -and $own -match '^\d{3}$' -and $own -ne '000') { Pass "$path WebSocket upgrade from the dashboard's own Origin passes the Origin check ($own for an unknown circuit)" }
+        # 404 (unknown circuit id) or 400 only: a Traefik 404 for a missing route would be the same code, but then the foreign Origin
+        # below is not 403 either; a 502/503 (dashboard down behind nginx) must not count as passing.
+        if ($own -in '404', '400') { Pass "$path WebSocket upgrade from the dashboard's own Origin passes the Origin check ($own for an unknown circuit)" }
         else { Fail "$path WebSocket upgrade from https://$dashboardHost answered $own (403: the Origin check refuses the dashboard itself, finding 1)" }
         foreach ($origin in 'https://evil.example.com', "http://$dashboardHost") {
             $foreign = Get-UpgradeStatus "$path`?id=procure-dashboard-check" $origin
