@@ -18,21 +18,13 @@ param(
 
 . (Join-Path $PSScriptRoot '..\common.ps1')
 
-function Get-TunnelProcess {
-    if (-not (Test-Path $HostedTunnelPidFile)) { return $null }
-    $tunnelPid = [int] (Get-Content -Raw $HostedTunnelPidFile).Trim()
-    $process = Get-Process -Id $tunnelPid -ErrorAction SilentlyContinue
-    if ($process -and $process.ProcessName -eq 'ssh') { return $process }
-    $null
-}
-
 function Test-PortOpen([int] $port) {
     $client = [System.Net.Sockets.TcpClient]::new()
     try { $client.ConnectAsync('127.0.0.1', $port).Wait(1000) -and $client.Connected } catch { $false } finally { $client.Dispose() }
 }
 
 if ($Close) {
-    $process = Get-TunnelProcess
+    $process = Get-HostedTunnelProcess
     if ($process) {
         Stop-Process -Id $process.Id
         Write-Host "Tunnel closed (ssh PID $($process.Id))."
@@ -45,11 +37,11 @@ if ($Close) {
 
 $hostInfo = Get-HostedHost
 $kubeArgs = @('--kubeconfig', $HostedKubeconfig, '--context', $HostedKubeContext)
-if ((Get-TunnelProcess) -and (Test-PortOpen $HostedTunnelPort)) {
+if ((Get-HostedTunnelProcess) -and (Test-PortOpen $HostedTunnelPort)) {
     & kubectl @kubeArgs get --raw /readyz 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) { Write-Host "Tunnel already open: 127.0.0.1:$HostedTunnelPort -> $($hostInfo.nodeIp):6443."; return }
     # A tunnel whose far end no longer answers (VM rebooted, network dropped): replace it.
-    Stop-Process -Id (Get-TunnelProcess).Id -ErrorAction SilentlyContinue
+    Stop-Process -Id (Get-HostedTunnelProcess).Id -ErrorAction SilentlyContinue
 }
 if (Test-PortOpen $HostedTunnelPort) {
     throw "Port 127.0.0.1:$HostedTunnelPort is in use by another process (not this script's tunnel). Free it and run this script again."

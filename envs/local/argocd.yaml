@@ -5,9 +5,10 @@ configs:
     # The address people open; the OIDC redirect URIs are <url>/auth/callback and <url>/pkce/verify (the Keycloak client `argocd`, whose
     # redirect base is the platform chart's keycloak.argocdUrl in envs/local/platform.yaml: keep both equal).
     url: https://argocd.procure.localtest.me
-    # Keycloak sign-in (see the header of argocd/values.yaml). Public client with PKCE (Argo CD's documented Keycloak setup for the UI and
-    # `argocd login --sso`), so there is no client secret. Only openid and profile are asked for: the realm defines no `email` or `groups`
-    # scope; the client's own mappers put sub, preferred_username, name, email and groups into the ID token.
+    # Keycloak sign-in (see the header of argocd/values.yaml). Public client with PKCE (Argo CD's documented Keycloak setup), so there is no
+    # client secret. For the UI only: `argocd login --sso` would need the CLI's callback http://localhost:8085/auth/callback, which the
+    # client deliberately does not allow (Claude uses its API token, people the UI). Only openid and profile are asked for: the realm
+    # defines no `email` or `groups` scope; the client's own mappers put sub, preferred_username, name, email and groups into the ID token.
     oidc.config: |
       name: Keycloak
       issuer: https://auth.procure.localtest.me/realms/procure

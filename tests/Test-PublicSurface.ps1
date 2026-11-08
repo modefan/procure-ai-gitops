@@ -277,12 +277,12 @@ spec:
 "@
         # Setup inside the try (Task 12 re-review minor 5): an unreachable VM is a counted FAIL with the summary, not an exception. A tunnel
         # this step opens (Select-ProcureCluster opens one when none answers) is closed again; one that was already open stays open.
+        # Ownership by the tunnel's ssh process (tunnel.pid), not by whether the API answers (review 12c M3): a live tunnel of another
+        # script that answers slowly for a moment is replaced by open-tunnel.ps1, but it is still not this step's to close.
         $openedTunnel = $false
         $applied = $false
         try {
-            $script:KubectlArgs = @('--kubeconfig', $HostedKubeconfig, '--context', $HostedKubeContext)
-            $tunnelWasUp = Test-ClusterReachable
-            $openedTunnel = -not $tunnelWasUp
+            $openedTunnel = -not (Get-HostedTunnelProcess)
             Select-ProcureCluster hosted
             Assert-ClusterReachable
             $applied = $true

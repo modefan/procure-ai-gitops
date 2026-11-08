@@ -16,3 +16,82 @@ configs:
       enablePKCEAuthentication: true
       requestedScopes: ["openid", "profile"]
       refreshTokenThreshold: 2m
+
+# Network policies (review 12c M5). The chart's own NetworkPolicy for argocd-server allows ingress from everywhere (`ingress: [{}]`, not
+# configurable), so with the admin login on (break-glass) every pod of the cluster could try POST /api/v1/session as admin. On the VM nobody
+# needs to reach argocd-server over the pod network: there is no ingress (people and Claude come through `kubectl port-forward`, which the
+# kubelet carries into the pod's own network namespace, so a NetworkPolicy does not apply to it), and no Argo CD component calls the server
+# (the controller and the repo server talk to each other and to Redis). The chart's policies are switched off here and the same set is
+# declared below, with argocd-server allowing no ingress at all. The other three are copies of the chart's (10.11.7) policies: compare
+# them with the chart when argocd.chartVersion changes (tests/Test-ArgocdNetworkPolicy.ps1 renders the chart and checks the set).
+# Local keeps the chart's policies (its Traefik ingress must reach the server).
+global:
+  networkPolicy:
+    create: false
+
+extraObjects:
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: argocd-server
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: server }
+    spec:
+      podSelector:
+        matchLabels: { app.kubernetes.io/name: argocd-server, app.kubernetes.io/instance: argocd }
+      policyTypes: [Ingress]
+      # No rule: no ingress over the pod network (kubelet probes from the node are still allowed by k3s's policy controller).
+      ingress: []
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: argocd-repo-server
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: repo-server }
+    spec:
+      podSelector:
+        matchLabels: { app.kubernetes.io/name: argocd-repo-server, app.kubernetes.io/instance: argocd }
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - podSelector: { matchLabels: { app.kubernetes.io/name: argocd-server, app.kubernetes.io/instance: argocd } }
+            - podSelector: { matchLabels: { app.kubernetes.io/name: argocd-application-controller, app.kubernetes.io/instance: argocd } }
+            - podSelector: { matchLabels: { app.kubernetes.io/name: argocd-applicationset-controller, app.kubernetes.io/instance: argocd } }
+          ports:
+            - { port: repo-server, protocol: TCP }
+        - from:
+            - namespaceSelector: {}
+          ports:
+            - port: metrics
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: argocd-redis
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: redis }
+    spec:
+      podSelector:
+        matchLabels: { app.kubernetes.io/name: argocd-redis, app.kubernetes.io/instance: argocd }
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - podSelector: { matchLabels: { app.kubernetes.io/name: argocd-server, app.kubernetes.io/instance: argocd } }
+            - podSelector: { matchLabels: { app.kubernetes.io/name: argocd-repo-server, app.kubernetes.io/instance: argocd } }
+            - podSelector: { matchLabels: { app.kubernetes.io/name: argocd-application-controller, app.kubernetes.io/instance: argocd } }
+          ports:
+            - { port: redis, protocol: TCP }
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: argocd-application-controller
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: application-controller }
+    spec:
+      podSelector:
+        matchLabels: { app.kubernetes.io/name: argocd-application-controller, app.kubernetes.io/instance: argocd }
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - namespaceSelector: {}
+          ports:
+            - port: metrics

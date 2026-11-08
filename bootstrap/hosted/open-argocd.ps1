@@ -13,7 +13,9 @@
     client's redirect URIs are http://127.0.0.1:8080, envs/hosted/argocd.yaml), or as admin (break-glass, when Keycloak is down).
     The port-forward ends when -Close runs, the tunnel drops or the PC restarts; run the script again.
     -Close stops the port-forward and the tunnel, but only a tunnel this script opened (a tunnel that was already open, e.g. for another
-    script, is left as it is).
+    script, is left as it is). Ownership is decided by the tunnel's ssh process, not by whether the API answers (review 12c M3): the
+    marker file holds the PID of the ssh process this script started, and -Close closes the tunnel only while that same process still
+    runs and no other program has a connection open through it (it says which tunnel it closes, or why it leaves it open).
 #>
 [CmdletBinding()]
 param(
@@ -27,16 +29,27 @@ param(
 
 . (Join-Path $PSScriptRoot '..\common.ps1')
 $pidFile = Join-Path $HostedDir 'argocd-port-forward.pid'
-# Set when this script opened the tunnel, so -Close closes only its own.
+# Holds the PID of the tunnel's ssh process when this script opened the tunnel, so -Close closes only that one.
 $tunnelMarker = Join-Path $HostedDir 'argocd-opened-tunnel'
 $url = "http://127.0.0.1:$Port"
 
 function Get-PortForwardProcess {
+    # The kubectl port-forward of this script. A PID from the file counts only when it is still a kubectl port-forward of argocd-server
+    # (review 12c N2: Windows reuses PIDs, and stopping some other kubectl would be wrong).
     if (-not (Test-Path $pidFile)) { return $null }
-    $forwardPid = [int] (Get-Content -Raw $pidFile).Trim()
-    $process = Get-Process -Id $forwardPid -ErrorAction SilentlyContinue
-    if ($process -and $process.ProcessName -eq 'kubectl') { return $process }
+    $text = (Get-Content -Raw $pidFile).Trim()
+    if ($text -notmatch '^\d+$') { return $null }
+    $process = Get-Process -Id ([int] $text) -ErrorAction SilentlyContinue
+    if (-not $process -or $process.ProcessName -ne 'kubectl') { return $null }
+    $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue).CommandLine
+    if ("$commandLine" -match 'port-forward' -and "$commandLine" -match 'svc/argocd-server') { return $process }
     $null
+}
+
+function Get-TunnelUsers {
+    # Other programs with a connection open through the tunnel's local port (kubectl port-forwards, watches): their PIDs.
+    @(Get-NetTCPConnection -RemoteAddress 127.0.0.1 -RemotePort $HostedTunnelPort -State Established -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -ne $PID })
 }
 
 function Test-ArgoCdAnswers {
@@ -48,24 +61,43 @@ if ($Close) {
     if ($process) { Stop-Process -Id $process.Id; Write-Host "Port-forward closed (kubectl PID $($process.Id))." }
     else { Write-Host 'No port-forward of this script is running.' }
     Remove-Item $pidFile -ErrorAction SilentlyContinue
-    if (Test-Path $tunnelMarker) {
-        & (Join-Path $PSScriptRoot 'open-tunnel.ps1') -Close
-        Remove-Item $tunnelMarker -ErrorAction SilentlyContinue
-    } else {
+    $markedPid = if (Test-Path $tunnelMarker) { (Get-Content -Raw $tunnelMarker).Trim() } else { '' }
+    Remove-Item $tunnelMarker -ErrorAction SilentlyContinue
+    $tunnel = Get-HostedTunnelProcess
+    if (-not $markedPid) {
         Write-Host 'The SSH tunnel was not opened by this script: left open.'
+    } elseif (-not $tunnel -or "$($tunnel.Id)" -ne $markedPid) {
+        # The tunnel this script opened is gone; a tunnel running now was started by another script (or replaced): not ours to close.
+        Write-Host "The SSH tunnel this script opened (ssh PID $markedPid) is no longer running$(if ($tunnel) { "; the open tunnel (ssh PID $($tunnel.Id)) belongs to another script and stays open" })."
+    } else {
+        Start-Sleep -Milliseconds 500   # the stopped port-forward's connection closes
+        $users = @(Get-TunnelUsers)
+        if ($users.Count -gt 0) {
+            Write-Host "The SSH tunnel this script opened (ssh PID $markedPid) is in use by other programs (PID $($users -join ', ')): left open. Close it later with bootstrap/hosted/open-tunnel.ps1 -Close."
+        } else {
+            Write-Host "Closing the SSH tunnel this script opened (ssh PID $markedPid; no other program uses it)."
+            & (Join-Path $PSScriptRoot 'open-tunnel.ps1') -Close
+        }
     }
     return
 }
 
 # 1. The tunnel.
 # Not Select-ProcureCluster: it opens a missing tunnel itself, and this script must know whether it did (-Close closes only its own).
-$tunnelWasOpen = $false
+# Ownership by the tunnel's ssh process (review 12c M3): a running tunnel of another script is reused and never marked as ours, even when
+# the API does not answer at this moment (open-tunnel.ps1 then replaces it, and it still is not ours).
 $script:KubectlArgs = @('--kubeconfig', $HostedKubeconfig, '--context', $HostedKubeContext)
 $script:KubeContext = $HostedKubeContext
-if (Test-ClusterReachable) { $tunnelWasOpen = $true }
-else {
+$tunnelWasOpen = [bool] (Get-HostedTunnelProcess)
+if (-not $tunnelWasOpen -or -not (Test-ClusterReachable)) {
     & (Join-Path $PSScriptRoot 'open-tunnel.ps1') | Out-Host
-    Set-Content -Path $tunnelMarker -Value (Get-Date -Format o) -NoNewline
+}
+if (-not $tunnelWasOpen) {
+    $opened = Get-HostedTunnelProcess
+    if ($opened) { Set-Content -Path $tunnelMarker -Value $opened.Id -NoNewline }
+} elseif (Test-Path $tunnelMarker) {
+    # A marker from an earlier run whose tunnel is still the one running stays; one naming another process is stale.
+    if ((Get-Content -Raw $tunnelMarker).Trim() -ne "$((Get-HostedTunnelProcess).Id)") { Remove-Item $tunnelMarker -ErrorAction SilentlyContinue }
 }
 Assert-ClusterReachable
 
@@ -100,4 +132,4 @@ Write-Host '  Sign in:      "Log in via Keycloak" with your own Keycloak user (g
 Write-Host '  Break-glass:  user admin, password in DEMO PASSWORDS.txt, "=== Argo CD ===", "Hosted admin (break-glass) password"'
 Write-Host '                (also Secret argocd/argocd-initial-admin-secret on the VM).'
 Write-Host '  Claude:       API token in user env var ARGOCD_AUTH_TOKEN_HOSTED (DEMO PASSWORDS.txt, same section).'
-Write-Host "Close with: bootstrap/hosted/open-argocd.ps1 -Close$(if ($tunnelWasOpen) { ' (the tunnel was already open and stays open)' })"
+Write-Host "Close with: bootstrap/hosted/open-argocd.ps1 -Close$(if (Test-Path $tunnelMarker) { ' (also closes the tunnel this script opened, unless another program uses it)' } else { ' (the tunnel was already open and stays open)' })"

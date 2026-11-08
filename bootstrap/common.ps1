@@ -147,6 +147,18 @@ function Get-HostedSshArgs {
         '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15')
 }
 
+function Get-HostedTunnelProcess {
+    # The SSH tunnel of open-tunnel.ps1: the ssh process whose PID is in tunnel.pid, if it is still running (else $null). Scripts that open
+    # the tunnel only when needed decide by this whether they own it (review 12c M3): a live process means another script's tunnel, which
+    # they reuse and never close, even when the API answers slowly or not at all for a moment.
+    if (-not (Test-Path $script:HostedTunnelPidFile)) { return $null }
+    $text = (Get-Content -Raw $script:HostedTunnelPidFile).Trim()
+    if ($text -notmatch '^\d+$') { return $null }
+    $process = Get-Process -Id ([int] $text) -ErrorAction SilentlyContinue
+    if ($process -and $process.ProcessName -eq 'ssh') { return $process }
+    $null
+}
+
 function Invoke-HostedSsh {
     # Runs a command on the VM as the admin user and returns its output lines; throws on a non-zero exit unless -AllowFailure (then
     # $LASTEXITCODE tells). Only for commands whose output holds no secret (the kubeconfig is fetched by new-hosted-cluster.ps1 itself).
@@ -381,4 +393,47 @@ function Read-UserSecrets {
     $begin = $text.IndexOf('//BEGIN'); $end = $text.IndexOf('//END')
     if ($begin -lt 0 -or $end -lt $begin) { throw 'Unexpected output from dotnet user-secrets list --json.' }
     $text.Substring($begin + 7, $end - $begin - 7) | ConvertFrom-Json -AsHashtable
+}
+
+# DEMO PASSWORDS.txt (CLAUDE.md "Secrets": every credential's value is kept there; local Desktop, outside every repo).
+$script:DemoPasswordsFile = Join-Path $env:USERPROFILE 'Desktop\DEMO PASSWORDS.txt'
+
+function Set-DemoPasswordEntry {
+    # Puts "<Label>: <Value>" into the section "=== <Section>..." of DEMO PASSWORDS.txt: replaces the line that starts with -Key (a
+    # stable prefix of the label), or adds it at the end of the section (the section at the end of the file when there is none). Prints
+    # and returns nothing about the value; the file keeps its CRLF line ends and has no BOM. Review 12c N6: scripts that make a credential
+    # store it themselves instead of asking for a copy.
+    param(
+        [Parameter(Mandatory)] [string] $Section,
+        [Parameter(Mandatory)] [string] $Key,
+        [Parameter(Mandatory)] [string] $Label,
+        [Parameter(Mandatory)] [string] $Value,
+        [string] $Path = $script:DemoPasswordsFile
+    )
+    if (-not $Label.StartsWith($Key)) { throw "The label must start with the key '$Key'." }
+    if ($Value -match '[\r\n]') { throw 'The value must be one line.' }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if (Test-Path $Path) { foreach ($line in [IO.File]::ReadAllLines($Path)) { $lines.Add($line) } }
+    $header = "=== $Section"
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith($header)) { $start = $i; break } }
+    $entry = "$($Label): $Value"
+    if ($start -lt 0) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -ne '') { $lines.Add('') }
+        $lines.Add("$header ===")
+        $lines.Add($entry)
+    } else {
+        $end = $lines.Count
+        for ($i = $start + 1; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith('===')) { $end = $i; break } }
+        $found = -1
+        for ($i = $start + 1; $i -lt $end; $i++) { if ($lines[$i].StartsWith($Key)) { $found = $i; break } }
+        if ($found -ge 0) { $lines[$found] = $entry }
+        else {
+            # After the section's last non-empty line.
+            $at = $end
+            while ($at - 1 -gt $start -and $lines[$at - 1] -eq '') { $at-- }
+            $lines.Insert($at, $entry)
+        }
+    }
+    [IO.File]::WriteAllText($Path, (($lines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
 }

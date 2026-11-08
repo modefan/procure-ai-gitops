@@ -9,8 +9,9 @@
     How: a temporary `kubectl port-forward` of argocd-server to a free loopback port (plain http behind it, no TLS to intercept), a session
     for the admin user (password from Secret argocd/argocd-initial-admin-secret, read in memory only), then
     POST /api/v1/account/claude/token. The token does not expire (-ExpiresInDays to change that); it is revoked by its ID
-    (DELETE /api/v1/account/claude/token/<id>, or -RevokeOthers on the next run). Copy the env var into DEMO PASSWORDS.txt afterwards
-    ("=== Argo CD ===").
+    (DELETE /api/v1/account/claude/token/<id>, or -RevokeOthers on the next run). The script also writes the token into DEMO
+    PASSWORDS.txt itself (section "=== Argo CD", line "<Hosted|Local> claude API token ...", replaced when it exists; review 12c N6),
+    printing only the line's name.
     Needs the admin login on (argocd.adminEnabled, both environments since Task 12c) and, for hosted, the SSH tunnel (opened when needed).
 #>
 [CmdletBinding()]
@@ -59,12 +60,17 @@ try {
     # The new token must work before it replaces the old one: list the Applications with it.
     $apps = Invoke-RestMethod "$base/api/v1/applications?fields=items.metadata.name" -Headers @{ Authorization = "Bearer $token" }
     $names = @($apps.items | ForEach-Object { $_.metadata.name })
-    if ($names.Count -eq 0) { throw "The new token $id lists no Applications (is `claude` bound to role:admin in argocd-rbac-cm?). Not stored." }
+    if ($names.Count -eq 0) { throw "The new token $id lists no Applications (is account claude bound to role:admin in argocd-rbac-cm?). Not stored." }
 
     [Environment]::SetEnvironmentVariable($envVar, $token, 'User')
     Set-Item "env:$envVar" $token
+    $envLabel = if ($Environment -eq 'hosted') { 'Hosted' } else { 'Local' }
+    $key = "$envLabel claude API token"
+    $expiry = if ($ExpiresInDays -gt 0) { "expires in $ExpiresInDays days" } else { 'no expiry' }
+    Set-DemoPasswordEntry -Section 'Argo CD' -Key $key -Value $token `
+        -Label "$key (account claude, apiKey only, role:admin; token id $id, $expiry; user env var $envVar; new one: bootstrap/new-argocd-token.ps1 -Environment $Environment)"
     $token = $null
-    Write-Host "Token $id for account claude stored in user env var $envVar (it sees $($names.Count) Applications: $($names -join ', '))."
+    Write-Host "Token $id for account claude stored in user env var $envVar and in DEMO PASSWORDS.txt (section Argo CD, line '$key ...'); it sees $($names.Count) Applications: $($names -join ', ')."
 
     $account = Invoke-RestMethod "$base/api/v1/account/claude" -Headers $headers
     $others = @($account.tokens | Where-Object { $_.id -ne $id })
@@ -76,7 +82,6 @@ try {
     } elseif ($others.Count -gt 0) {
         Write-Host "Other tokens of claude still valid: $(($others | ForEach-Object { $_.id }) -join ', ') (-RevokeOthers revokes them)."
     }
-    Write-Host 'Copy it into DEMO PASSWORDS.txt ("=== Argo CD ===") without printing it.'
 } finally {
     if (-not $forward.HasExited) { Stop-Process -Id $forward.Id -ErrorAction SilentlyContinue }
 }

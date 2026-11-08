@@ -1,0 +1,159 @@
+#Requires -Version 7.4
+<#
+.SYNOPSIS
+    Proves that bootstrap/add-argocd-admin.ps1 cannot make a demo user an Argo CD admin (plan 08 Task 12c review I1), against the live
+    Keycloak of an environment (hosted: through the SSH tunnel).
+.DESCRIPTION
+    The Keycloak group argocd-admins is the only thing between a public demo account and Argo CD's role:admin once someone has the tunnel,
+    and the script is the path a human uses to fill it. Every case below must be refused with the group's members unchanged:
+      1. a demo user from the realm file (tom@acme.test): a *.test address, an organization member and a fixed realm-file ID at once; the
+         refusal must name all three reasons, so each guard is shown to fire on its own;
+      2. admin@acme.test (its password is published on the demo login page);
+      3. a new user with a *.test address (no user may be created either);
+      4. an organization member with an ordinary address (a probe user made here and put in the organization `demo`);
+      5. the e-mail fallback: -UserName names nobody and -Email names an existing ordinary user (a probe made here);
+      6. the mismatch: -UserName names one address, -Email another (the existing probe user).
+    A positive control then adds a new ordinary probe user (it must land in the group) and takes it out again with -Remove.
+    Probe users are named t12c-probe-<kind>-<random>@example.com, created and deleted by this test (also after a failure); any member the
+    group did not have before the test is taken out again. Passwords are random, never printed. -Script runs another copy of the script
+    (e.g. the previous version, to see this test fail on it).
+#>
+[CmdletBinding()]
+param(
+    [string] $Environment = 'hosted',
+    [string] $Script = (Join-Path $PSScriptRoot '..\bootstrap\add-argocd-admin.ps1')
+)
+
+. (Join-Path $PSScriptRoot '..\bootstrap\common.ps1')
+Select-ProcureCluster $Environment
+Assert-ClusterReachable
+$Script = (Resolve-Path $Script).Path
+
+$failures = [System.Collections.Generic.List[string]]::new()
+function Pass([string] $message) { Write-Host "  PASS  $message" -ForegroundColor Green }
+function Fail([string] $message) { Write-Host "  FAIL  $message" -ForegroundColor Red; $failures.Add($message) }
+
+# kcadm in the Keycloak pod, signed in as the bootstrap admin from the pod's environment (KC_CLI_PASSWORD: not on a command line).
+$preamble = @'
+set -eu
+export HOME=/tmp
+cfg=$(mktemp /tmp/kcadm-XXXXXX.config)
+trap 'rm -f "$cfg"' EXIT
+K=/opt/keycloak/bin/kcadm.sh
+KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" $K config credentials --config "$cfg" --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" </dev/null >/dev/null 2>&1
+kc() { $K "$@" --config "$cfg" -r procure; }
+'@
+function Invoke-Kc([string] $body, [string[]] $arguments = @()) {
+    $text = ($preamble + "`n" + $body) -replace "`r", ''
+    $out = & kubectl @KubectlArgs -n procure exec deploy/keycloak -c keycloak -- bash -c $text _ @arguments 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "kcadm failed ($LASTEXITCODE): $(($out | ForEach-Object { "$_" }) -join ' ')" }
+    @($out | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^Logging into' })
+}
+function Get-GroupMembers {
+    @(Invoke-Kc @'
+GID=$(kc get groups -q exact=true -q search=argocd-admins --fields id,name --format csv --noquotes | while IFS=, read -r id name; do [ "$name" = argocd-admins ] && echo "$id"; done || true)
+[ -n "$GID" ] || { echo "no group argocd-admins" >&2; exit 3; }
+kc get "groups/$GID/members" --fields username --format csv --noquotes
+'@ | Where-Object { $_ })
+}
+function Get-UserId([string] $name) {
+    "$(Invoke-Kc 'kc get users -q exact=true -q username="$1" --fields id --format csv --noquotes' @($name))".Trim()
+}
+function New-RandomPassword {
+    $bytes = [byte[]]::new(24); [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    ConvertTo-SecureString -String ([Convert]::ToBase64String($bytes)) -AsPlainText -Force
+}
+
+# Runs the script under test; returns @{ Refused; Output } (refused = threw or failed). The password is a random SecureString.
+function Invoke-AddAdmin([hashtable] $arguments) {
+    $output = $null; $refused = $false
+    try {
+        $output = & $Script -Environment $Environment -Password (New-RandomPassword) @arguments *>&1 | ForEach-Object { "$_" }
+    } catch {
+        $refused = $true
+        $output = @($output) + "EXCEPTION: $($_.Exception.Message)"
+    }
+    @{ Refused = $refused; Output = (@($output) -join "`n") }
+}
+
+$suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$victim = "t12c-probe-victim-$suffix@example.com"
+$orgUser = "t12c-probe-org-$suffix@example.com"
+$okUser = "t12c-probe-ok-$suffix@example.com"
+$newTestUser = "t12c-probe-new-$suffix@example.test"
+$before = @(Get-GroupMembers)
+Write-Host "Script under test: $Script"
+Write-Host "argocd-admins before: $($before.Count) member(s)."
+
+function Assert-Refused([string] $case, [hashtable] $arguments, [string[]] $reasons = @()) {
+    $result = Invoke-AddAdmin $arguments
+    $after = @(Get-GroupMembers)
+    $added = @($after | Where-Object { $_ -notin $before })
+    if ($added.Count -gt 0) {
+        Fail "$($case): the user was ADDED to argocd-admins ($($added -join ', '))"
+        # Undo at once: a demo user must not stay an Argo CD admin.
+        foreach ($name in $added) { Invoke-Kc @'
+GID=$(kc get groups -q exact=true -q search=argocd-admins --fields id,name --format csv --noquotes | while IFS=, read -r id name; do [ "$name" = argocd-admins ] && echo "$id"; done || true)
+U=$(kc get users -q exact=true -q username="$1" --fields id --format csv --noquotes)
+kc delete "users/$U/groups/$GID"
+'@ @($name) | Out-Null }
+        return
+    }
+    if (-not $result.Refused) { Fail "$($case): not refused (no error), although the group is unchanged"; return }
+    $missing = @($reasons | Where-Object { $result.Output -notmatch [regex]::Escape($_) })
+    if ($missing) { Fail "$($case): refused, but the reason does not name: $($missing -join '; ')"; return }
+    Pass "$case refused, group unchanged$(if ($reasons) { " (reasons: $($reasons -join '; '))" })"
+}
+
+try {
+    # Probe users: an ordinary one (the e-mail fallback's victim) and one in the organization `demo`.
+    Invoke-Kc @'
+kc create users -s username="$1" -s email="$1" -s firstName=Probe -s lastName=Victim -s enabled=true >/dev/null
+U=$(kc get users -q exact=true -q username="$2" --fields id --format csv --noquotes)
+[ -z "$U" ] || exit 9
+kc create users -s username="$2" -s email="$2" -s firstName=Probe -s lastName=Org -s enabled=true >/dev/null
+U=$(kc get users -q exact=true -q username="$2" --fields id --format csv --noquotes)
+ORG=$(kc get organizations --fields id,alias --format csv --noquotes | while IFS=, read -r id alias; do [ "$alias" = demo ] && echo "$id"; done || true)
+[ -n "$ORG" ] || { echo "no organization demo" >&2; exit 8; }
+printf '"%s"' "$U" | kc create "organizations/$ORG/members" -f - >/dev/null
+'@ @($victim, $orgUser) | Out-Null
+    Write-Host 'Probe users created (victim, organization member).'
+
+    Assert-Refused '1. demo user tom@acme.test' @{ UserName = 'tom@acme.test' } @('demo domain', 'organization', 'realm-file ID')
+    Assert-Refused '2. admin@acme.test (published password)' @{ UserName = 'admin@acme.test' } @('demo domain')
+    Assert-Refused '3. new user with a *.test address' @{ UserName = $newTestUser } @('demo domain')
+    if (Get-UserId $newTestUser) { Fail '3. the *.test user was created' } else { Pass '3. no *.test user was created' }
+    Assert-Refused '4. organization member with an ordinary address' @{ UserName = $orgUser } @('organization')
+    Assert-Refused '5. e-mail fallback (-UserName names nobody, -Email an existing user)' @{ UserName = "t12c-probe-nobody-$suffix"; Email = $victim }
+    Assert-Refused '6. -UserName and -Email name different addresses' @{ UserName = $okUser; Email = $victim } @('differ')
+    if (Get-UserId $okUser) { Fail '6. a user was created for the mismatched -UserName' } else { Pass '6. no user created for the mismatch' }
+
+    # Positive control: an ordinary new user is added (and removed again).
+    $result = Invoke-AddAdmin @{ UserName = $okUser; FirstName = 'Probe'; LastName = 'Ok' }
+    $after = @(Get-GroupMembers)
+    if (-not $result.Refused -and $okUser -in $after) { Pass 'positive control: a new ordinary user is added to argocd-admins' }
+    else { Fail "positive control: the ordinary user was not added: $($result.Output)" }
+    $result = Invoke-AddAdmin @{ UserName = $okUser; Remove = $true }
+    if (-not $result.Refused -and $okUser -notin (Get-GroupMembers)) { Pass 'positive control: -Remove takes it out again' }
+    else { Fail "positive control: -Remove failed: $($result.Output)" }
+} finally {
+    # Back to the state before the test: probe users deleted, nobody new left in the group.
+    $extra = @(Get-GroupMembers | Where-Object { $_ -notin $before })
+    foreach ($name in $extra) {
+        Invoke-Kc @'
+GID=$(kc get groups -q exact=true -q search=argocd-admins --fields id,name --format csv --noquotes | while IFS=, read -r id name; do [ "$name" = argocd-admins ] && echo "$id"; done || true)
+U=$(kc get users -q exact=true -q username="$1" --fields id --format csv --noquotes)
+[ -z "$U" ] || kc delete "users/$U/groups/$GID"
+'@ @($name) | Out-Null
+        Write-Host "Cleanup: took $name out of argocd-admins."
+    }
+    foreach ($name in $victim, $orgUser, $okUser, $newTestUser) {
+        Invoke-Kc 'U=$(kc get users -q exact=true -q username="$1" --fields id --format csv --noquotes); [ -z "$U" ] || kc delete "users/$U"' @($name) | Out-Null
+    }
+    $now = @(Get-GroupMembers)
+    Write-Host "Cleanup: probe users deleted; argocd-admins now has $($now.Count) member(s) ($(if ((($before | Sort-Object) -join ',') -eq (($now | Sort-Object) -join ',')) { 'as before' } else { 'NOT as before' }))."
+}
+
+Write-Host ''
+if ($failures.Count -gt 0) { Write-Host "$($failures.Count) FAIL" -ForegroundColor Red; exit 1 }
+Write-Host 'All passed.' -ForegroundColor Green
