@@ -1,0 +1,13 @@
+# Every text file is stored with LF. Scripts and manifests are also checked out with LF on Windows (core.autocrlf=true would give CRLF):
+# a PowerShell here-string sent over ssh carries the checkout's line ends to the VM, where bash reads each `\r` as part of the command
+# (Test-HostBaseline's AppArmor probe failed that way from a CRLF checkout, plan 08 Task 12 push report). Invoke-HostedSsh strips `\r`
+# too; this keeps every checkout byte-identical to what was reviewed.
+* text=auto
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.tpl text eol=lf
+*.lua text eol=lf
+*.tf text eol=lf
+*.hcl text eol=lf

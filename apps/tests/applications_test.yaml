@@ -98,7 +98,8 @@ tests:
               targetRevision: 10.11.7
               helm:
                 releaseName: argocd
-                valueFiles: [$values/argocd/values.yaml]
+                # The environment's own Argo CD values (url, OIDC issuer) over the shared ones (Task 12c).
+                valueFiles: [$values/argocd/values.yaml, $values/envs/local/argocd.yaml]
                 # The environment's switches (argocd.adminEnabled, argocd.ingressEnabled); local keeps both on.
                 valuesObject:
                   configs:
@@ -193,8 +194,8 @@ tests:
       - failedTemplate:
           errorPattern: platformImageTags.postgres must be a 40-character git tree hash
 
-  # Plan 08 ruling 4: a hosted environment has no public Argo CD (no ingress) and no admin user (no password login at all; the UI is
-  # reached by kubectl port-forward with a temporary switch, or `argocd --core`).
+  # Plan 08 ruling 4: an environment can run Argo CD without a public address (no ingress) and without the admin login (the hosted VM
+  # keeps the admin login on as break-glass since Task 12c; both switches still work).
   - it: argo cd has no ingress and no admin user when the environment turns them off
     set:
       argocd:
@@ -228,3 +229,12 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: argocd.ingressEnabled must be true or false \(a YAML boolean, not a string\)
+
+  - it: the argocd Application reads the environment's own argo cd values file
+    set:
+      env: hosted
+    documentSelector: { path: metadata.name, value: argocd }
+    asserts:
+      - equal:
+          path: spec.sources[0].helm.valueFiles
+          value: [$values/argocd/values.yaml, $values/envs/hosted/argocd.yaml]

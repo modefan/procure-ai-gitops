@@ -1,0 +1,35 @@
+# Values of the argo-cd chart for the local k3d cluster `procure`, over argocd/values.yaml (plan 08 Task 12c): the second values file of the
+# argocd Application (apps chart) and of bootstrap/install-argocd.ps1. The switches (admin user, ingress) stay in envs/local/apps.yaml.
+configs:
+  cm:
+    # The address people open; the OIDC redirect URIs are <url>/auth/callback and <url>/pkce/verify (the Keycloak client `argocd`, whose
+    # redirect base is the platform chart's keycloak.argocdUrl in envs/local/platform.yaml: keep both equal).
+    url: https://argocd.procure.localtest.me
+    # Keycloak sign-in (see the header of argocd/values.yaml). Public client with PKCE (Argo CD's documented Keycloak setup for the UI and
+    # `argocd login --sso`), so there is no client secret. Only openid and profile are asked for: the realm defines no `email` or `groups`
+    # scope; the client's own mappers put sub, preferred_username, name, email and groups into the ID token.
+    oidc.config: |
+      name: Keycloak
+      issuer: https://auth.procure.localtest.me/realms/procure
+      clientID: argocd
+      enablePKCEAuthentication: true
+      requestedScopes: ["openid", "profile"]
+      refreshTokenThreshold: 2m
+
+server:
+  # The issuer's certificate is the local CA's (bootstrap/new-local-ca.ps1 writes ConfigMap argocd/procure-ca); the server checks it when it
+  # reads Keycloak's discovery document and keys (pods reach auth.procure.localtest.me through the CoreDNS rewrite, plan 07 ruling 8).
+  env:
+    - name: SSL_CERT_DIR
+      value: /etc/ssl/certs:/etc/procure-ca
+  # optional: a cluster made before Task 12c has no argocd/procure-ca until new-local-ca.ps1 runs again; the server must still start (only
+  # the Keycloak sign-in fails until then; admin and API tokens work).
+  volumes:
+    - name: procure-ca
+      configMap:
+        name: procure-ca
+        optional: true
+  volumeMounts:
+    - name: procure-ca
+      mountPath: /etc/procure-ca
+      readOnly: true

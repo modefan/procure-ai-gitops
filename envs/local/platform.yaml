@@ -16,6 +16,11 @@ hosts:
   dashboard: dashboard.procure.localtest.me
   mailpit: mail.procure.localtest.me
 
+keycloak:
+  # Argo CD's address (the Keycloak client argocd's redirect base, plan 08 Task 12c); equal to configs.cm.url in envs/local/argocd.yaml.
+  # Hosted keeps the chart default http://127.0.0.1:8080 (the port-forward of bootstrap/hosted/open-argocd.ps1).
+  argocdUrl: https://argocd.procure.localtest.me
+
 postgres:
   storage: 5Gi
 mongo:

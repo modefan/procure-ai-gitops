@@ -1,11 +1,22 @@
 # Values of the official argo-cd Helm chart (version in apps/values.yaml, argocd.chartVersion) for the local k3d cluster `procure`.
 # bootstrap/install-argocd.ps1 installs Argo CD with these values; after that the `argocd` Application (wave -2) manages Argo CD itself
 # with the same chart and values, so a change here is deployed by a push to this repo.
-# Small on purpose: the node has 10 GB for everything (CLAUDE.md "My PC is shared"); one replica of each component, no Dex (the admin
-# user is enough for a local cluster), no notifications, no ApplicationSet controller.
+# Small on purpose: the node has 10 GB for everything (CLAUDE.md "My PC is shared"); one replica of each component, no Dex (Argo CD's
+# built-in OIDC client signs people in with Keycloak), no notifications, no ApplicationSet controller.
 # Two switches per environment live in the apps chart, not here (plan 08 ruling 4): argocd.adminEnabled (configs.cm admin.enabled) and
 # argocd.ingressEnabled (server.ingress.enabled), set in envs/<env>/apps.yaml; the argocd Application passes them as valuesObject over this
-# file and install-argocd.ps1 passes them with --set. Local: both on. A public host: both off (port-forward; `argocd --core`).
+# file and install-argocd.ps1 passes them with --set. Local: both on. Hosted: admin on (break-glass, Task 12c), ingress off (port-forward).
+# What differs per environment beyond the switches (the external URL, the OIDC issuer, the local CA) is in envs/<env>/argocd.yaml, the
+# second values file of both (plan 08 Task 12c).
+#
+# Who may do what (plan 08 Task 12c; CLAUDE.md "Hosting plan", Dale 2026-11-08):
+#   people        sign in with Keycloak (realm procure, public client `argocd`, code flow + PKCE, no client secret). Only members of the
+#                 Keycloak group `argocd-admins` get role:admin; everyone else who can sign in (the public demo users) gets no role at
+#                 all (policy.default empty): no Application, project, log or action is visible to them.
+#   admin         the local admin login, break-glass for when Keycloak is down (admin.enabled per environment; password in Secret
+#                 argocd/argocd-initial-admin-secret, copied to DEMO PASSWORDS.txt).
+#   claude        a local account with an API key only (no UI login), role:admin, so Claude can do every admin function without Keycloak;
+#                 its token comes from bootstrap/new-argocd-token.ps1 (user env var ARGOCD_AUTH_TOKEN_<ENV>, DEMO PASSWORDS.txt).
 
 global:
   domain: argocd.procure.localtest.me
@@ -26,6 +37,8 @@ configs:
     # TLS ends at Traefik (the local CA's wildcard certificate); the server speaks plain http behind it.
     server.insecure: true
   cm:
+    # Claude's account (see the header): API keys only, no password login.
+    accounts.claude: apiKey
     # How often Argo CD looks for new commits (the publish workflow's revision bump): every 2 minutes, plus up to 1 minute jitter.
     timeout.reconciliation: 120s
     # Health of an Application as a resource of the root Application (app of apps). Argo CD has no built-in check for it, so without
@@ -149,6 +162,16 @@ configs:
       hs.status = health
       hs.message = healthMessage
       return hs
+
+  # RBAC (see the header). The `groups` claim (Keycloak group membership mapper of the argocd client, plain group names) is matched against
+  # the g-lines; policy.default empty gives a signed-in user without a matching group nothing. The built-in admin keeps role:admin.
+  rbac:
+    policy.default: ""
+    policy.csv: |
+      g, argocd-admins, role:admin
+      g, claude, role:admin
+    scopes: "[groups]"
+    policy.matchMode: glob
 
 controller:
   resources:

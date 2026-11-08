@@ -59,7 +59,8 @@ argocd:
   chartVersion: 10.11.7
   releaseName: argocd
   # The environment's switches over argocd/values.yaml (plan 08 ruling 4). Local: both on. A public host: no ingress (the UI only through
-  # kubectl port-forward) and no admin user (no password login at all; `argocd --core` or kubectl, or turn it on for a while).
+  # kubectl port-forward); the admin user is break-glass there (Task 12c: on, people sign in with Keycloak). The rest of the environment's
+  # Argo CD settings (url, OIDC issuer) are in envs/<env>/argocd.yaml, the Application's second values file.
   # bootstrap/install-argocd.ps1 reads both lines from envs/<env>/apps.yaml for the first install, so Argo CD never starts more open.
   adminEnabled: true
   ingressEnabled: true

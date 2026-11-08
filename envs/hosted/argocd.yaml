@@ -1,0 +1,18 @@
+# Values of the argo-cd chart for the hosted VM, over argocd/values.yaml (plan 08 Task 12c): the second values file of the argocd
+# Application (apps chart) and of bootstrap/install-argocd.ps1. The switches (admin user on as break-glass, no ingress) stay in
+# envs/hosted/apps.yaml.
+configs:
+  cm:
+    # No public address: Argo CD is opened through the SSH tunnel and `kubectl port-forward` on Dale's PC
+    # (bootstrap/hosted/open-argocd.ps1, 127.0.0.1:8080). The OIDC redirect URIs are <url>/auth/callback and <url>/pkce/verify, which the
+    # Keycloak client `argocd` allows (platform chart keycloak.argocdUrl, default http://127.0.0.1:8080: keep both equal).
+    url: http://127.0.0.1:8080
+    # Keycloak sign-in (see the header of argocd/values.yaml): the public realm at auth.daleabels.com (Let's Encrypt certificate; the
+    # server reaches it through the CoreDNS rewrite, bootstrap/hosted/coredns-custom.yaml). Public client with PKCE, no client secret.
+    oidc.config: |
+      name: Keycloak
+      issuer: https://auth.daleabels.com/realms/procure
+      clientID: argocd
+      enablePKCEAuthentication: true
+      requestedScopes: ["openid", "profile"]
+      refreshTokenThreshold: 2m

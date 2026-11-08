@@ -3,8 +3,10 @@
 # bootstrap/new-local-ca.ps1 -Environment hosted (the internal CA for MongoDB's TLS) and bootstrap/new-secrets.ps1 -Environment hosted.
 env: hosted
 argocd:
-  # A public host (plan 08 ruling 4): no admin user and no ingress; the UI only through kubectl port-forward over the SSH tunnel.
-  adminEnabled: false
+  # A public host (plan 08 ruling 4): no ingress; the UI only through kubectl port-forward over the SSH tunnel
+  # (bootstrap/hosted/open-argocd.ps1). People sign in with Keycloak (envs/hosted/argocd.yaml); the admin login stays on as break-glass
+  # for when Keycloak is down (Dale 2026-11-08, Task 12c), reachable only through the tunnel like the rest of Argo CD.
+  adminEnabled: true
   ingressEnabled: false
 platform:
   enabled: true

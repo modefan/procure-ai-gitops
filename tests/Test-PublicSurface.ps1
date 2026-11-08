@@ -24,8 +24,8 @@
    10. The client address (Review Focus 5): Traefik must see the visitor's own address, not a ServiceLB or node address (k3s's svclb pod
        masquerades). Through the SSH tunnel (kubectl), a throwaway namespace gets an echo pod (traefik/whoami) behind an Ingress on a random
        path of the app host; one request from this PC must come back with X-Forwarded-For equal to this PC's public IPv4 address (asked from
-       https://api.ipify.org). Prints only "matches" or the kind of address seen, never an address. The namespace is deleted afterwards.
-       -SkipClientAddress leaves it out (no tunnel at hand).
+       https://api.ipify.org). Prints only "matches" or the kind of address seen, never an address. The namespace is deleted afterwards,
+       and a tunnel the step opened is closed again (an open one is reused and left open). -SkipClientAddress leaves it out.
     Not covered: UDP, and the VM's IPv6 address from outside (Test-HostBaseline checks the listeners and [v6]:80/443 from the VM itself).
     The port scan has no second pass (both firewalls drop, so every closed port times out and a second pass would be the whole scan again):
     a port whose SYN-ACK arrives later than -PortTimeoutMs counts as closed. To keep the VM's and Contabo's SYN handling from delaying
@@ -238,8 +238,6 @@ try {
     # --- 10. The client address Traefik sees ------------------------------------------------------------------------------------------
     if (-not $SkipClientAddress) {
         Write-Step 'The client address Traefik sees (echo pod through the tunnel)'
-        Select-ProcureCluster hosted
-        Assert-ClusterReachable
         $probeNs = 'client-ip-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
         $probePath = '/__client-address-' + [guid]::NewGuid().ToString('N')
         $manifest = @"
@@ -277,7 +275,17 @@ spec:
       paths:
       - {path: $probePath, pathType: Exact, backend: {service: {name: echo, port: {number: 80}}}}
 "@
+        # Setup inside the try (Task 12 re-review minor 5): an unreachable VM is a counted FAIL with the summary, not an exception. A tunnel
+        # this step opens (Select-ProcureCluster opens one when none answers) is closed again; one that was already open stays open.
+        $openedTunnel = $false
+        $applied = $false
         try {
+            $script:KubectlArgs = @('--kubeconfig', $HostedKubeconfig, '--context', $HostedKubeContext)
+            $tunnelWasUp = Test-ClusterReachable
+            $openedTunnel = -not $tunnelWasUp
+            Select-ProcureCluster hosted
+            Assert-ClusterReachable
+            $applied = $true
             $applyOut = $manifest | & kubectl @KubectlArgs apply -f - 2>&1
             if ($LASTEXITCODE -ne 0) { throw "kubectl apply of the echo probe failed: $($applyOut -join ' ')" }
             Invoke-Kubectl -n $probeNs wait pod/echo --for=condition=Ready --timeout=120s | Out-Null
@@ -304,7 +312,8 @@ spec:
         } catch {
             Fail "client address check: $($_.Exception.Message)"
         } finally {
-            & kubectl @KubectlArgs delete namespace $probeNs --wait=false --ignore-not-found 2>&1 | Out-Null
+            if ($applied) { & kubectl @KubectlArgs delete namespace $probeNs --wait=false --ignore-not-found 2>&1 | Out-Null }
+            if ($openedTunnel) { & (Join-Path $PSScriptRoot '../bootstrap/hosted/open-tunnel.ps1') -Close | Out-Host }
         }
     }
 } finally {

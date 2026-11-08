@@ -15,7 +15,7 @@
 {{- end }}
 {{- $sources := list
       (dict "repoURL" .chartRepo "chart" .chart "targetRevision" (toString .chartVersion)
-            "helm" (dict "releaseName" .releaseName "valueFiles" (list "$values/argocd/values.yaml")
+            "helm" (dict "releaseName" .releaseName "valueFiles" (list "$values/argocd/values.yaml" (printf "$values/envs/%s/argocd.yaml" $.Values.env))
                          "valuesObject" (dict "configs" (dict "cm" (dict "admin.enabled" .adminEnabled))
                                               "server" (dict "ingress" (dict "enabled" .ingressEnabled)))))
       (dict "repoURL" $.Values.repos.gitops "targetRevision" $.Values.repos.gitopsRevision "ref" "values") }}

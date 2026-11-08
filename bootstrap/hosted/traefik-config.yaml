@@ -11,7 +11,8 @@
 #  - hostPorts on one node: a new Traefik pod cannot start while the old one holds 80/443, so a rollout replaces the pod (maxSurge 0,
 #    maxUnavailable 1; a few seconds without ingress, only when this config or k3s's Traefik changes).
 #  - Ingress status: without a LoadBalancer Service there is no address to copy (publishedService), and Argo CD calls an Ingress without
-#    a status address Progressing; Traefik writes the public host name instead.
+#    a status address Progressing; Traefik writes the public host name instead. The name is a placeholder here: install-cert-manager.ps1
+#    fills in procure.<HostedDomain> (bootstrap/common.ps1) before it applies this file (Task 12 re-review minor 4).
 #  - Traefik trusts no incoming X-Forwarded-* (the chart's default: no forwardedHeaders.trustedIPs, no insecure mode); nothing sits in
 #    front of the VM, so a visitor cannot choose the address the gateway logs and rate-limits by.
 #  - HSTS on every https answer (procure, auth, dashboard): a Headers Middleware kube-system/hsts (in the same chart release, extraObjects,
@@ -64,4 +65,4 @@ spec:
         publishedService:
           enabled: false
         ingressEndpoint:
-          hostname: procure.daleabels.com
+          hostname: __APP_HOST__

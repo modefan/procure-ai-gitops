@@ -151,6 +151,9 @@ function Invoke-HostedSsh {
     # Runs a command on the VM as the admin user and returns its output lines; throws on a non-zero exit unless -AllowFailure (then
     # $LASTEXITCODE tells). Only for commands whose output holds no secret (the kubeconfig is fetched by new-hosted-cluster.ps1 itself).
     param([Parameter(Mandatory)] [string] $Command, [switch] $AllowFailure)
+    # The VM's bash reads a carriage return (CR) as part of the command: a here-string from a CRLF checkout (core.autocrlf) would end every line with one
+    # (plan 08 Task 12 push report: Test-HostBaseline's AppArmor probe broke that way). .gitattributes pins *.ps1 to LF as well.
+    $Command = $Command -replace "`r", ''
     $hostInfo = Get-HostedHost
     $out = & ssh @(Get-HostedSshArgs) "$($hostInfo.user)@$($hostInfo.ipv4)" $Command 2>&1
     if ($LASTEXITCODE -ne 0 -and -not $AllowFailure) { throw "ssh '$Command' failed ($LASTEXITCODE): $($out -join [Environment]::NewLine)" }

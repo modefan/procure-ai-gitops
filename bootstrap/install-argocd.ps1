@@ -19,11 +19,14 @@
                                    (main only; plan 08 Task 6, so the weekly clean-up holds no write key)
        A key is generated once and added to GitHub when GitHub does not list it; each Actions secret is set when its key is new or the
        secret is missing (-SetCiSecret sets both again). Needs `gh` signed in with admin rights on both repos.
-    2. Argo CD by Helm (chart argo/argo-cd at the version in apps/values.yaml, values argocd/values.yaml), waiting until it runs.
+    2. Argo CD by Helm (chart argo/argo-cd at the version in apps/values.yaml, values argocd/values.yaml and envs/<Environment>/argocd.yaml),
+       waiting until it runs.
     3. Repository Secrets repo-procure-ai and repo-procure-ai-gitops in namespace argocd (server-side apply, no value printed).
     4. The root Application.
     Safe to run again. Prints names and fingerprints only, never a key.
-    The admin password of the Argo CD UI (https://argocd.procure.localtest.me, user admin) is in Secret argocd/argocd-initial-admin-secret.
+    The admin password of the Argo CD UI (https://argocd.procure.localtest.me, user admin; on hosted break-glass through
+    bootstrap/hosted/open-argocd.ps1) is in Secret argocd/argocd-initial-admin-secret. People sign in with Keycloak (group argocd-admins);
+    Claude's API token comes from bootstrap/new-argocd-token.ps1 (plan 08 Task 12c).
     With argocd.adminEnabled / argocd.ingressEnabled false in envs/<Environment>/apps.yaml, Argo CD is installed without the admin user /
     its ingress from the start.
 #>
@@ -45,7 +48,7 @@ $gh = Get-Gh
 $appRepo = 'modefan/procure-ai'
 $gitopsRepo = 'modefan/procure-ai-gitops'
 $envDir = Join-Path $repoRoot "envs/$Environment"
-foreach ($file in 'apps.yaml', 'release.yaml') {
+foreach ($file in 'apps.yaml', 'release.yaml', 'argocd.yaml') {
     if (-not (Test-Path (Join-Path $envDir $file))) { throw "envs/$Environment/$file is missing." }
 }
 
@@ -171,7 +174,7 @@ $ingressEnabled = Get-ArgoCdSwitch 'ingressEnabled'
 
 Write-Host "Installing Argo CD (chart argo-cd $chartVersion; admin user $(if ($adminEnabled) { 'on' } else { 'off' }), ingress $(if ($ingressEnabled) { 'on' } else { 'off' }))..."
 $out = & helm @HelmArgs upgrade --install argocd argo-cd --repo $chartRepo --version $chartVersion `
-    --namespace argocd -f (Join-Path $repoRoot 'argocd/values.yaml') `
+    --namespace argocd -f (Join-Path $repoRoot 'argocd/values.yaml') -f (Join-Path $envDir 'argocd.yaml') `
     --set "configs.cm.admin\.enabled=$($adminEnabled.ToString().ToLowerInvariant())" `
     --set "server.ingress.enabled=$($ingressEnabled.ToString().ToLowerInvariant())" --wait --timeout 10m 2>&1
 if ($LASTEXITCODE -ne 0) { throw "helm upgrade --install argocd failed: $($out -join [Environment]::NewLine)" }
@@ -211,7 +214,7 @@ $root = [ordered]@{
 }
 Write-Host (Invoke-Apply $root)
 if ($Environment -eq 'hosted') {
-    Write-Host "Argo CD now brings up envs/$Environment (kubectl --kubeconfig $HostedKubeconfig --context $KubeContext -n argocd get applications). UI: kubectl port-forward svc/argocd-server through the tunnel (no public ingress, plan 08 ruling 4)."
+    Write-Host "Argo CD now brings up envs/$Environment (kubectl --kubeconfig $HostedKubeconfig --context $KubeContext -n argocd get applications). UI: bootstrap/hosted/open-argocd.ps1 (tunnel + port-forward, no public ingress, plan 08 ruling 4); Keycloak sign-in, admin as break-glass."
 } else {
     Write-Host "Argo CD now brings up envs/$Environment (kubectl --context $KubeContext -n argocd get applications). UI: https://argocd.procure.localtest.me (admin; password in Secret argocd/argocd-initial-admin-secret)."
 }

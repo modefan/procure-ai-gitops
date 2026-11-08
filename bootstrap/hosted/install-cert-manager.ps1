@@ -51,7 +51,10 @@ if (-not $Production) {
 
 # --- 1. Traefik -----------------------------------------------------------------------------------------------------------------------
 $before = & kubectl @KubectlArgs -n kube-system get deployment traefik -o jsonpath='{.metadata.generation}' 2>$null
-Write-Host (Invoke-ServerSideApply -Path (Join-Path $PSScriptRoot 'traefik-config.yaml') -Description 'HelmChartConfig kube-system/traefik')
+# The app's public host name (Ingress status address) comes from common.ps1, not the file: the file holds a placeholder.
+$traefikConfig = (Get-Content -Raw (Join-Path $PSScriptRoot 'traefik-config.yaml')).Replace('__APP_HOST__', "procure.$HostedDomain")
+if ($traefikConfig -match '__[A-Z_]+__') { throw "traefik-config.yaml still holds a placeholder ($($Matches[0]))." }
+Write-Host (Invoke-ServerSideApply -Json $traefikConfig -Description 'HelmChartConfig kube-system/traefik')
 # k3s's helm controller reruns the chart install when the config changes; wait for it to apply both settings.
 $deadline = (Get-Date).AddMinutes(5)
 while ($true) {
