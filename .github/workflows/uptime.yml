@@ -34,7 +34,9 @@ jobs:
           check() {
             local name="$1" url="$2" expect="$3" body status
             for attempt in 1 2 3; do
-              status=$(curl -sS -o body.txt -w '%{http_code}' --max-time 20 "$url" || echo 000)
+              # On a connection error curl already writes 000 through -w (so no "|| echo 000", which would make it 000000).
+              status=$(curl -sS -o body.txt -w '%{http_code}' --max-time 20 "$url") || true
+              status=${status:-000}
               body=$(head -c 2000 body.txt 2>/dev/null || true)
               if [[ "$status" =~ ^2 ]] && grep -qF -- "$expect" <<<"$body"; then
                 echo "ok   $name: HTTP $status"

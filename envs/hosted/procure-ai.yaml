@@ -30,8 +30,9 @@ global:
 # Worst case, every organisation at its cap every day: 3 organisations (acme, globex, demo; self-registration is off, and would add
 # users to Demo, not organisations) x 150 000 x 30 days = 13.5 M tokens, + the 2 seeds past a cap (2 x 7 959 x 30 = 0.5 M) = 14 M.
 # Priced as if 20 % were output (measured: ~5 %): 0.8 x $0.25 + 0.2 x $2.00 = $0.60 per 1 M -> about $8.40 a month (R 139 at
-# R 16.54/$, ECB 2026-11-06), under the $10 budget alert (procure-ai-10usd). Calls already in flight when the cap is reached still finish
-# (procure-ai docs/assistant.md "Daily token cap"); the deployment's 50 000 tokens a minute bounds that overshoot.
+# R 16,54/$, ECB 2026-11-06), under the $10 budget alert (procure-ai-10usd). Calls already in flight when the cap is reached still finish
+# (procure-ai docs/assistant.md "Daily token cap"); the deployment's 50 000 tokens a minute bounds that overshoot, so $8.40 is not a hard
+# ceiling: add at most about $1-2 once for a scripted burst of questions fired together at the cap (still under $10).
 assistant:
   env:
     AI__Provider: AzureFoundry
