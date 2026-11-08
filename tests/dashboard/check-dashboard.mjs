@@ -7,7 +7,8 @@
 //   DASHBOARD_USER        admin@acme.test
 //   DASHBOARD_PASSWORD    the demo users' password
 //   DASHBOARD_LOG_SERVICES   requests-api (services that must have a fresh row on Structured logs)
-//   DASHBOARD_TRACE_SERVICES gateway,requests-api (services that must have a fresh row on Traces)
+//   DASHBOARD_TRACE_SERVICES requests-api (services that must have a fresh row on Traces)
+//   DASHBOARD_TRACE_ROOT     gateway (the newest trace on each of those pages must start there: a request through the gateway)
 //   DASHBOARD_MAX_AGE_MIN 10
 //   DASHBOARD_LOADS       3 (full page loads per page)
 //   DASHBOARD_NO_NUDGE    1: block /_procure/virtualize-nudge.js (shows whether the dashboard's tables load without the workaround)
@@ -19,7 +20,8 @@ const base = (process.env.DASHBOARD_URL || '').replace(/\/$/, '');
 const user = process.env.DASHBOARD_USER;
 const password = process.env.DASHBOARD_PASSWORD;
 const list = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
-const servicesOf = { structuredlogs: list(process.env.DASHBOARD_LOG_SERVICES ?? 'requests-api'), traces: list(process.env.DASHBOARD_TRACE_SERVICES ?? 'gateway,requests-api') };
+const servicesOf = { structuredlogs: list(process.env.DASHBOARD_LOG_SERVICES ?? 'requests-api'), traces: list(process.env.DASHBOARD_TRACE_SERVICES ?? 'requests-api') };
+const traceRoot = process.env.DASHBOARD_TRACE_ROOT ?? 'gateway';
 const maxAgeMin = Number(process.env.DASHBOARD_MAX_AGE_MIN || 10);
 const loads = Number(process.env.DASHBOARD_LOADS || 3);
 const noNudge = process.env.DASHBOARD_NO_NUDGE === '1';
@@ -54,7 +56,19 @@ async function waitForRows(page) {
   while (Date.now() - started < rowsTimeoutMs) {
     grid = await readGrid(page);
     // An empty grid shows one "No ... found" row; only data counts.
-    if (grid.count > 0 && grid.rows.length > 0) return { grid, ms: Date.now() - started };
+    if (grid.count > 0 && grid.rows.length > 0) {
+      const ms = Date.now() - started;
+      // The first rows can be a partial render (seen: 5 of 74 traces, a count of 5 of 8 logs); read until two reads a second apart agree.
+      const key = g => `${g.count}|${g.rows.length}|${JSON.stringify(g.rows[g.rows.length - 1])}`;
+      for (let i = 0; i < 8; i++) {
+        await page.waitForTimeout(1000);
+        const next = await readGrid(page);
+        const same = key(next) === key(grid);
+        grid = next;
+        if (same) break;
+      }
+      return { grid, ms };
+    }
     await page.waitForTimeout(250);
   }
   return { grid, ms: null };
@@ -116,6 +130,15 @@ try {
       const newest = ages.length ? Math.min(...ages) : null;
       if (newest !== null && newest <= maxAgeMin) ok(`/${name}/resource/${service}: newest row ${newest.toFixed(1)} min old (${grid.count} in all)`);
       else fail(`/${name}/resource/${service}: newest row ${newest === null ? 'has no time' : `${newest.toFixed(1)} min old`}, expected under ${maxAgeMin} min (${grid.count} in all)`);
+      // Traces: the newest one is a request that came in through the gateway (its name is "<root resource>: <operation>").
+      // (Not /traces/resource/gateway: on 13.6.2 that page stopped listing new gateway-rooted traces that the requests-api page lists.)
+      if (name === 'traces' && traceRoot && newest !== null) {
+        const nameCol = grid.headers.indexOf('Name');
+        const newestRow = grid.rows.find(r => ageMinutes(r[col], now) === newest);
+        const root = newestRow ? (newestRow[nameCol] || '').split(':')[0] : '';
+        if (root === traceRoot) ok(`/${name}/resource/${service}: the newest trace starts at ${traceRoot} (${(newestRow[nameCol] || '').split(' ').slice(0, 3).join(' ')})`);
+        else fail(`/${name}/resource/${service}: the newest trace starts at '${root}', expected ${traceRoot}`);
+      }
     }
   }
 } catch (e) {

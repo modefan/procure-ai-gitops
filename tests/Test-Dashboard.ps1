@@ -18,7 +18,9 @@
     3. In Microsoft Edge (tests/dashboard/check-dashboard.mjs, playwright-core): signs in at Keycloak as the demo admin (client role
        dashboard-viewer; the password from the user secrets), opens Structured logs and Traces -Loads times each as full page loads and
        needs rows within 20 s every time, then opens the resource pages (/structuredlogs/resource/<name> for each -LogServices,
-       /traces/resource/<name> for each -TraceServices) and needs the newest row to be at most -MaxAgeMinutes old.
+       /traces/resource/<name> for each -TraceServices) and needs the newest row to be at most -MaxAgeMinutes old, and the newest trace
+       to start at -TraceRoot (the gateway: the request came in through it). /traces/resource/gateway itself is not used: on dashboard
+       13.6.2 it stopped listing new gateway-rooted traces that the requests-api page lists (seen 2026-11-08).
 
     -NoNudge blocks the workaround script (/_procure/virtualize-nudge.js, procure-ai deploy/charts/procure-observability): run it after an
     Aspire dashboard upgrade; when every load still shows rows, the workaround can go (dashboard.proxy.enabled: false).
@@ -31,7 +33,8 @@ param(
     [ValidateSet('local', 'hosted')]
     [string] $Environment = 'local',
     [string[]] $LogServices = @('requests-api'),
-    [string[]] $TraceServices = @('gateway', 'requests-api'),
+    [string[]] $TraceServices = @('requests-api'),
+    [string] $TraceRoot = 'gateway',
     [int] $MaxAgeMinutes = 10,
     [int] $Loads = 3,
     [string] $Tenant = 'acme',
@@ -113,6 +116,7 @@ try {
         $password = $null
         $env:DASHBOARD_LOG_SERVICES = $LogServices -join ','
         $env:DASHBOARD_TRACE_SERVICES = $TraceServices -join ','
+        $env:DASHBOARD_TRACE_ROOT = $TraceRoot
         $env:DASHBOARD_MAX_AGE_MIN = "$MaxAgeMinutes"
         $env:DASHBOARD_LOADS = "$Loads"
         $env:DASHBOARD_NO_NUDGE = if ($NoNudge) { '1' } else { '' }
@@ -123,7 +127,7 @@ try {
             $lines = @(& node (Join-Path $dir 'check-dashboard.mjs') 2>&1 | ForEach-Object { "$_" })
         } finally {
             Pop-Location
-            foreach ($name in 'DASHBOARD_URL', 'DASHBOARD_USER', 'DASHBOARD_PASSWORD', 'DASHBOARD_LOG_SERVICES', 'DASHBOARD_TRACE_SERVICES', 'DASHBOARD_MAX_AGE_MIN', 'DASHBOARD_LOADS',
+            foreach ($name in 'DASHBOARD_URL', 'DASHBOARD_USER', 'DASHBOARD_PASSWORD', 'DASHBOARD_LOG_SERVICES', 'DASHBOARD_TRACE_SERVICES', 'DASHBOARD_TRACE_ROOT', 'DASHBOARD_MAX_AGE_MIN', 'DASHBOARD_LOADS',
                               'DASHBOARD_NO_NUDGE', 'DASHBOARD_IGNORE_TLS', 'DASHBOARD_HEADED') {
                 Remove-Item "Env:$name" -ErrorAction SilentlyContinue
             }
