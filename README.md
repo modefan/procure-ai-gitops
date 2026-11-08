@@ -110,6 +110,13 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
   admin key, the observability Application, the dashboard's Keycloak sign-in (Tom refused, the admin with `dashboard-viewer` let in),
   its telemetry API answering 404, and that a pod in `procure` cannot reach the gateway or Keycloak directly with a spoofed
   `X-Forwarded-For` (only through Traefik; plan 08 ruling 5).
+- `tests/Test-Dashboard.ps1 [-Environment hosted]` (plan 08b; also run by Test-FreshCluster after Test-Smoke): the Aspire dashboard as an
+  operator uses it. Fresh telemetry through the gateway (admin key), Blazor's WebSocket Origin check (own Origin passes, a foreign one and
+  http:// get 403, on `/_blazor` and `/_Blazor`), then Microsoft Edge (playwright-core, `tests/dashboard/`, installed by the first run)
+  signs in as the demo admin, loads Structured logs and Traces three times each (rows within 20 s every time) and needs rows newer than 10
+  minutes from requests-api (logs) and gateway and requests-api (traces). `-NoNudge` blocks the blank-table workaround of procure-ai's
+  observability chart, to see whether a new dashboard release still needs it. **Run it after every push or deploy that reaches a
+  cluster** (CLAUDE.md "Operating the live system"): `Test-FreshCluster.ps1 -Environment hosted -WatchOnly` includes it.
 - `tests/Test-LocalCa.ps1` (no cluster needed): `new-local-ca.ps1 -FilesOnly` into a temp folder; the CA's name constraints, both leaves
   verify, a certificate for any other name signed by the same CA does not, an old unconstrained CA is replaced.
 - `tests/Test-Upgrade.ps1` (plan 07 Review Focus 2): deploys two throwaway procure-ai revisions by a helm parameter on the root

@@ -29,3 +29,5 @@ id_ecdsa*
 known_hosts
 # new-hosted-cluster.ps1 -Import writes this for one run (import blocks with live IDs) and deletes it.
 infra/hosted/_import.tf
+# tests/dashboard: playwright-core, installed by Test-Dashboard.ps1 (npm ci)
+node_modules/

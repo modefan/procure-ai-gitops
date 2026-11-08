@@ -9,7 +9,8 @@
         own health (not the wave gate) and its last sync Succeeded (the demo seed is procure-ai's PostSync hook, so it has run), and
       - every pod in procure, argocd and observability is Ready (Jobs' pods: Succeeded).
     Then it waits -StableSeconds more and checks that every pod is still Ready and no container restarted in that time (a pod that
-    crashes on its first message, not at start, shows up here), and runs Test-Smoke.ps1.
+    crashes on its first message, not at start, shows up here), and runs Test-Smoke.ps1 and Test-Dashboard.ps1 (the dashboard signed in
+    with a real browser: tables load, fresh rows from the apps; plan 08b).
     It fails early, with the container's last log lines, when a container crash-loops (CrashLoopBackOff for -CrashLoopMinutes or
     -MaxRestarts restarts), an image cannot be pulled for 3 minutes, a container's configuration is wrong (CreateContainerConfigError,
     e.g. a missing Secret key) for 2 minutes, a pod is evicted, or Windows has less than -MinFreeGB of free memory (the PC is shared).
@@ -366,6 +367,11 @@ Write-Step 'Test-Smoke.ps1'
 & (Join-Path $PSScriptRoot 'Test-Smoke.ps1') -Environment $Environment
 if ($LASTEXITCODE -ne 0) { Stop-Test 'smoke checks failed.' }
 
+# --- 5. The dashboard, in a real browser (plan 08b: green smoke checks while the dashboard showed nothing for days) -----------------
+Write-Step 'Test-Dashboard.ps1'
+& (Join-Path $PSScriptRoot 'Test-Dashboard.ps1') -Environment $Environment
+if ($LASTEXITCODE -ne 0) { Stop-Test 'dashboard checks failed.' }
+
 Write-Summary
-Write-Host "`nFresh cluster converged on its own and passed the smoke checks$(if ($script:waveOrderWarning) { ' (wave order NOT CHECKED, see the warning)' })." -ForegroundColor Green
+Write-Host "`nFresh cluster converged on its own and passed the smoke and dashboard checks$(if ($script:waveOrderWarning) { ' (wave order NOT CHECKED, see the warning)' })." -ForegroundColor Green
 exit 0

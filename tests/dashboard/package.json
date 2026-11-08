@@ -1,0 +1,9 @@
+{
+  "name": "procure-dashboard-check",
+  "private": true,
+  "description": "Browser check of the Aspire dashboard (tests/Test-Dashboard.ps1). playwright-core only: it drives the installed Microsoft Edge, no browser download.",
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.64.1"
+  }
+}
