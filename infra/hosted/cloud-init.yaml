@@ -113,7 +113,7 @@ write_files:
     permissions: "0600"
     content: |
       # The node and the API on the dummy node address only: nothing of Kubernetes listens on the public interfaces except Traefik's
-      # 80/443 (ServiceLB host ports), and Contabo's firewall drops everything but 22, 80 and 443 anyway.
+      # 80/443 (host ports of the Traefik pod, Task 12), and Contabo's firewall drops everything but 22, 80 and 443 anyway.
       node-ip: ${node_ip}
       advertise-address: ${node_ip}
       bind-address: ${node_ip}
@@ -170,7 +170,7 @@ write_files:
 
   # Host firewall, in its own nftables table (k3s's kube-proxy and flannel rules live in the ip/ip6 tables of iptables-nft and are not
   # touched; the file replaces only this table). Public interface eth0: replies, SSH, HTTP, HTTPS and the ICMPv6 that IPv6 needs come in,
-  # nothing else. The input chain covers the host's own sockets; the forward chain covers what kube-proxy and ServiceLB forward to pods
+  # nothing else. The input chain covers the host's own sockets; the forward chain covers what kube-proxy and host ports forward to pods
   # (after DNAT, so the original destination port decides): only 80 and 443, never a NodePort. Contabo's firewall in front does the same.
   - path: /etc/procure/host-firewall.nft
     permissions: "0644"

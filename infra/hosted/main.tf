@@ -116,8 +116,8 @@ resource "contabo_firewall" "public" {
 }
 
 # An A record for each host, straight to the server (DNS only: Traefik terminates TLS with Let's Encrypt, Task 12). No AAAA: k3s is
-# IPv4 single-stack (ServiceLB publishes host ports for IPv4 only), so an AAAA record would send IPv6 clients and Let's Encrypt to an
-# address where 80/443 do not answer (controller ruling 2026-11-07; revisit with dual-stack in Task 12). Only these three records are
+# IPv4 single-stack (Traefik's host ports are IPv4 only), so an AAAA record would send IPv6 clients and Let's Encrypt to an
+# address where 80/443 do not answer (controller ruling 2026-11-07; Task 12 kept IPv4 only). Only these three records are
 # managed here; the apex and anything else in the zone are not touched.
 locals {
   dns_records = { for host in var.dns_hosts : "${host}-A" => { name = "${host}.${var.domain}", type = "A", content = local.ipv4 } }

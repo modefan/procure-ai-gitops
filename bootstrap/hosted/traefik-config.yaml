@@ -2,10 +2,21 @@
 # ships; k3s reinstalls Traefik with them). Applied by bootstrap/hosted/install-cert-manager.ps1; the local cluster keeps k3s's defaults.
 #  - http:// answers with a permanent redirect to https:// (path and query kept) for every host. Let's Encrypt's HTTP-01 check follows
 #    the redirect to port 443, where cert-manager's solver Ingress answers (the websecure entry point serves every router with TLS).
-#  - externalTrafficPolicy Local: k3s's ServiceLB forwards to Traefik on this node without SNAT, so Traefik sees the visitor's address
-#    and puts it in X-Forwarded-For (the gateway trusts that from the pod network only; plan 08 ruling 5, Review Focus 5).
+#  - The visitor's own address reaches Traefik (and so X-Forwarded-For; the gateway trusts that from the pod network only; plan 08 ruling
+#    5, Review Focus 5). k3s's ServiceLB cannot do that: its svclb pod DNATs to the node and MASQUERADEs (klipper-lb), so every visitor
+#    arrived as the svclb pod's address, also with externalTrafficPolicy Local (measured in the Task 12 fix round: Traefik saw 10.42.0.40).
+#    So Traefik takes 80 and 443 itself through hostPorts (the CNI portmap plugin DNATs and keeps the source address) and its Service is a
+#    plain ClusterIP: no ServiceLB pod, no NodePorts, no health check node port. The host firewall is unchanged: its forward chain lets
+#    only connections whose original destination port is 80 or 443 reach a pod (cloud-init.yaml), Contabo's firewall the same.
+#  - hostPorts on one node: a new Traefik pod cannot start while the old one holds 80/443, so a rollout replaces the pod (maxSurge 0,
+#    maxUnavailable 1; a few seconds without ingress, only when this config or k3s's Traefik changes).
+#  - Ingress status: without a LoadBalancer Service there is no address to copy (publishedService), and Argo CD calls an Ingress without
+#    a status address Progressing; Traefik writes the public host name instead.
 #  - Traefik trusts no incoming X-Forwarded-* (the chart's default: no forwardedHeaders.trustedIPs, no insecure mode); nothing sits in
 #    front of the VM, so a visitor cannot choose the address the gateway logs and rate-limits by.
+#  - HSTS on every https answer (procure, auth, dashboard): a Headers Middleware kube-system/hsts (in the same chart release, extraObjects,
+#    so it exists whenever the entry point names it) on the websecure entry point. One year, no includeSubDomains, no preload: the demo's
+#    own three hosts only, and nothing that is hard to undo (preload lists are).
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:
@@ -17,12 +28,40 @@ spec:
   valuesContent: |-
     ports:
       web:
+        hostPort: 80
         http:
           redirections:
             entryPoint:
               to: websecure
               scheme: https
               permanent: true
+      websecure:
+        hostPort: 443
+        http:
+          middlewares:
+            - kube-system-hsts@kubernetescrd
     service:
       spec:
-        externalTrafficPolicy: Local
+        type: ClusterIP
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 1
+        maxSurge: 0
+    extraObjects:
+      - apiVersion: traefik.io/v1alpha1
+        kind: Middleware
+        metadata:
+          name: hsts
+          namespace: kube-system
+        spec:
+          headers:
+            stsSeconds: 31536000
+            stsIncludeSubdomains: false
+            stsPreload: false
+    providers:
+      kubernetesIngress:
+        publishedService:
+          enabled: false
+        ingressEndpoint:
+          hostname: procure.daleabels.com

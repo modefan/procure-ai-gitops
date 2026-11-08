@@ -42,8 +42,9 @@ Hostnames (all `*.localtest.me`, which resolves to 127.0.0.1): `procure.localtes
 
 The live demo runs on a Contabo Cloud VPS with k3s, built by Terraform in `infra/hosted/` (the adopted VPS reinstalled with cloud-init,
 Contabo's firewall, the Cloudflare DNS records) and bootstrapped through an SSH tunnel by `bootstrap/hosted/`:
-`new-hosted-cluster.ps1` (plan, money guard, apply, kubeconfig), `hosted/install-cert-manager.ps1` (Traefik redirect and client address,
-cert-manager, the Let's Encrypt certificate for procure, auth and dashboard.daleabels.com), `new-local-ca.ps1 -Environment hosted` (the
+`new-hosted-cluster.ps1` (plan, money guard, apply, kubeconfig), `hosted/install-cert-manager.ps1` (Traefik on host ports 80/443 so it sees the
+visitor's address, the https redirect and HSTS, cert-manager, the Let's Encrypt certificate for procure, auth and dashboard.daleabels.com;
+staging unless `-Production`), `new-local-ca.ps1 -Environment hosted` (the
 internal CA for MongoDB's TLS), `new-secrets.ps1 -Environment hosted` and `install-argocd.ps1 -Environment hosted`, which then brings up
 `envs/hosted/` (the public demo at <https://procure.daleabels.com>). `bootstrap/hosted/Test-HostBaseline.ps1` checks the VM's security
 baseline and `tests/Test-PublicSurface.ps1` what the internet sees; `Test-Smoke.ps1`, `Test-FreshCluster.ps1 -WatchOnly`,
