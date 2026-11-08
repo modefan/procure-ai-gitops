@@ -126,6 +126,11 @@ write_files:
         - "healthz-bind-address=${node_ip}:10256"
       # Secrets encrypted at rest in the datastore.
       secrets-encryption: true
+      # No ServiceLB (klipper-lb; plan 08 final review B M3): Traefik takes 80/443 as hostPorts behind a ClusterIP Service (it must see
+      # the visitor's address, which ServiceLB masquerades), and nothing else may publish a port: a future LoadBalancer Service would
+      # otherwise get svclb host ports on every interface. It then stays Pending instead.
+      disable:
+        - servicelb
 
   # Kubelet settings as a configuration drop-in (k3s reads agent/etc/kubelet.conf.d; kubelet command-line flags for these are
   # deprecated in favour of the configuration file).

@@ -51,6 +51,9 @@ $curl = @('C:\Program Files\Git\mingw64\bin\curl.exe', "$env:SystemRoot\System32
 if (-not $curl) { throw 'curl not found.' }
 $hosted = $Environment -eq 'hosted'
 if ($hosted -ne [bool] $Reboot) { throw '-Reboot goes with -Environment hosted (the local cluster restarts with k3d stop/start).' }
+# Whether the SSH tunnel was already open (another script's, e.g. a WAL watch): that one is reused and never closed here (review B M9,
+# the ownership rule of open-argocd.ps1). Decided before Select-ProcureCluster, which opens a missing tunnel.
+$tunnelWasOpen = $hosted -and [bool] (Get-HostedTunnelProcess)
 Select-ProcureCluster $Environment
 if (-not $AppHost) { $AppHost = if ($hosted) { "procure.$HostedDomain" } else { 'procure.localtest.me' } }
 $tlsArgs = @('--ssl-no-revoke')
@@ -140,7 +143,8 @@ try {
         $bootBefore = (Invoke-HostedSsh -Command 'cat /proc/sys/kernel/random/boot_id') -join ''
         $stoppedAt = [datetime]::UtcNow
         Invoke-HostedSsh -Command 'sudo systemctl reboot' -AllowFailure | Out-Null
-        & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') -Close | Out-Host
+        # The reboot drops the tunnel; not closed here (it may be another script's): open-tunnel.ps1 below replaces a tunnel that no longer
+        # answers, or opens a new one when its ssh process has exited.
         $deadline = (Get-Date).AddMinutes(10)
         $bootAfter = $null
         while (-not $bootAfter -or $bootAfter -eq $bootBefore) {
@@ -263,6 +267,8 @@ try {
     }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    # Close the tunnel only when this script opened it (none was running at the start); another script's tunnel stays open.
+    if ($hosted -and -not $tunnelWasOpen) { & (Join-Path $PSScriptRoot '..\bootstrap\hosted\open-tunnel.ps1') -Close | Out-Host }
 }
 
 if ($failures.Count -gt 0) {

@@ -31,6 +31,20 @@
       k3s), the instance stays managed and is NOT cancelled; it keeps billing until Dale cancels it in the Contabo panel (procure-ai
       docs/hosting.md). Afterwards both APIs are checked: no DNS record left, the firewall still active on the instance, the instance not
       cancelled. A normal run brings the records back.
+    -Import (plan 08 final review B I4, ruling R4): the Terraform state is lost (a new PC, a deleted folder) but the VM, its firewall, its
+      SSH key secret and the DNS records still exist. Without it the plan wants to ADOPT the instance (a reinstall: all data lost) and
+      CREATE the DNS records (Cloudflare refuses duplicates, so the apply fails halfway). -Import finds every existing object through the
+      APIs (the instance by its approved ID; the one firewall holding it; the SSH key secret by name; each A record by name) and adds an
+      `import` block for each address the state does not hold yet (in infra/hosted/_import.tf, written for the run and deleted
+      afterwards). The plan must then import, not create: any create (except a DNS record that does not exist at all), delete or replace,
+      and any change to the instance, is refused. The apply writes only the state; nothing on the VM, the firewall or the DNS changes.
+      With -PlanOnly it stops after the plan (proof run). The SSH key must be the one on the VM (%USERPROFILE%\.procure-ai\hosted\, restored
+      from the offline backup, procure-ai docs/hosting.md "Recovering the hosted setup"); with a new key Terraform would only update the
+      key secret and SSH would still be refused (the VM keeps the old key).
+    -KubeconfigOnly: only fetches the kubeconfig again (no Terraform): after a k3s upgrade or restart, or when k3s renewed its client
+      certificates and the PC's copy stopped working (bootstrap/hosted/upgrade-k3s.ps1 runs it).
+    -StateFile: the state file to use instead of %USERPROFILE%\.procure-ai\hosted\terraform.tfstate (an empty file proves -Import without
+      touching the real state).
     The root password Dale received with the VPS stays valid for the Contabo console: the script keeps it in a Contabo password secret
     (procure-hosted-root-password, created once from DEMO PASSWORDS.txt without printing it) that the reinstall uses.
     Safe to run again: with nothing to change, Terraform applies nothing and the rest is re-checked.
@@ -41,6 +55,12 @@ param(
     [Parameter(ParameterSetName = 'Apply')] [switch] $PlanOnly,
     # Allow (or, when Terraform already manages the VM, force) the reinstall that adopting the instance means. All data on the VM is lost.
     [Parameter(ParameterSetName = 'Apply')] [switch] $Reinstall,
+    # Adopt the existing VM, firewall, SSH key secret and DNS records into a lost or empty state, without reinstalling or recreating anything.
+    [Parameter(ParameterSetName = 'Apply')] [switch] $Import,
+    # Fetch the kubeconfig again and nothing else.
+    [Parameter(ParameterSetName = 'Kubeconfig', Mandatory)] [switch] $KubeconfigOnly,
+    # Another state file (e.g. an empty one in a temporary folder, to prove -Import -PlanOnly without touching the real state).
+    [string] $StateFile = '',
     # Remove the DNS records only (the VM, its firewall and the SSH key stay; nothing is cancelled).
     [Parameter(ParameterSetName = 'Destroy', Mandatory)] [switch] $Destroy,
     # Apply (or destroy) without asking (the guard still runs).
@@ -50,6 +70,31 @@ param(
 . (Join-Path $PSScriptRoot '..\common.ps1')
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $tfDir = Join-Path $repoRoot 'infra\hosted'
+if ($StateFile) { $HostedStateFile = [IO.Path]::GetFullPath($StateFile) }
+if ($Import -and $Reinstall) { throw '-Import keeps the VM as it is; -Reinstall reinstalls it. Use one.' }
+$importFile = Join-Path $tfDir '_import.tf'
+
+function Update-HostedKubeconfig([string] $target) {
+    # k3s's admin kubeconfig from the VM, pointed at the tunnel (127.0.0.1:16443) and renamed to the procure-hosted context. The file holds
+    # the admin client certificate: it goes from ssh straight to the file (current user only), never to the console.
+    $raw = & ssh @(Get-HostedSshArgs) $target 'sudo cat /etc/rancher/k3s/k3s.yaml' 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { throw 'Could not read /etc/rancher/k3s/k3s.yaml on the VM (is k3s running? sudo systemctl status k3s).' }
+    $kubeconfig = ($raw -join "`n") -replace '(?m)^(\s*server:\s*)https://\S+$', "`${1}https://127.0.0.1:$HostedTunnelPort" `
+        -replace '(?m)^(\s*(?:-\s+)?(?:name|cluster|user|current-context):\s*)default\s*$', "`${1}$HostedKubeContext"
+    Set-Content -Path $HostedKubeconfig -Value $kubeconfig -NoNewline
+    Set-CurrentUserOnlyAcl $HostedDir
+    Remove-Variable raw, kubeconfig
+    Write-Host "kubeconfig: $HostedKubeconfig (context $HostedKubeContext, via the tunnel)"
+}
+
+if ($KubeconfigOnly) {
+    $hostInfo = Get-HostedHost
+    Update-HostedKubeconfig "$($hostInfo.user)@$($hostInfo.ipv4)"
+    Select-ProcureCluster 'hosted'
+    Assert-ClusterReachable
+    Write-Host 'The Kubernetes API answers through the tunnel with the new kubeconfig.'
+    return
+}
 
 foreach ($tool in 'terraform', 'ssh', 'ssh-keygen', 'kubectl') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool not found on PATH." }
@@ -101,6 +146,45 @@ $instance = Get-Instance
 Assert-InstanceIsTheBoughtOne $instance
 Write-Host "Instance $HostedInstanceId ($($instance.productId), $($instance.region), $HostedMonthlyPrice a month): $($instance.status), Terraform $(if ($managed) { 'manages it' } else { 'does not manage it yet' })."
 
+# --- -Import: import blocks for every existing object the state does not hold (state lost) ----------------------------------------------
+function Get-ImportIds {
+    # address -> import ID of every object that already exists, found through the APIs (nothing is created or changed here).
+    $ids = [ordered]@{ 'contabo_instance.vps' = $HostedInstanceId }
+    $firewalls = @((Invoke-ContaboApi 'firewalls?size=100').data | Where-Object { @($_.instances | Where-Object { "$($_.instanceId)" -eq $HostedInstanceId }).Count })
+    if ($firewalls.Count -ne 1) { throw "Expected exactly one firewall on instance $HostedInstanceId, found $($firewalls.Count)." }
+    $ids['contabo_firewall.public'] = "$($firewalls[0].firewallId)"
+    $keyName = 'procure-hosted-admin'  # infra/hosted/main.tf: "${var.server_name}-admin"
+    $keys = @((Invoke-ContaboApi "secrets?name=$([uri]::EscapeDataString($keyName))&type=ssh").data | Where-Object name -eq $keyName)
+    if ($keys.Count -ne 1) { throw "Expected exactly one Contabo SSH key secret '$keyName', found $($keys.Count)." }
+    $ids['contabo_secret.ssh'] = "$($keys[0].secretId)"
+    $records = Get-HostedDnsRecords
+    foreach ($h in $HostedDnsHosts) {
+        $a = @($records | Where-Object { $_.name -eq "$h.$HostedDomain" -and $_.type -eq 'A' })
+        if ($a.Count -gt 1) { throw "$($a.Count) A records for $h.$HostedDomain; expected at most one." }
+        # cloudflare_dns_record (provider 5.x) imports as <zone_id>/<record_id>; a record that does not exist is simply created by the plan.
+        if ($a.Count -eq 1) { $ids["cloudflare_dns_record.host[""$h-A""]"] = "$HostedCloudflareZoneId/$($a[0].id)" }
+    }
+    $ids
+}
+
+if ($Import) {
+    $ids = Get-ImportIds
+    $toImport = @($ids.Keys | Where-Object { $_ -notin $state })
+    if (-not $toImport) { Write-Host 'The state already holds every existing object: nothing to import (a normal run continues).' }
+    $blocks = foreach ($address in $toImport) { "import {`n  to = $address`n  id = ""$($ids[$address])""`n}`n" }
+    Set-Content -Path $importFile -Value ("# Written by new-hosted-cluster.ps1 -Import for one run; deleted afterwards (never committed).`n" + ($blocks -join "`n")) -NoNewline
+    Write-Host "Import: $($toImport.Count) object(s) found through the APIs and not in the state: $($toImport -join ', ')"
+    $managed = $true  # the instance is adopted by import, not by a reinstall
+}
+
+function Get-ChangedAttributes($rc) {
+    # The names of the attributes an update changes (names only; values may be long or sensitive).
+    if (-not $rc.change.before -or -not $rc.change.after) { return @() }
+    @($rc.change.after.PSObject.Properties.Name | Where-Object {
+            ($rc.change.after.$_ | ConvertTo-Json -Depth 20 -Compress) -ne
+            ($rc.change.before.PSObject.Properties[$_] ? ($rc.change.before.$_ | ConvertTo-Json -Depth 20 -Compress) : 'null') })
+}
+
 # The plan check: only the expected resources, never a new or a cancelled instance (details in the help above). Returns the problems; an
 # empty list means the plan may be applied. -DestroyOnly: the plan may only delete our own DNS records.
 function Test-Plan($plan, [switch] $DestroyOnly) {
@@ -115,6 +199,19 @@ function Test-Plan($plan, [switch] $DestroyOnly) {
         if ($rc.type -like 'contabo_*' -and $rc.type -notin 'contabo_secret', 'contabo_instance', 'contabo_firewall') { $problems.Add("$($rc.type) may cost money") }
         if ($DestroyOnly -and $actions -notin 'no-op', 'read' -and -not $ownDnsDelete) { $problems.Add("-Destroy may delete only DNS records, not $($rc.address) ($actions)") }
         if ($rc.type -eq 'contabo_firewall' -and 'delete' -in @($rc.change.actions)) { $problems.Add('the plan deletes the firewall of a VM that keeps running k3s') }
+        # -Import: adopt only. Nothing is created (except a DNS record that does not exist at all), deleted or replaced, and the instance
+        # itself must not change (an update of the instance may reinstall it).
+        if ($Import) {
+            $isMissingDns = $rc.type -eq 'cloudflare_dns_record' -and $actions -eq 'create' -and $rc.address -notin $importIds
+            if (('create' -in @($rc.change.actions) -and -not $isMissingDns) -or 'delete' -in @($rc.change.actions)) { $problems.Add("-Import: $($rc.address) would be $actions, not imported") }
+            # The one accepted instance update: existing_instance_id, which the provider's import does not read back (null in the imported
+            # state, the approved ID in main.tf). Provider 0.1.44's update reinstalls only for ssh_keys, root_password, user_data, image_id or
+            # default_user and patches only display_name; for existing_instance_id alone it only reads the instance again.
+            $instanceChanges = if ($rc.address -eq 'contabo_instance.vps' -and $actions -eq 'update') { @(Get-ChangedAttributes $rc) } else { @() }
+            if ($rc.address -eq 'contabo_instance.vps' -and $actions -ne 'no-op' -and -not ($actions -eq 'update' -and ($instanceChanges -join ',') -eq 'existing_instance_id')) {
+                $problems.Add("-Import: the instance would change ($($actions): $($instanceChanges -join ', ')); it must be imported unchanged")
+            }
+        }
     }
     if (-not $DestroyOnly) { foreach ($address in $expected) { if ($address -notin $planAddresses) { $problems.Add("missing resource $address") } } }
     $vps = $plan.resource_changes | Where-Object address -eq 'contabo_instance.vps'
@@ -125,7 +222,7 @@ function Test-Plan($plan, [switch] $DestroyOnly) {
             $after = $vps.change.after
             if ("$($after.existing_instance_id)" -ne $HostedInstanceId) { $problems.Add("the plan creates an instance without existing_instance_id=${HostedInstanceId}: that would ORDER a new VPS") }
             if ($after.PSObject.Properties['add_ons'] -and @($after.add_ons).Count) { $problems.Add('the plan adds add-ons (they cost money)') }
-            if (-not $Reinstall) { $problems.Add("the plan adopts instance $HostedInstanceId, which REINSTALLS it (all data lost); rerun with -Reinstall only on purpose") }
+            if (-not $Reinstall -or $Import) { $problems.Add("the plan adopts instance $HostedInstanceId, which REINSTALLS it (all data lost); rerun with -Reinstall only on purpose") }
         }
     }
     $firewall = $plan.resource_changes | Where-Object address -eq 'contabo_firewall.public'
@@ -152,10 +249,12 @@ function Test-Plan($plan, [switch] $DestroyOnly) {
 }
 
 function Show-Plan($plan) {
-    foreach ($rc in @($plan.resource_changes | Where-Object { (@($_.change.actions) -join ',') -notin 'no-op', 'read' })) {
+    foreach ($rc in @($plan.resource_changes | Where-Object { (@($_.change.actions) -join ',') -notin 'no-op', 'read' -or ($_.change.PSObject.Properties['importing'] -and $_.change.importing) })) {
         $extra = if ($rc.type -eq 'cloudflare_dns_record' -and $rc.change.after) { " ($($rc.change.after.type) $($rc.change.after.name), proxied=$($rc.change.after.proxied), ttl $($rc.change.after.ttl))" }
         elseif ($rc.type -eq 'cloudflare_dns_record' -and $rc.change.before) { " ($($rc.change.before.type) $($rc.change.before.name))" }
+        elseif ($rc.change.PSObject.Properties['importing'] -and $rc.change.importing) { " (IMPORT of existing $($rc.change.importing.id))" }
         elseif ($rc.address -eq 'contabo_instance.vps' -and $rc.change.after) { " (adopts existing instance $($rc.change.after.existing_instance_id), image $($rc.change.after.image_id): REINSTALL)" }
+        if ('update' -in @($rc.change.actions)) { $extra += " [changes: $((Get-ChangedAttributes $rc) -join ', ')]" }
         Write-Host "plan: $($rc.change.actions -join '/') $($rc.address)$extra"
     }
 }
@@ -225,12 +324,15 @@ if ($Reinstall -and $managed) {
 }
 
 $rootSecretId = Get-RootPasswordSecretId
+try {
 $tfVars = @('-var', "ssh_public_key_path=$HostedSshKey.pub", '-var', "k3s_version=$HostedK3sVersion", '-var', "root_password_secret_id=$rootSecretId")
 $planFile = Join-Path $HostedDir 'tfplan'
 Invoke-Terraform plan -input=false -no-color "-out=$planFile" @tfVars | Out-Null
 $plan = (Invoke-Terraform show -json $planFile) -join "`n" | ConvertFrom-Json -Depth 50
 
+$importIds = @($plan.resource_changes | Where-Object { $_.change.PSObject.Properties['importing'] -and $_.change.importing } | ForEach-Object { "$($_.address)" })
 $problems = @(Test-Plan $plan)
+if ($Import) { Write-Host "Import plan: $($importIds.Count) object(s) imported: $($importIds -join ', ')" }
 $adopts = [bool] (@($plan.resource_changes | Where-Object { $_.address -eq 'contabo_instance.vps' -and 'create' -in @($_.change.actions) }).Count)
 $changes = @($plan.resource_changes | Where-Object { (@($_.change.actions) -join ',') -notin 'no-op', 'read' })
 Show-Plan $plan
@@ -279,6 +381,10 @@ if ($changes.Count -gt 0) {
     }
 }
 Remove-Item $planFile -ErrorAction SilentlyContinue
+} finally {
+    # The import blocks are for this run only (an applied import is in the state; a second run must not import again).
+    Remove-Item $importFile -ErrorAction SilentlyContinue
+}
 
 $outputs = (Invoke-Terraform output -json) -join "`n" | ConvertFrom-Json
 $hostInfo = [ordered]@{
@@ -341,14 +447,7 @@ $k3s = Invoke-HostedSsh -Command 'systemctl is-active k3s' -AllowFailure
 if ("$k3s".Trim() -ne 'active') { throw "k3s is not active on the VM ($k3s); see sudo journalctl -u k3s." }
 
 # --- 4. kubeconfig (through the tunnel) -----------------------------------------------------------------------------------------------
-$raw = & ssh @(Get-HostedSshArgs) $target 'sudo cat /etc/rancher/k3s/k3s.yaml' 2>$null
-if ($LASTEXITCODE -ne 0 -or -not $raw) { throw 'Could not read /etc/rancher/k3s/k3s.yaml on the VM (is k3s running? sudo systemctl status k3s).' }
-$kubeconfig = ($raw -join "`n") -replace '(?m)^(\s*server:\s*)https://\S+$', "`${1}https://127.0.0.1:$HostedTunnelPort" `
-    -replace '(?m)^(\s*(?:-\s+)?(?:name|cluster|user|current-context):\s*)default\s*$', "`${1}$HostedKubeContext"
-Set-Content -Path $HostedKubeconfig -Value $kubeconfig -NoNewline
-Set-CurrentUserOnlyAcl $HostedDir
-Remove-Variable raw, kubeconfig
-Write-Host "kubeconfig: $HostedKubeconfig (context $HostedKubeContext, via the tunnel)"
+Update-HostedKubeconfig $target
 
 Select-ProcureCluster 'hosted'
 Assert-ClusterReachable

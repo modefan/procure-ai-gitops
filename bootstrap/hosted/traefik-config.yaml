@@ -18,6 +18,9 @@
 #  - HSTS on every https answer (procure, auth, dashboard): a Headers Middleware kube-system/hsts (in the same chart release, extraObjects,
 #    so it exists whenever the entry point names it) on the websecure entry point. One year, no includeSubDomains, no preload: the demo's
 #    own three hosts only, and nothing that is hard to undo (preload lists are).
+#  - Resources (plan 08 final review B M2): the public edge gets a memory limit, so a connection flood cannot grow Traefik into the
+#    node's headroom (the kubelet then restarts Traefik instead of evicting the app). Measured 2026-11-08: 31 MiB, 2m CPU at idle; the
+#    limit is 8x that. No CPU limit: throttling the edge would only add latency; the request keeps it scheduled with a fair share.
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:
@@ -44,6 +47,12 @@ spec:
     service:
       spec:
         type: ClusterIP
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
     updateStrategy:
       type: RollingUpdate
       rollingUpdate:

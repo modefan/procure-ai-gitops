@@ -17,7 +17,13 @@
       - the host firewall (nftables table inet procure_host) is loaded: on eth0 only replies, 22, 80, 443 (and the ICMP IPv6 needs) come
         in, and only 80/443 are forwarded to pods;
       - the sudo group holds only the admin user (Contabo's merged config also creates the image's `ubuntu` user; cloud-init removes it);
-      - WARN (not a failure) when a kernel or library update waits for a reboot (/var/run/reboot-required).
+      - WARN (not a failure) when a kernel or library update waits for a reboot (/var/run/reboot-required);
+      - k3s runs without ServiceLB (disable: servicelb in /etc/rancher/k3s/config.yaml) and no Service is of type LoadBalancer;
+      - Traefik (the public edge) has a memory limit (traefik-config.yaml);
+      - the Let's Encrypt certificate ingress-tls/procure-public is Ready, from letsencrypt-production, with more than 21 days left
+        (renewal is due at 30; fewer than 21 means renewal has been failing for 9 days);
+      - the GHCR pull token (bootstrap/common.ps1 GhcrPullTokenExpires): WARN within 21 days of its expiry, FAIL after it;
+      - the PC's hosted kubeconfig: its admin client certificate has more than 30 days left.
     From the PC, against the public IPv4 (and IPv6 when the PC has a route); before host.json exists, the addresses come from the Contabo
     API, so the outside checks also run against a VM that is not set up yet:
       - root and password logins are refused (the server offers only publickey);
@@ -83,9 +89,11 @@ Add-Check 'from the PC: root and password logins refused (server offers publicke
     if (-not $publicAddresses) { throw 'no address (host.json missing and the Contabo API did not answer)' }
     $user = if ($hostInfo) { $hostInfo.user } else { 'procure' }
     $ip = $publicAddresses[0]
-    # Only refusals are tested here, so the server's host key does not matter (and before the first setup none is recorded): no known_hosts
-    # is read or written. Every connection that matters (Invoke-HostedSsh) checks the key strictly.
-    $common = @('-o', 'UserKnownHostsFile=NUL', '-o', 'StrictHostKeyChecking=no', '-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15')
+    # Only refusals are tested here, so the server's host key does not matter (and before the first setup none is recorded): the real
+    # known_hosts is neither read nor written. Every connection that matters (Invoke-HostedSsh) checks the key strictly. A throwaway file,
+    # not NUL: Windows OpenSSH wrote "NUL" as a file into the current folder (found in the plan 08 fix wave).
+    $throwawayKnownHosts = New-TemporaryFile
+    $common = @('-o', "UserKnownHostsFile=$($throwawayKnownHosts.FullName)", '-o', 'StrictHostKeyChecking=no', '-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15')
     # Root with the right key: refused (AllowUsers and PermitRootLogin).
     $root = & ssh @common -i $HostedSshKey -o IdentitiesOnly=yes "root@$ip" true 2>&1
     if ($LASTEXITCODE -eq 0) { throw 'root logged in with the admin key' }
@@ -94,6 +102,7 @@ Add-Check 'from the PC: root and password logins refused (server offers publicke
     $denied = ($nokey | ForEach-Object { "$_" }) -match 'Permission denied \(([^)]*)\)'
     if ($LASTEXITCODE -eq 0 -or -not $denied) { throw "unexpected answer without a key: $($nokey -join ' ')" }
     $methods = ([regex]::Match(($nokey -join ' '), 'Permission denied \(([^)]*)\)')).Groups[1].Value
+    Remove-Item -LiteralPath $throwawayKnownHosts.FullName -ErrorAction SilentlyContinue
     if ($methods -ne 'publickey') { throw "server offers: $methods" }
     "root refused; methods offered: $methods"
 }
@@ -226,6 +235,59 @@ Add-Check 'sudo group holds only the admin user; no ubuntu user' {
     $ubuntu = (Get-Ssh 'id ubuntu >/dev/null 2>&1 && echo present || echo absent') -join ''
     if ($sudo -ne $hostInfo.user -or $ubuntu -ne 'absent') { throw "sudo group: '$sudo'; ubuntu user $ubuntu" }
     "sudo: $sudo; ubuntu absent"
+}
+
+Add-Check 'k3s without ServiceLB; no Service of type LoadBalancer' {
+    # Plan 08 final review B M3: Traefik takes 80/443 as hostPorts; a LoadBalancer Service would get svclb host ports on every interface.
+    $config = (Get-Ssh 'sudo cat /etc/rancher/k3s/config.yaml') -join "`n"
+    $services = ((Get-Ssh 'sudo k3s kubectl get svc -A -o json') -join "`n" | ConvertFrom-Json).items
+    $lb = @($services | Where-Object { $_.spec.type -eq 'LoadBalancer' } | ForEach-Object { "$($_.metadata.namespace)/$($_.metadata.name)" })
+    $problems = @()
+    if ($config -notmatch '(?m)^disable:\s*$' -or $config -notmatch '(?m)^\s*-\s*"?servicelb"?\s*$') { $problems += 'servicelb is not disabled in /etc/rancher/k3s/config.yaml (docs/hosting.md "Turning ServiceLB off")' }
+    if ($lb) { $problems += "LoadBalancer Services: $($lb -join ', ')" }
+    if ($problems) { throw ($problems -join '; ') }
+    'servicelb disabled; no LoadBalancer Service'
+}
+
+Add-Check 'Traefik (public edge) has a memory limit' {
+    $limit = (Get-Ssh "sudo k3s kubectl -n kube-system get deploy traefik -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'") -join ''
+    if (-not $limit) { throw 'no memory limit on kube-system/traefik (apply traefik-config.yaml: install-cert-manager.ps1 -Production)' }
+    "memory limit $limit"
+}
+
+Add-Check 'certificate ingress-tls/procure-public Ready, from letsencrypt-production, more than 21 days left' {
+    $cert = (Get-Ssh 'sudo k3s kubectl -n ingress-tls get certificate procure-public -o json') -join "`n" | ConvertFrom-Json
+    $ready = @($cert.status.conditions | Where-Object type -eq 'Ready')[0]
+    $notAfter = [datetime]::Parse($cert.status.notAfter, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
+    $days = [int] [math]::Floor(($notAfter - [datetime]::UtcNow).TotalDays)
+    $problems = @()
+    if ($ready.status -ne 'True') { $problems += "Ready=$($ready.status) ($($ready.message))" }
+    if ($cert.spec.issuerRef.name -ne 'letsencrypt-production') { $problems += "issuer $($cert.spec.issuerRef.name)" }
+    if ($days -lt 21) { $problems += "$days days left (renewal due at 30 is failing: kubectl -n ingress-tls describe certificate,order,challenge)" }
+    if ($problems) { throw ($problems -join '; ') }
+    "Ready; $($cert.spec.issuerRef.name); $days days left (until $($notAfter.ToString('yyyy-MM-dd')))"
+}
+
+Add-Check "the PC's hosted kubeconfig: admin client certificate valid for more than 30 days" {
+    # k3s renews its client certificates on a restart when they are within 90 days of expiry; the PC keeps the copy it fetched, which
+    # then stops working on its expiry date. Fix: bootstrap/hosted/new-hosted-cluster.ps1 -KubeconfigOnly (after a k3s restart).
+    if (-not (Test-Path $HostedKubeconfig)) { throw "no kubeconfig at $HostedKubeconfig" }
+    $data = [regex]::Match((Get-Content -Raw $HostedKubeconfig), '(?m)^\s*client-certificate-data:\s*(\S+)').Groups[1].Value
+    if (-not $data) { throw 'no client-certificate-data in the kubeconfig' }
+    $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($data))
+    $left = [int] [math]::Floor(($cert.NotAfter.ToUniversalTime() - [datetime]::UtcNow).TotalDays)
+    $cert.Dispose()
+    if ($left -lt 30) { throw "$left days left: restart k3s at a quiet time (it renews), then new-hosted-cluster.ps1 -KubeconfigOnly" }
+    "$left days left"
+}
+
+Add-Check "GHCR pull token not expired (expires $($GhcrPullTokenExpires.ToString('yyyy-MM-dd')))" {
+    $left = [int] [math]::Floor(($GhcrPullTokenExpires - (Get-Date)).TotalDays)
+    if ($left -lt 0) { throw "expired $(-$left) days ago: hosted deploys fail with ImagePullBackOff while the packages are private (bootstrap/common.ps1 GhcrPullTokenExpires says how to renew)" }
+    if ($left -lt 21) {
+        $results.Add([pscustomobject]@{ Result = 'WARN'; Check = 'GHCR pull token expires soon'; Detail = "$left days left; renew it (bootstrap/common.ps1 GhcrPullTokenExpires)" })
+    }
+    "$left days left"
 }
 
 # A warning only: unattended upgrades install kernel fixes, but the VM reboots only when Dale (or Claude) decides (docs/hosting.md).

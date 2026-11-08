@@ -93,7 +93,7 @@ tests:
       - equal:
           path: spec.sources
           value:
-            - repoURL: https://argoproj.github.io/argo-helm
+            - repoURL: ghcr.io/argoproj/argo-helm
               chart: argo-cd
               targetRevision: 10.11.7
               helm:

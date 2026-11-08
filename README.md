@@ -51,9 +51,21 @@ baseline and `tests/Test-PublicSurface.ps1` what the internet sees; `Test-Smoke.
 `Test-RestartKeepsData.ps1 -Reboot` and `Test-WalSlotsAdvance.ps1` take `-Environment hosted`. Costs, how to cancel and every step:
 procure-ai `docs/hosting.md`.
 
-`.github/workflows/uptime.yml` is the repo's only workflow (no CI here): every 30 minutes it checks the gateway's `/health/ready`, the
-web app, Keycloak's realm and the demo switch on the public hosts, and fails (GitHub e-mails the owner) when one is down. Its schedule
-stays commented out while the repo is private, so it uses no private Actions minutes; going public (plan 08 Task 17) switches it on.
+`.github/workflows/uptime.yml` is the repo's only workflow (no CI here): it checks the gateway's `/health/ready`, the web app, Keycloak's
+realm and the demo switch on the public hosts, and that each host's Let's Encrypt certificate has at least 21 days left, and fails
+(GitHub e-mails the owner) when one is not so. It runs once a day while the repo is private (about 30 of the 2 000 private Actions minutes
+a month; plan 08 fix wave ruling R2); going public (plan 08 Task 17) moves it to every 30 minutes.
+
+Maintenance of the VM (procure-ai `docs/hosting.md` has the runbooks): `bootstrap/hosted/upgrade-k3s.ps1` (plans a k3s patch upgrade: the
+embedded containerd, runc and Traefik versions; `-Apply` upgrades, re-fetches the kubeconfig and reruns the baseline),
+`new-hosted-cluster.ps1 -KubeconfigOnly`, `new-hosted-cluster.ps1 -Import` (adopts the existing VM, firewall, key and DNS records into a
+lost Terraform state without a reinstall) and `bootstrap/hosted/backup-hosted.ps1 -Destination <folder>` (a gpg-encrypted offline copy
+of the SSH key, the state, the deploy keys, the CAs, both user-secrets stores and DEMO PASSWORDS.txt; where to keep it is Dale's choice).
+
+**Before every push here that changes `envs/`, `apps/` or `argocd/`: `./tests/Test-RenderEnvs.ps1`.** This repo has no CI, so nothing
+else renders the values before Argo CD does on the cluster (for `envs/hosted`, the public demo). It renders the app of apps, procure-ai's
+three charts at each environment's `appRevision` (or `-AppRef WORKTREE -AppRepo <procure-ai worktree>` for an unpushed chart change) and
+Argo CD's own chart, each through `kubeconform -strict`. procure-ai's CI renders the same environments against every procure-ai commit.
 
 ## GitOps: how a commit gets deployed
 

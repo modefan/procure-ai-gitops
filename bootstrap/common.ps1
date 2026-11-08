@@ -62,10 +62,16 @@ $script:HostedMonthlyPrice = 'EUR 14.00'
 # The Contabo password secret that keeps Dale's root password (console login) valid across the reinstall; created once from DEMO
 # PASSWORDS.txt ("=== Contabo ===", "VPS root password") by new-hosted-cluster.ps1, value never printed.
 $script:HostedRootPasswordSecretName = 'procure-hosted-root-password'
-# The Cloudflare DNS records Terraform keeps (A and AAAA each, DNS only): <host>.<domain> -> the server.
+# The Cloudflare DNS records Terraform keeps (one A record each, DNS only; no AAAA, k3s is IPv4 only): <host>.<domain> -> the server.
 $script:HostedDomain = 'daleabels.com'
 $script:HostedDnsHosts = @('procure', 'auth', 'dashboard')
 $script:HostedCloudflareZoneId = '93c854c6f17e0cbb8f2b7e9395f7828c'
+# The hosted ghcr-pull Secret holds a classic read-only PAT (read:packages, user modefan; DEMO PASSWORDS.txt "GitHub Container Registry
+# (GHCR)", user env var GHCR_READ_TOKEN). It expires on this date: while the packages are private an expired token makes the next hosted
+# deploy fail with ImagePullBackOff (running pods keep their cached images). Test-HostBaseline.ps1 warns 21 days before and fails after.
+# Renew: a new token with the same scope (CLAUDE.md learning 2026-11-07), DEMO PASSWORDS.txt and the env var, new-secrets.ps1 -Environment
+# hosted, then this date. Not needed once the packages are public (plan 08 Task 17).
+$script:GhcrPullTokenExpires = [datetime] '2027-02-05'
 
 # kubectl and helm arguments that select the cluster; every kubectl/helm call of the bootstrap uses them (never the current context).
 $script:KubectlArgs = @('--context', $script:KubeContext)
@@ -436,13 +442,68 @@ function Set-DemoPasswordEntry {
             $lines.Insert($at, $entry)
         }
     }
-    # Never truncate the only store of every credential in place (re-review R2): write a temporary file next to it, then swap it in;
-    # File.Replace keeps the previous version as '<file>.bak'.
+    Write-DemoPasswordsFile -Lines $lines -Path $Path
+}
+
+function Write-DemoPasswordsFile {
+    # Writes DEMO PASSWORDS.txt (CRLF, no BOM). Never truncates the only store of every credential in place (re-review R2): writes a
+    # temporary file next to it, then swaps it in. File.Replace keeps the previous version as '<file>.bak' while it swaps; after a
+    # successful swap the .bak is deleted, so no second plaintext copy of every credential stays on the Desktop (plan 08 fix wave ruling
+    # R3). Only a failed swap leaves it, for recovery.
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [System.Collections.Generic.List[string]] $Lines, [Parameter(Mandatory)] [string] $Path)
     $temporary = "$Path.tmp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $backup = "$Path.bak"
     try {
-        [IO.File]::WriteAllText($temporary, (($lines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
-        if (Test-Path $Path) { [IO.File]::Replace($temporary, $Path, "$Path.bak") } else { [IO.File]::Move($temporary, $Path) }
+        [IO.File]::WriteAllText($temporary, (($Lines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
+        if (Test-Path $Path) { [IO.File]::Replace($temporary, $Path, $backup) } else { [IO.File]::Move($temporary, $Path) }
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $backup) { throw "Could not delete $backup (a plaintext copy of the old file); delete it by hand." }
     } finally {
         Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue
     }
+}
+
+function Sync-DemoPasswordSection {
+    # Puts every "<label>: <value>" of -Entries (ordered label -> value) into the section "=== <Section>..." of DEMO PASSWORDS.txt: a line
+    # whose text (indent ignored) starts with exactly "<label>: " is replaced, a missing one is added at the end of the section (the section
+    # at the end of the file when there is none). Writes the file once, and only when something changed. Returns the number of entries
+    # added or changed; prints nothing about the values. Used by new-secrets.ps1 to keep the copy of a user-secrets store current (Dale's
+    # rule 2026-11-07: every generated secret has its value in DEMO PASSWORDS.txt; plan 08 final review B M4).
+    param(
+        [Parameter(Mandatory)] [string] $Section,
+        [Parameter(Mandatory)] [System.Collections.IDictionary] $Entries,
+        [string] $Path = $script:DemoPasswordsFile
+    )
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if (Test-Path $Path) { foreach ($line in [IO.File]::ReadAllLines($Path)) { $lines.Add($line) } }
+    $header = "=== $Section"
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith($header)) { $start = $i; break } }
+    if ($start -lt 0) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -ne '') { $lines.Add('') }
+        $lines.Add("$header ===")
+        $start = $lines.Count - 1
+    }
+    $changed = 0
+    foreach ($label in $Entries.Keys) {
+        $value = "$($Entries[$label])"
+        if ($value -match '[
+]') { throw "The value of '$label' must be one line." }
+        $entry = "$($label): $value"
+        $end = $lines.Count
+        for ($i = $start + 1; $i -lt $lines.Count; $i++) { if ($lines[$i].StartsWith('===')) { $end = $i; break } }
+        $found = -1
+        for ($i = $start + 1; $i -lt $end; $i++) { if ($lines[$i].TrimStart().StartsWith("$($label): ", [StringComparison]::Ordinal)) { $found = $i; break } }
+        if ($found -ge 0) {
+            if ($lines[$found].TrimStart() -ceq $entry) { continue }
+            $lines[$found] = $entry
+        } else {
+            $at = $end
+            while ($at - 1 -gt $start -and $lines[$at - 1] -eq '') { $at-- }
+            $lines.Insert($at, $entry)
+        }
+        $changed++
+    }
+    if ($changed -gt 0) { Write-DemoPasswordsFile -Lines $lines -Path $Path }
+    $changed
 }

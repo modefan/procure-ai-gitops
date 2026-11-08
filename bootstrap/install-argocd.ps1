@@ -150,7 +150,9 @@ if (@(($repoSecrets | ConvertFrom-Json) | Where-Object name -eq 'GITOPS_DEPLOY_K
 $appsValues = Get-Content -Raw (Join-Path $repoRoot 'apps/values.yaml')
 if ($appsValues -notmatch '(?m)^\s+chartVersion:\s*"?([0-9][0-9A-Za-z.\-]*)"?\s*$') { throw 'argocd.chartVersion not found in apps/values.yaml.' }
 $chartVersion = $Matches[1]
-$chartRepo = 'https://argoproj.github.io/argo-helm'
+# The chart's OCI copy (apps/values.yaml argocd.chartRepo, the argocd Application reads the same registry).
+if ($appsValues -notmatch '(?m)^\s+chartRepo:\s*"?([^"\s#]+)"?') { throw 'argocd.chartRepo not found in apps/values.yaml.' }
+$chartRef = "oci://$($Matches[1])/argo-cd"
 
 # The environment's switches (argocd.adminEnabled, argocd.ingressEnabled: apps/values.yaml, overridden by envs/<env>/apps.yaml) as the
 # argocd Application passes them (apps/templates/applications.yaml), so the first install is never more open than what follows it.
@@ -173,7 +175,7 @@ $adminEnabled = Get-ArgoCdSwitch 'adminEnabled'
 $ingressEnabled = Get-ArgoCdSwitch 'ingressEnabled'
 
 Write-Host "Installing Argo CD (chart argo-cd $chartVersion; admin user $(if ($adminEnabled) { 'on' } else { 'off' }), ingress $(if ($ingressEnabled) { 'on' } else { 'off' }))..."
-$out = & helm @HelmArgs upgrade --install argocd argo-cd --repo $chartRepo --version $chartVersion `
+$out = & helm @HelmArgs upgrade --install argocd $chartRef --version $chartVersion `
     --namespace argocd -f (Join-Path $repoRoot 'argocd/values.yaml') -f (Join-Path $envDir 'argocd.yaml') `
     --set "configs.cm.admin\.enabled=$($adminEnabled.ToString().ToLowerInvariant())" `
     --set "server.ingress.enabled=$($ingressEnabled.ToString().ToLowerInvariant())" --wait --timeout 10m 2>&1

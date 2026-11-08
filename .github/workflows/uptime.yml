@@ -1,17 +1,21 @@
 # Uptime check of the public live demo (plan 08 Task 13). The only workflow in this repo: the GitOps repo has no CI (Argo CD reads it).
 #
-# OFF while the repos are private: a private repo's scheduled runs use the account's free Actions minutes (2 000 a month, procure-ai's CI
-# needs them), so the schedule below is commented out. Plan 08 Task 17 (go public) uncomments it; public repos run Actions for free.
-# `workflow_dispatch` stays, for a manual run (about one minute).
+# While the repos are private a scheduled run uses the account's free Actions minutes (2 000 a month, procure-ai's CI needs them), so
+# the schedule runs once a day (about 30 minutes a month; plan 08 fix wave ruling R2). Plan 08 Task 17 (go public) moves it to every
+# 30 minutes; public repos run Actions for free. `workflow_dispatch` stays, for a manual run (about one minute).
 #
-# A failed run e-mails the repo owner (GitHub's default notification for failed workflow runs). GitHub turns off a public repo's schedules
+# Besides the hosts answering, it checks the Let's Encrypt certificate of every public host: fewer than 21 days left fails the run.
+# cert-manager renews at 30 days, so a failure here means renewal has been failing for 9 days and there is still a week to fix it before
+# browsers (HSTS: no click-through) refuse the site. Let's Encrypt sends no expiry e-mails any more, so this is the only warning.
+#
+# A failed run e-mails the repo owner (GitHub's default notification for failed workflow runs). GitHub turns off a repo's schedules
 # after 60 days without any commit; a commit (e.g. the publish workflow's release bump) re-arms it.
 name: uptime
 
 on:
-  # UPTIME-OFF until public (Task 17): uncomment the schedule.
-  # schedule:
-  #   - cron: "7,37 * * * *" # every 30 minutes, off the full hour (GitHub delays runs at :00 most)
+  schedule:
+    # Daily while private (ruling R2). Task 17 (go public): "7,37 * * * *", every 30 minutes, off the full hour (GitHub delays :00 most).
+    - cron: "17 5 * * *" # 07:17 in South Africa (UTC+2)
   workflow_dispatch:
 
 permissions: {}
@@ -59,4 +63,31 @@ jobs:
           if grep -qF '"enabled":false' body.txt 2>/dev/null; then
             echo "::notice title=Demo switched off::The demo switch is off (maintenance page shown on purpose)."
           fi
+          exit $fail
+
+      - name: Certificates have at least 21 days left
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          min_days=21
+          for host in procure.daleabels.com auth.daleabels.com dashboard.daleabels.com; do
+            # -servername: SNI, so Traefik picks the host's certificate (the default certificate otherwise).
+            pem=$(openssl s_client -connect "$host:443" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null) || pem=""
+            if [[ -z "$pem" ]]; then
+              echo "::error title=$host certificate unreadable::no TLS certificate from $host:443"
+              fail=1
+              continue
+            fi
+            end=$(openssl x509 -noout -enddate <<<"$pem" | cut -d= -f2)
+            days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+            issuer=$(openssl x509 -noout -issuer <<<"$pem")
+            if ! openssl x509 -noout -checkend $(( min_days * 86400 )) <<<"$pem" >/dev/null; then
+              echo "::error title=$host certificate expires soon::$days days left (expires $end; renewal is due at 30). Check cert-manager: kubectl -n ingress-tls describe certificate"
+              fail=1
+            else
+              echo "ok   $host: certificate valid for $days more days ($issuer)"
+            fi
+          done
           exit $fail

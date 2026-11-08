@@ -53,7 +53,11 @@ argocd:
   enabled: true
   namespace: argocd
   wave: -2
-  chartRepo: https://argoproj.github.io/argo-helm
+  # The chart's OCI copy on GitHub Container Registry, published by the argo-helm project with every release (10.11.7 there is byte for
+  # byte the release on argoproj.github.io, checked 2026-11-08). Not the GitHub Pages index: its 504s made cold renders time out (plan 08
+  # fix wave, known item 2). No oci:// prefix: Argo CD treats a scheme-less repoURL with a chart as an OCI registry
+  # (helm.IsHelmOciRepo) and needs no repository Secret for a public one. bootstrap/install-argocd.ps1 installs from the same place.
+  chartRepo: ghcr.io/argoproj/argo-helm
   chart: argo-cd
   # Argo CD v3.5.7. bootstrap/install-argocd.ps1 reads this line for the first install, so both always match.
   chartVersion: 10.11.7

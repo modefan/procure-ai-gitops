@@ -43,6 +43,10 @@
     letters and digits; the admin API key 64, its SHA-256 derived from it; the MongoDB keyfile 48 random bytes in base64) and kept, so a
     second run changes nothing. Rotate a value by removing it from that store (dotnet user-secrets remove --id procure-ai-hosted
     Parameters:<name>) and running the script again, then restart the pods that use it.
+
+    Every run also copies every value of the store into DEMO PASSWORDS.txt (Sync-DemoPasswordSection in common.ps1; section "procure-ai
+    hosted (Contabo) secrets" or "procure-ai local: all AppHost user secrets"), so a generated or rotated value is never only in the store.
+    The file is rewritten only when a value changed, and no .bak copy stays behind.
 #>
 [CmdletBinding()]
 param(
@@ -124,6 +128,22 @@ function Get-Parameter([string] $name, $default = $null) {
 
 $missing = @($required | Where-Object { [string]::IsNullOrEmpty($secrets["Parameters:$_"]) })
 if ($missing) { throw "$storeName missing: $(($missing | ForEach-Object { "Parameters:$_" }) -join ', '). Run the AppHost once, then this script again." }
+
+# The copy in DEMO PASSWORDS.txt (Dale's rule 2026-11-07: every generated secret has its value there, and the copy follows every
+# regeneration; plan 08 final review B M4): every value of the store, written into its section on every run (the file is rewritten only
+# when a value differs or is new). Hosted: "procure-ai hosted (Contabo) secrets", labels without the Parameters: prefix; local: "procure-ai
+# local: all AppHost user secrets", labels as the store's keys. Prints only how many entries changed.
+$demoEntries = [ordered]@{}
+if ($hosted) {
+    $demoSection = 'procure-ai hosted (Contabo) secrets'
+    foreach ($key in $secrets.Keys | Where-Object { $_ -like 'Parameters:*' } | Sort-Object) { $demoEntries[$key.Substring('Parameters:'.Length)] = $secrets[$key] }
+} else {
+    $demoSection = 'procure-ai local: all AppHost user secrets'
+    # Aspire's own bookkeeping (Aspire:VersionCheck:*) is not a secret.
+    foreach ($key in $secrets.Keys | Where-Object { $_ -like 'Parameters:*' -or $_ -like 'AppHost:*' } | Sort-Object) { $demoEntries[$key] = $secrets[$key] }
+}
+$demoChanged = Sync-DemoPasswordSection -Section $demoSection -Entries $demoEntries
+Write-Host "DEMO PASSWORDS.txt, section '$demoSection': $demoChanged of $($demoEntries.Count) entries added or updated (values not shown)."
 
 # User names: the AppHost sets none, so Aspire's defaults apply (an override in the user secrets wins, as in the AppHost).
 $rabbitUser = Get-Parameter 'rabbitmq-username' 'guest'

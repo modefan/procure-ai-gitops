@@ -31,7 +31,7 @@ if (-not $Chart) {
     $Chart = Join-Path $cache "argo-cd-$version.tgz"
     if (-not (Test-Path $Chart)) {
         $pullDir = Join-Path ([IO.Path]::GetTempPath()) "argo-cd-$version-$([guid]::NewGuid().ToString('N').Substring(0, 6))"
-        & helm pull argo-cd --repo https://argoproj.github.io/argo-helm --version $version -d $pullDir | Out-Null
+        & helm pull oci://ghcr.io/argoproj/argo-helm/argo-cd --version $version -d $pullDir | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "helm pull argo-cd $version failed." }
         $Chart = Join-Path $pullDir "argo-cd-$version.tgz"
     }
