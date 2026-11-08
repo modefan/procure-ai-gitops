@@ -14,11 +14,22 @@
        host name, verified against Git for Windows' CA bundle with openssl (not .NET: ESET on this PC intercepts TLS from pwsh), and
        valid for at least 14 more days (cert-manager renews 30 days before the end).
     6. Keycloak's public host serves only the procure realm and static resources: /admin, /admin/master/console/, the master realm's
-       discovery and token endpoints, the welcome page and /metrics answer 404; the procure realm's discovery answers 200 with issuer
-       https://auth.<domain>/realms/procure.
+       discovery and token endpoints, the welcome page and /metrics answer 404, also when reached by path tricks (/realms/procure/../master
+       sent as is, /realms/procure/%2e%2e/master, /realms//master, /resources/%2e%2e/admin); the procure realm's discovery answers 200 with
+       issuer https://auth.<domain>/realms/procure.
     7. No other site answers on 443: Argo CD and Mailpit host names (hosted and local spellings) and the bare IP give Traefik's 404.
     8. The dashboard redirects to Keycloak's sign-in for client aspire-dashboard, and its telemetry API answers 404.
-    9. The app (https://procure.<domain>/) answers 200.
+    9. The app (https://procure.<domain>/) answers 200. Every host sends Strict-Transport-Security (max-age at least 180 days, no preload),
+       and no Server header names a version (nginx/1.2.3).
+   10. The client address (Review Focus 5): Traefik must see the visitor's own address, not a ServiceLB or node address (k3s's svclb pod
+       masquerades). Through the SSH tunnel (kubectl), a throwaway namespace gets an echo pod (traefik/whoami) behind an Ingress on a random
+       path of the app host; one request from this PC must come back with X-Forwarded-For equal to this PC's public IPv4 address (asked from
+       https://api.ipify.org). Prints only "matches" or the kind of address seen, never an address. The namespace is deleted afterwards.
+       -SkipClientAddress leaves it out (no tunnel at hand).
+    Not covered: UDP, and the VM's IPv6 address from outside (Test-HostBaseline checks the listeners and [v6]:80/443 from the VM itself).
+    The port scan has no second pass (both firewalls drop, so every closed port times out and a second pass would be the whole scan again):
+    a port whose SYN-ACK arrives later than -PortTimeoutMs counts as closed. To keep the VM's and Contabo's SYN handling from delaying
+    answers, it connects in batches of -PortBatchSize (128: about 80 s) rather than in one burst; 22/80/443 must answer in the same batches.
     Nothing secret is used. Exit code 1 on any failure.
 .EXAMPLE
     ./tests/Test-PublicSurface.ps1                 # daleabels.com, production certificates
@@ -37,6 +48,11 @@ param(
     # Skip the port scan (about 20 s).
     [switch] $SkipPortScan,
     [int] $PortTimeoutMs = 2500,
+    # Parallel connects per batch of the port scan.
+    [ValidateRange(1, 1024)] [int] $PortBatchSize = 128,
+    # Skip step 10 (needs the hosted kubeconfig and the SSH tunnel; opened when it is not up).
+    [switch] $SkipClientAddress,
+    [string] $EchoImage = 'traefik/whoami:v1.12.0',
     [int] $MinCertDays = 14
 )
 
@@ -60,7 +76,7 @@ New-Item -ItemType Directory -Path $work | Out-Null
 
 function Invoke-Http {
     # One request, no redirect followed, certificate not checked (step 5 checks certificates with openssl). Returns @{ Status; Location;
-    # Body }. -Resolve sends the request for $Url's host to the VM's address (also for names without DNS records).
+    # Body; Headers }. -Resolve sends the request for $Url's host to the VM's address (also for names without DNS records).
     param([Parameter(Mandatory)] [string] $Url, [string] $Method = 'GET', [switch] $Resolve, [string[]] $Extra = @())
     $bodyFile = Join-Path $work 'body.txt'; $headerFile = Join-Path $work 'headers.txt'
     Remove-Item $bodyFile, $headerFile -ErrorAction SilentlyContinue
@@ -71,7 +87,8 @@ function Invoke-Http {
     $location = Get-Content $headerFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '^location:\s*(.+)$' } |
         ForEach-Object { $Matches[1].Trim() } | Select-Object -Last 1
     $body = if (Test-Path $bodyFile) { Get-Content -Raw $bodyFile } else { "$out" }
-    [pscustomobject]@{ Status = $status; Location = $location; Body = "$body" }
+    $headers = @(Get-Content $headerFile -ErrorAction SilentlyContinue | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    [pscustomobject]@{ Status = $status; Location = $location; Body = "$body"; Headers = $headers }
 }
 
 try {
@@ -95,11 +112,11 @@ try {
             6444, 7946, 8000, 8008, 8025, 8080, 8081, 8443, 8472, 8888, 9000, 9090, 9093, 9100, 9200, 9300, 9443, 10248, 10249, 10250,
             10251, 10252, 10255, 10256, 10257, 10259, 15672, 16443, 18080, 18888, 25672, 27017, 50000, 51820) { [void] $ports.Add($p) }
         foreach ($p in 30000..32767) { [void] $ports.Add($p) }
-        Write-Step "Port scan of $Ip ($($ports.Count) TCP ports, connect with a $PortTimeoutMs ms timeout)"
+        Write-Step "Port scan of $Ip ($($ports.Count) TCP ports in batches of $PortBatchSize, connect with a $PortTimeoutMs ms timeout)"
         $open = [System.Collections.Generic.List[int]]::new()
         $all = @($ports)
-        for ($i = 0; $i -lt $all.Count; $i += 512) {
-            $batch = @(foreach ($port in $all[$i..([Math]::Min($i + 511, $all.Count - 1))]) {
+        for ($i = 0; $i -lt $all.Count; $i += $PortBatchSize) {
+            $batch = @(foreach ($port in $all[$i..([Math]::Min($i + $PortBatchSize - 1, $all.Count - 1))]) {
                     $client = [System.Net.Sockets.TcpClient]::new()
                     [pscustomobject]@{ Port = $port; Client = $client; Task = $client.ConnectAsync($Ip, $port) }
                 })
@@ -154,9 +171,17 @@ try {
     # --- 6. Keycloak: the procure realm and static resources only ---------------------------------------------------------------------
     Write-Step "Keycloak's public paths (https://$KeycloakHost)"
     foreach ($path in '/admin', '/admin/', '/admin/master/console/', '/admin/realms/procure/users', '/realms/master/.well-known/openid-configuration',
-        '/realms/master/account', '/', '/metrics', '/health/ready', '/js/keycloak.js') {
-        $r = Invoke-Http "https://$KeycloakHost$path"
+        '/realms/master/account', '/', '/metrics', '/health/ready', '/js/keycloak.js',
+        # Path tricks (Task 12 review): dot segments sent as is (curl --path-as-is; curl folds them otherwise), encoded dots, empty segments.
+        '/realms/procure/../master/.well-known/openid-configuration', '/realms/procure/%2e%2e/master/.well-known/openid-configuration',
+        '/realms/procure/%2E%2E/master/account', '/realms//master/.well-known/openid-configuration', '/realms/procure/..%2fmaster/account',
+        '/resources/../admin/master/console/', '/resources/%2e%2e/admin/master/console/') {
+        $r = Invoke-Http "https://$KeycloakHost$path" -Extra @('--path-as-is')
         if ($r.Status -eq 404) { Pass "$path answers 404" } else { Fail "https://$KeycloakHost$path answered $($r.Status), expected 404 (not a public path)" }
+    }
+    foreach ($path in '/realms/procure/../master/protocol/openid-connect/token', '/realms//master/protocol/openid-connect/token') {
+        $r = Invoke-Http "https://$KeycloakHost$path" -Method POST -Extra @('--path-as-is', '--data', 'grant_type=password&client_id=admin-cli&username=x&password=x')
+        if ($r.Status -eq 404) { Pass "POST $path answers 404" } else { Fail "POST https://$KeycloakHost$path answered $($r.Status), expected 404" }
     }
     $r = Invoke-Http "https://$KeycloakHost/realms/master/protocol/openid-connect/token" -Method POST -Extra @('--data', 'grant_type=password&client_id=admin-cli&username=x&password=x')
     if ($r.Status -eq 404) { Pass 'the master realm token endpoint answers 404 (no admin login from outside)' }
@@ -197,6 +222,91 @@ try {
     Write-Step "The app (https://$AppHost)"
     $r = Invoke-Http "https://$AppHost/"
     if ($r.Status -eq 200) { Pass "https://$AppHost/ answers 200" } else { Fail "https://$AppHost/ answered $($r.Status)" }
+
+    Write-Step 'HSTS and Server headers'
+    foreach ($url in "https://$AppHost/", "https://$KeycloakHost/realms/procure/.well-known/openid-configuration", "https://$DashboardHost/") {
+        $r = Invoke-Http $url
+        $sts = @($r.Headers | Where-Object { $_ -match '^strict-transport-security:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
+        $maxAge = if ("$($sts | Select-Object -First 1)" -match 'max-age=(\d+)') { [long] $Matches[1] } else { 0 }
+        if ($sts.Count -ge 1 -and $maxAge -ge 15552000 -and "$sts" -notmatch 'preload') { Pass "$url sends HSTS ($($sts[0]))" }
+        else { Fail "$url Strict-Transport-Security '$($sts -join ' | ')' (expected max-age >= 15552000, no preload)" }
+        $server = @($r.Headers | Where-Object { $_ -match '^server:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
+        if (@($server | Where-Object { $_ -match '\d+\.\d+' }).Count -eq 0) { Pass "$url names no server version ($(if ($server) { $server -join ', ' } else { 'no Server header' }))" }
+        else { Fail "$url Server header '$($server -join ', ')' names a version" }
+    }
+
+    # --- 10. The client address Traefik sees ------------------------------------------------------------------------------------------
+    if (-not $SkipClientAddress) {
+        Write-Step 'The client address Traefik sees (echo pod through the tunnel)'
+        Select-ProcureCluster hosted
+        Assert-ClusterReachable
+        $probeNs = 'client-ip-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $probePath = '/__client-address-' + [guid]::NewGuid().ToString('N')
+        $manifest = @"
+apiVersion: v1
+kind: Namespace
+metadata: {name: $probeNs, labels: {app.kubernetes.io/managed-by: test-public-surface}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: echo, namespace: $probeNs, labels: {app: echo}}
+spec:
+  automountServiceAccountToken: false
+  securityContext: {runAsNonRoot: true, runAsUser: 65534, seccompProfile: {type: RuntimeDefault}}
+  containers:
+  - name: echo
+    image: $EchoImage
+    args: ["--port", "8080"]
+    ports: [{containerPort: 8080}]
+    resources: {requests: {cpu: 5m, memory: 16Mi}, limits: {memory: 32Mi}}
+    securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo, namespace: $probeNs}
+spec: {selector: {app: echo}, ports: [{port: 80, targetPort: 8080}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: echo, namespace: $probeNs}
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: $AppHost
+    http:
+      paths:
+      - {path: $probePath, pathType: Exact, backend: {service: {name: echo, port: {number: 80}}}}
+"@
+        try {
+            $applyOut = $manifest | & kubectl @KubectlArgs apply -f - 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "kubectl apply of the echo probe failed: $($applyOut -join ' ')" }
+            Invoke-Kubectl -n $probeNs wait pod/echo --for=condition=Ready --timeout=120s | Out-Null
+            $mine = (& $curl -sS --ssl-no-revoke --max-time 20 -4 https://api.ipify.org 2>$null | Out-String).Trim()
+            if ($mine -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { throw "could not learn this PC's public IPv4 address from api.ipify.org" }
+            $r = $null
+            foreach ($attempt in 1..15) {
+                # Traefik picks up a new Ingress within a few seconds; until then the path is the app's (an HTML page, no echo lines).
+                $r = Invoke-Http "https://$AppHost$probePath"
+                if ($r.Status -eq 200 -and $r.Body -match '(?m)^Hostname: echo') { break }
+                Start-Sleep -Seconds 2
+            }
+            if (-not ($r.Status -eq 200 -and $r.Body -match '(?m)^Hostname: echo')) { throw "the echo path answered $($r.Status) without the echo body" }
+            $seen = @(($r.Body -split "`r?`n") | Where-Object { $_ -match '^X-Forwarded-For:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
+            $kind = switch -Regex ("$($seen | Select-Object -First 1)") {
+                '^10\.42\.' { 'a pod address (ServiceLB masquerade)'; break }
+                '^10\.' { 'a private 10/8 address (node or service network)'; break }
+                '^(172\.(1[6-9]|2\d|3[01])|192\.168)\.' { 'a private address'; break }
+                '^$' { 'no X-Forwarded-For'; break }
+                default { 'another public address' }
+            }
+            if ($seen.Count -eq 1 -and $seen[0] -eq $mine) { Pass "Traefik sees this PC's public address (X-Forwarded-For matches api.ipify.org)" }
+            else { Fail "Traefik saw $kind, not this PC's public address: every visitor would share one rate-limit partition" }
+        } catch {
+            Fail "client address check: $($_.Exception.Message)"
+        } finally {
+            & kubectl @KubectlArgs delete namespace $probeNs --wait=false --ignore-not-found 2>&1 | Out-Null
+        }
+    }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
