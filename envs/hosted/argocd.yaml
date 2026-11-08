@@ -7,11 +7,11 @@ configs:
     # (bootstrap/hosted/open-argocd.ps1, 127.0.0.1:8080). The OIDC redirect URIs are <url>/auth/callback and <url>/pkce/verify, which the
     # Keycloak client `argocd` allows (platform chart keycloak.argocdUrl, default http://127.0.0.1:8080: keep both equal).
     url: http://127.0.0.1:8080
-    # Keycloak sign-in (see the header of argocd/values.yaml): the public realm at auth.daleabels.com (Let's Encrypt certificate; the
+    # Keycloak sign-in (see the header of argocd/values.yaml): realm ops (not the demo realm; ruling R6c) at auth.daleabels.com (Let's Encrypt certificate; the
     # server reaches it through the CoreDNS rewrite, bootstrap/hosted/coredns-custom.yaml). Public client with PKCE, no client secret.
     oidc.config: |
       name: Keycloak
-      issuer: https://auth.daleabels.com/realms/procure
+      issuer: https://auth.daleabels.com/realms/ops
       clientID: argocd
       enablePKCEAuthentication: true
       requestedScopes: ["openid", "profile"]

@@ -1,25 +1,28 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Gives a person's own Keycloak user Argo CD's admin role: creates the user in realm procure when it does not exist (password asked for
-    here, never shown or stored), and puts it in the group argocd-admins (plan 08 Task 12c).
+    Gives a person's own Keycloak user Argo CD's admin role: creates the user in realm ops when it does not exist (password asked for
+    here, never shown or stored), and puts it in the group argocd-admins (plan 08 Task 12c; realm ops since fix wave ruling R6c).
+    Realm ops is Argo CD's directory only: not the public demo realm `procure` (shared demo users, no lockout), but its own realm with
+    brute-force lockout and an authenticator app (OTP) required for every user; no demo user and no service of the app exists there.
 .DESCRIPTION
     For Dale's own user (CLAUDE.md "Hosting plan": he picks the user name and password himself; Claude does not create it). Keycloak's
-    admin console is not reachable on the hosted VM (the public host serves /realms/procure/ only, and the console always sends the browser
-    to that public host), so this script uses Keycloak's own admin CLI (kcadm.sh) inside the Keycloak pod, through the SSH tunnel:
+    admin console is not reachable on the hosted VM (the public host serves /realms/procure/ and /realms/ops/ only, and the console always
+    sends the browser to that public host), so this script uses Keycloak's own admin CLI (kcadm.sh) inside the Keycloak pod, through the SSH tunnel:
       - signs in to the master realm as the bootstrap admin from the pod's own environment (KC_CLI_PASSWORD, so no admin password leaves
         the cluster or appears on a command line),
-      - creates the user (enabled, e-mail verified, in no organization, so it is not a tenant user of the demo) and sets its password,
-        which goes to the pod on kubectl's stdin and to Keycloak on kcadm's stdin (never on a command line),
+      - creates the user (enabled, e-mail verified) and sets its password, which goes to the pod on kubectl's stdin and to Keycloak on
+        kcadm's stdin (never on a command line),
+      - makes sure the user must set up an authenticator app at the next sign-in (required action Configure OTP) unless it already has
+        one; from then on every sign-in asks for the 6-digit code,
       - adds it to argocd-admins and prints the group's members (names only).
     The realm uses the e-mail address as the user name (registrationEmailAsUsername), so -UserName is that address (-Email, if given, must
     be the same address).
 
-    Demo users can never become admins this way (review I1): argocd-admins is all that separates the public demo accounts from Argo CD's
-    role:admin once someone has the tunnel. The script refuses, before changing anything, a user
-      - with an address in a demo domain (*.test: every user of the realm file and of the demo tenants), or a service account,
-      - with one of the realm file's fixed IDs (00000000-0000-4000-8000-...),
-      - who is a member of any organization (every demo and tenant user is; your own user is created in none),
+    No demo identity can become an admin this way (review I1). The demo users live in the other realm, and the script still refuses,
+    before changing anything, a user
+      - with an address in a demo domain (*.test: every user of the demo realm file and of the demo tenants), or a service account,
+      - with one of the demo realm file's fixed IDs (00000000-0000-4000-8000-...),
       - found only through a different identifier (-UserName and -Email naming different addresses, or a user whose user name is not
         the address given: the old e-mail fallback could promote tom@acme.test for a typo).
     tests/Test-AddArgocdAdmin.ps1 proves each refusal against the live Keycloak.
@@ -77,10 +80,10 @@ K="/opt/keycloak/bin/kcadm.sh"
 IFS= read -r CRED || true
 CRED=${CRED%$'\r'}   # PowerShell ends the piped line with CRLF
 KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" $K config credentials --config "$cfg" --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" </dev/null >/dev/null 2>&1 || { echo "admin sign-in to Keycloak (master realm) failed"; exit 2; }
-kc() { $K "$@" --config "$cfg" -r procure; }
+kc() { $K "$@" --config "$cfg" -r ops; }
 ACTION=$1; NAME=$2
 GID=$(kc get groups -q exact=true -q search=argocd-admins --fields id,name --format csv --noquotes | while IFS=, read -r id name; do [ "$name" = argocd-admins ] && echo "$id"; done || true)
-[ -n "$GID" ] || { echo "group argocd-admins not found in realm procure (realm file not applied yet?)"; exit 3; }
+[ -n "$GID" ] || { echo "group argocd-admins not found in realm ops (ops-realm.json not applied yet?)"; exit 3; }
 # Exact lookups by user name and by e-mail: both must find the same user (or none).
 BYNAME=$(kc get users -q exact=true -q username="$NAME" --fields id --format csv --noquotes)
 BYMAIL=$(kc get users -q exact=true -q email="$NAME" --fields id --format csv --noquotes)
@@ -103,11 +106,6 @@ else
     USERCSV=$(kc get "users/$UIDV" --fields username,email --format csv --noquotes)
     case "$USERCSV" in *.test|*.test,*) refuse "demo domain: the user's address is a *.test address";; esac
     case "$UIDV" in 00000000-0000-4000-8000-*) refuse "realm-file ID: $UIDV is a fixed ID of the realm file's demo users";; esac
-    # Fails closed (re-review R1): a failed lookup stops the script; anything but an empty list refuses.
-    ORGS=$(kc get "organizations/members/$UIDV/organizations" --fields alias) || { echo "organization lookup for $NAME failed: refusing, because it cannot be shown that the user is in no organization. Nothing changed."; exit 7; }
-    if [ "$(printf '%s' "$ORGS" | tr -d ' \t\r\n')" != "[]" ]; then
-      refuse "organization member: the user belongs to an organization (a demo or tenant user)"
-    fi
   fi
   if [ -n "$reasons" ]; then
     echo "REFUSED: $NAME is not made an Argo CD admin. Reasons:$reasons"
@@ -130,7 +128,14 @@ else
     printf '%s' "$CRED" | kc update "users/$UIDV/reset-password" -f -
     echo "password set"
   fi
-  kc update "users/$UIDV/groups/$GID" -s realm=procure -s userId="$UIDV" -s groupId="$GID" -n
+  # An authenticator app is required (ruling R6c): without an OTP credential yet, the next sign-in asks to set one up first.
+  if kc get "users/$UIDV/credentials" --fields type --format csv --noquotes | grep -qx otp; then
+    echo "authenticator app already set up"
+  else
+    kc update "users/$UIDV" -s 'requiredActions=["CONFIGURE_TOTP"]'
+    echo "the first sign-in asks to set up an authenticator app (Configure OTP)"
+  fi
+  kc update "users/$UIDV/groups/$GID" -s realm=ops -s userId="$UIDV" -s groupId="$GID" -n
   echo "$NAME is in argocd-admins"
 fi
 echo "members of argocd-admins:"
@@ -163,5 +168,5 @@ try {
 $out | Write-Host
 if (-not $Remove) {
     $where = if ($Environment -eq 'hosted') { 'bootstrap/hosted/open-argocd.ps1, then "Log in via Keycloak"' } else { 'https://argocd.procure.localtest.me, "Log in via Keycloak"' }
-    Write-Host "Done. Sign in to Argo CD: $where."
+    Write-Host "Done. Sign in to Argo CD: $where (realm ops: password, then the authenticator app's code; the first time it asks you to scan a QR code)."
 }

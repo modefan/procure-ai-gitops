@@ -24,9 +24,12 @@ keycloak:
   ingress:
     # Plan 08 ruling 4: only Keycloak's public paths of the procure realm (no admin console, admin REST API, master realm or welcome page).
     publicPathsOnly: true
-    # Plan 08 fix wave ruling R6b: per-client-address rate limits on the procure realm's sign-in paths (numbers: the chart's defaults,
-    # deploy/charts/procure-platform/values.yaml keycloak.ingress.rateLimit). Keycloak's own brute-force lockout stays off: it let anyone
-    # keep the shared demo users locked.
+    # The demo realm and realm ops (Argo CD's sign-in, ruling R6c: the browser opens its login page at auth.daleabels.com/realms/ops/;
+    # brute-force lockout and an authenticator app protect it). Never master.
+    publicRealms: [procure, ops]
+    # Plan 08 fix wave rulings R6b/R6c: per-client-address rate limits on every path of the Keycloak host, the token endpoints with their
+    # own higher limit (numbers: the chart's defaults, deploy/charts/procure-platform/values.yaml keycloak.ingress.rateLimit). The demo
+    # realm's own brute-force lockout stays off (it let anyone keep the shared demo users locked); realm ops has one.
     rateLimit:
       enabled: true
 

@@ -11,7 +11,7 @@ configs:
     # defines no `email` or `groups` scope; the client's own mappers put sub, preferred_username, name, email and groups into the ID token.
     oidc.config: |
       name: Keycloak
-      issuer: https://auth.procure.localtest.me/realms/procure
+      issuer: https://auth.procure.localtest.me/realms/ops
       clientID: argocd
       enablePKCEAuthentication: true
       requestedScopes: ["openid", "profile"]

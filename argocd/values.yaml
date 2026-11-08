@@ -10,9 +10,10 @@
 # second values file of both (plan 08 Task 12c).
 #
 # Who may do what (plan 08 Task 12c; CLAUDE.md "Hosting plan", Dale 2026-11-08):
-#   people        sign in with Keycloak (realm procure, public client `argocd`, code flow + PKCE, no client secret). Only members of the
-#                 Keycloak group `argocd-admins` get role:admin; everyone else who can sign in (the public demo users) gets no role at
-#                 all (policy.default empty): no Application, project, log or action is visible to them.
+#   people        sign in with Keycloak: realm ops (fix wave ruling R6c), apart from the public demo realm, with brute-force lockout and
+#                 an authenticator app (OTP) required; public client `argocd`, code flow + PKCE, no client secret. Only members of the
+#                 group `argocd-admins` get role:admin; anyone else who can sign in gets no role at all (policy.default empty): no
+#                 Application, project, log or action is visible to them. Users: bootstrap/add-argocd-admin.ps1.
 #   admin         the local admin login, break-glass for when Keycloak is down (admin.enabled per environment; password in Secret
 #                 argocd/argocd-initial-admin-secret, copied to DEMO PASSWORDS.txt).
 #   claude        a local account with an API key only (no UI login), role:admin, so Claude can do every admin function without Keycloak;
