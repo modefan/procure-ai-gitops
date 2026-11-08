@@ -24,6 +24,14 @@
     -Environment hosted works with -WatchOnly only (the hosted VM is never deleted by a test): it watches the hosted cluster through the
     SSH tunnel and reports the node's peak memory from `kubectl top node` instead of docker stats; the smoke checks run with
     -Environment hosted.
+
+    Wave order (the apps sync a revision only after the platform's sync of it finished): checked on the last sync operations of platform
+    and procure-ai. A fresh cluster always has them. With -WatchOnly the last procure-ai sync may predate the watch (a reboot runs no sync):
+      - -Since <time> (e.g. the time the release bump was pushed): procure-ai must have synced at or after that time, otherwise the run
+        FAILS (the deploy being checked never synced); the platform's sync is reported as part of this deploy or not (an app-only change
+        does not re-sync the platform). Use it for every check of a deploy (the both-change path, plan 07 carry-over 27).
+      - without -Since: a procure-ai sync that started before the watch is reported as a WARNING ("wave order NOT CHECKED", also in the
+        summary), not a pass; the exit code stays 0 so reboot checks can use it.
 #>
 [CmdletBinding()]
 param(
@@ -32,6 +40,8 @@ param(
     # Skip the delete and bootstrap: only wait for, watch and smoke-check the running cluster (e.g. after a deploy, or to see the
     # failure checks work).
     [switch] $WatchOnly,
+    # -WatchOnly: the deploy being checked was pushed (or bumped) at this time; procure-ai must have synced since then (see Wave order).
+    [datetime] $Since,
     [int] $TimeoutMinutes = 15,
     [int] $StableSeconds = 120,
     [int] $CrashLoopMinutes = 4,
@@ -72,6 +82,7 @@ if ($apps -match '(?ms)^observability:\s*\n\s+(#[^\n]*\n\s+)*enabled:\s*true') {
 $script:peakNodeBytes = 0L
 $script:minFreeGB = [double]::MaxValue
 $script:convergedAfter = $null
+$script:waveOrderWarning = $null
 
 function ConvertFrom-DockerSize([string] $text) {
     if ($text -match '^([\d.]+)\s*([KMGT]i?B|B)$') {
@@ -109,6 +120,7 @@ function Write-Summary {
         else { Write-Host ("Node memory peak (docker stats): {0:N2} GiB of {1}." -f ($script:peakNodeBytes / 1GB), $NodeMemory) }
     }
     if ($script:minFreeGB -lt [double]::MaxValue) { Write-Host ("Windows free memory, lowest seen: {0:N1} GB." -f $script:minFreeGB) }
+    if ($script:waveOrderWarning) { Write-Host "WARNING: $($script:waveOrderWarning)" -ForegroundColor Yellow }
     if (Test-ClusterReachable) {
         $out = & kubectl @KubectlArgs -n argocd get applications -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,OPERATION:.status.operationState.phase,REVISION:.status.sync.revisions[0]' 2>&1
         Write-Host ($out -join "`n")
@@ -303,14 +315,25 @@ foreach ($name in 'platform', 'procure-ai') {
 }
 $platformDone = [datetimeoffset] $byName['platform'].status.operationState.finishedAt
 $appsStarted = [datetimeoffset] $byName['procure-ai'].status.operationState.startedAt
-if ($WatchOnly -and $appsStarted -lt [datetimeoffset] $suiteStart) {
-    # Nothing synced during this watch (e.g. after a VM reboot the pods restart but no sync runs): the last operations may come from
-    # different rollouts or a manual sync, so their order says nothing.
-    Write-Host "Wave order: no procure-ai sync during this watch (its last started $($appsStarted.ToLocalTime().ToString('HH:mm:ss'))); not checked."
+$platformStarted = [datetimeoffset] $byName['platform'].status.operationState.startedAt
+$hasSince = $PSBoundParameters.ContainsKey('Since')
+$windowStart = if ($hasSince) { [datetimeoffset] $Since } else { [datetimeoffset] $suiteStart }
+$fmt = { param($t) $t.ToLocalTime().ToString('HH:mm:ss') }
+if ($WatchOnly -and $appsStarted -lt $windowStart) {
+    if ($hasSince) {
+        # The deploy being checked never synced procure-ai: nothing about its wave order (or its rollout) was observed.
+        Stop-Test "no procure-ai sync since -Since $(& $fmt $windowStart) (its last started $(& $fmt $appsStarted)): the deploy was not checked"
+    }
+    # A reboot check: pods restart but no sync runs, so the last operations may come from different rollouts or a manual sync.
+    $script:waveOrderWarning = "wave order NOT CHECKED: procure-ai's last sync started $(& $fmt $appsStarted), before this watch; pass -Since <push time> to check a deploy."
+    Write-Host "WARNING: $($script:waveOrderWarning)" -ForegroundColor Yellow
 } elseif ($appsStarted -lt $platformDone) {
-    Stop-Test "procure-ai's sync started at $($appsStarted.ToLocalTime().ToString('HH:mm:ss')), before the platform's sync finished at $($platformDone.ToLocalTime().ToString('HH:mm:ss'))"
+    Stop-Test "procure-ai's sync started at $(& $fmt $appsStarted), before the platform's sync finished at $(& $fmt $platformDone)"
 } else {
-    Write-Host "Wave order ok: platform's sync finished $($platformDone.ToLocalTime().ToString('HH:mm:ss')), procure-ai's started $($appsStarted.ToLocalTime().ToString('HH:mm:ss')) (both at $($appRevision.Substring(0, 7)))."
+    $platformPart = if (-not $WatchOnly) { '' }
+        elseif ($platformStarted -ge $windowStart) { ' Both synced in this deploy (platform and app changed: the both-change path).' }
+        else { " The platform did not sync in this deploy (its last sync started $(& $fmt $platformStarted)): app-only change." }
+    Write-Host "Wave order ok: platform's sync finished $(& $fmt $platformDone), procure-ai's started $(& $fmt $appsStarted) (both at $($appRevision.Substring(0, 7))).$platformPart"
 }
 
 # --- 3. Stable: nothing restarts or drops out of Ready -------------------------------------------------------------------------------
@@ -344,5 +367,5 @@ Write-Step 'Test-Smoke.ps1'
 if ($LASTEXITCODE -ne 0) { Stop-Test 'smoke checks failed.' }
 
 Write-Summary
-Write-Host "`nFresh cluster converged on its own and passed the smoke checks." -ForegroundColor Green
+Write-Host "`nFresh cluster converged on its own and passed the smoke checks$(if ($script:waveOrderWarning) { ' (wave order NOT CHECKED, see the warning)' })." -ForegroundColor Green
 exit 0

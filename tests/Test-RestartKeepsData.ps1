@@ -25,6 +25,8 @@
     again (Test-FreshCluster.ps1 -Environment hosted -WatchOnly), which must happen within -ConvergeMinutes of the reboot. Postgres must
     have shut down cleanly: crash recovery in its log after the reboot FAILS (with k3d it is only reported: `k3d cluster stop` kills it).
     Hosted: the public host name, Let's Encrypt certificates (Windows' trusted roots) and the admin key from DEMO_ADMIN_API_KEY_HOSTED.
+    The hosted demo is live: a visitor's action or the nightly demo reset (02:00 Africa/Johannesburg) between the counts before and after
+    changes them and gives a false FAIL (never a false PASS). Run it away from 02:00 and rerun once before debugging a count difference.
 #>
 [CmdletBinding()]
 param(
