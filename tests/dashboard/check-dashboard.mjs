@@ -46,7 +46,9 @@ async function readGrid(page) {
     const headers = [...table.querySelectorAll('thead th')].map(h => h.innerText.trim());
     const rows = [...table.querySelectorAll('tbody [role="row"]')].map(r => [...r.querySelectorAll('td')].map(td => td.innerText.trim()));
     const nudges = window.__procureVirtualizeNudge ? window.__procureVirtualizeNudge.nudges : null;
-    return { found: true, rows, count: Math.max(0, Number(table.getAttribute('aria-rowcount')) - 1), headers, nudges };
+    const bodyRows = table.querySelectorAll('tbody [role="row"]');
+    const lastIndex = bodyRows.length ? Number(bodyRows[bodyRows.length - 1].getAttribute('aria-rowindex')) : null;
+    return { found: true, rows, count: Math.max(0, Number(table.getAttribute('aria-rowcount')) - 1), rowCount: Number(table.getAttribute('aria-rowcount')), lastIndex, headers, nudges };
   });
 }
 
@@ -74,21 +76,58 @@ async function waitForRows(page) {
   return { grid, ms: null };
 }
 
-// A cell's time of day (the dashboard shows HH:MM:SS.fff in the browser's time zone, the PC's) as minutes before `now`, the server's
-// time from the page's Date header: the PC's clock may be off (Dale's ran 35 s ahead on 2026-11-08, Windows Time stopped).
+// A cell's time (with the context's locale pinned to en-US the dashboard shows h:MM:SS.fff AM/PM for today and M/D/YYYY h:MM:SS.fff
+// AM/PM for older days, in the browser's time zone, the PC's) as minutes before `now`, the server's time from the page's Date header: the PC's
+// clock may be off (Dale's ran 35 s ahead on 2026-11-08, Windows Time stopped). Reading only the time of day made yesterday's rows look
+// a few hours old (2026-11-12: "11/11/2026 12:39" read as 12:39 today, a false "gateway traces 251 min old").
 function ageMinutes(text, now) {
-  const m = /(\d{1,2}):(\d{2}):(\d{2})(?:\.\d+)?/.exec(text || '');
+  const m = /(?:(\d{1,2})\/(\d{1,2})\/(\d{4})\s+)?(\d{1,2}):(\d{2}):(\d{2})(?:\.\d+)?(?:\s*([AP]M))?/i.exec(text || '');
   if (!m) return null;
   const t = new Date(now);
-  t.setHours(Number(m[1]), Number(m[2]), Number(m[3]), 0);
+  if (m[3]) t.setFullYear(Number(m[3]), Number(m[1]) - 1, Number(m[2]));
+  let hours = Number(m[4]);
+  if (m[7]) hours = (hours % 12) + (m[7].toUpperCase() === 'PM' ? 12 : 0); // en-US shows 12-hour times: 12:05 AM is 00:05
+  t.setHours(hours, Number(m[5]), Number(m[6]), 0);
   let age = (now - t) / 60000;
-  if (age < -1) age += 24 * 60; // before midnight
+  if (!m[3] && age < -1) age += 24 * 60; // before midnight
   return age;
+}
+
+// The grids list the oldest row first and fill in over several Blazor round trips (seen on the hosted VM: 5 rows first, 113 a few
+// seconds later), so the newest rows are there only once the grid is complete. Scrolls the grid (every scrollable ancestor and the
+// window) to its end until the last rendered row is the grid's last row (aria-rowindex = aria-rowcount) and the count has held for
+// five reads 1.5 s apart, at most 45 s. A partial first page can hold for several seconds (2026-11-12: the gateway page stayed at
+// 5 of 115 rows for over 4.5 s), so each read first scrolls to the top and back and fires a resize, which makes Virtualize ask the
+// server for its items again.
+async function scrollGridToEnd(page) {
+  let last = '', same = 0, grid = await readGrid(page);
+  const started = Date.now();
+  while (Date.now() - started < 45000) {
+    await page.evaluate(async () => {
+      const table = document.querySelector('table.fluent-data-grid');
+      const scrollers = [];
+      for (let e = table; e; e = e.parentElement) if (e.scrollHeight > e.clientHeight + 10) scrollers.push(e);
+      for (const e of scrollers) e.scrollTop = 0;
+      window.scrollTo(0, 0);
+      await new Promise(r => setTimeout(r, 200));
+      for (const e of scrollers) e.scrollTop = e.scrollHeight;
+      window.scrollTo(0, document.body.scrollHeight);
+      window.dispatchEvent(new Event('resize'));
+    });
+    await page.waitForTimeout(1500);
+    grid = await readGrid(page);
+    const complete = grid.lastIndex !== null && grid.lastIndex === grid.rowCount;
+    const key = `${grid.rowCount}|${grid.lastIndex}|${JSON.stringify(grid.rows[grid.rows.length - 1])}`;
+    same = complete && key === last ? same + 1 : 0;
+    last = key;
+    if (same >= 4) return grid;
+  }
+  return grid;
 }
 
 const browser = await chromium.launch({ channel: 'msedge', headless: process.env.DASHBOARD_HEADED !== '1' });
 try {
-  const context = await browser.newContext({ ignoreHTTPSErrors: process.env.DASHBOARD_IGNORE_TLS === '1', viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ locale: 'en-US', ignoreHTTPSErrors: process.env.DASHBOARD_IGNORE_TLS === '1', viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
   if (noNudge) await page.route('**/_procure/virtualize-nudge.js', route => route.abort());
 
@@ -123,12 +162,12 @@ try {
       const response = await page.goto(`${base}/${name}/resource/${encodeURIComponent(service)}`, { waitUntil: 'load' });
       const serverDate = response && response.headers()['date'] ? new Date(response.headers()['date']) : null;
       const now = serverDate && !isNaN(serverDate) ? serverDate : new Date();
-      const { grid, ms } = await waitForRows(page);
-      if (ms === null) { fail(`/${name}/resource/${service}: no rows (grid ${grid.found ? `holds ${grid.count}` : 'not found'})`); continue; }
+      const loaded = await waitForRows(page);
+      if (loaded.ms === null) { fail(`/${name}/resource/${service}: no rows (grid ${loaded.grid.found ? `holds ${loaded.grid.count}` : 'not found'})`); continue; }
+      const grid = await scrollGridToEnd(page);
       const col = grid.headers.indexOf('Timestamp');
       const ages = grid.rows.map(r => ageMinutes(r[col], now)).filter(a => a !== null);
-      const newest = ages.length ? Math.min(...ages) : null;
-      if (newest !== null && newest <= maxAgeMin) ok(`/${name}/resource/${service}: newest row ${newest.toFixed(1)} min old (${grid.count} in all)`);
+      const newest = ages.length ? Math.min(...ages) : null;      if (newest !== null && newest <= maxAgeMin) ok(`/${name}/resource/${service}: newest row ${newest.toFixed(1)} min old (${grid.count} in all)`);
       else fail(`/${name}/resource/${service}: newest row ${newest === null ? 'has no time' : `${newest.toFixed(1)} min old`}, expected under ${maxAgeMin} min (${grid.count} in all)`);
       // Traces: some trace from the window is a request that came in through the gateway (its name is "<root resource>: <operation>").
       // Not only the newest one: a message or job trace may land between this check's own request and the page read (review I2).

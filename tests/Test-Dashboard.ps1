@@ -21,7 +21,9 @@
        /traces/resource/<name> for each -TraceServices) and needs the newest row to be at most -MaxAgeMinutes old, and on each traces
        page some trace from that window to start at -TraceRoot (the gateway: a request came in through it). The gateway page is checked
        on purpose: on 2026-11-08, with the plan 08b collector applied by hand, /traces/resource/gateway stopped listing new
-       gateway-rooted traces that the requests-api page listed (cause not found; plan 08b Task 1 report).
+       gateway-rooted traces that the requests-api page listed. Found 2026-11-12: a test artifact, not lost telemetry. The grids list the
+       oldest row first and render only a screenful, and older days' rows carry a date that the age check ignored, so the gateway page
+       (many rows) looked hours old. The check now scrolls each resource grid to its end and reads the date.
 
     -NoNudge blocks the workaround script (/_procure/virtualize-nudge.js, procure-ai deploy/charts/procure-observability): run it after an
     Aspire dashboard upgrade; when every load still shows rows, the workaround can go (dashboard.proxy.enabled: false).
