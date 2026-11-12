@@ -44,11 +44,26 @@ kc_sign_in "$cfg"
 kc() { $K "$@" --config "$cfg" -r ops; }
 '@
 $kcadmSecret = Get-KeycloakKcadmSecretLine
+$script:KcSignIn = ''
 function Invoke-Kc([string] $body, [string[]] $arguments = @()) {
     $text = ($preamble + "`n" + $body) -replace "`r", ''
     $out = $kcadmSecret | & kubectl @KubectlArgs -n procure exec -i deploy/keycloak -c keycloak -- bash -c $text _ @arguments 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kcadm failed ($LASTEXITCODE): $(($out | ForEach-Object { "$_" }) -join ' ')" }
-    @($out | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^Logging into' })
+    $lines = @($out | ForEach-Object { "$_" })
+    # kc_sign_in's 'kcadm: ...' line names the identity used (review m9); kept apart from the command's output.
+    $script:KcSignIn = "$($lines | Where-Object { $_ -match '^kcadm: ' } | Select-Object -Last 1)"
+    @($lines | Where-Object { $_ -notmatch '^Logging into' -and $_ -notmatch '^kcadm: ' })
+}
+
+# Review m9: when Secret procure-keycloak has automation-client-secret, the client must be what signs in. A silent fallback to the bootstrap
+# admin (still enabled until the first sync with automationClient, or after a rollback) would make this test prove nothing about the client
+# (docs/hosting.md uses it as that proof), so it fails before any probe is made.
+$null = Invoke-Kc 'true'
+Write-Host "Keycloak admin sign-in: $($script:KcSignIn)"
+if ($kcadmSecret -and $script:KcSignIn -ne 'kcadm: signed in as client procure-automation') {
+    Write-Host '  FAIL  Secret procure-keycloak has automation-client-secret, but kcadm did not sign in as client procure-automation' -ForegroundColor Red
+    Write-Host '1 FAIL' -ForegroundColor Red
+    exit 1
 }
 function Get-GroupMembers {
     @(Invoke-Kc @'

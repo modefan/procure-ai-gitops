@@ -579,17 +579,29 @@ function Read-OperatorSecrets([ValidateSet('hosted', 'local')] [string] $Environ
 # first sync with automationClient, which creates the client, has not run yet (the local cluster after this change). Once that sync has run
 # the bootstrap admin is disabled and only the client works. The client's secret goes to the pod as the FIRST line of kubectl exec's stdin
 # (Get-KeycloakKcadmSecretLine), never on a command line; $KeycloakKcadmSignIn is the bash that reads that line and defines
-# kc_sign_in <config file>. Nothing it runs prints a secret (kcadm's output goes to /dev/null).
+# kc_sign_in <config file>. Nothing it runs prints a secret (kcadm's output goes to /dev/null); it writes one stderr line starting with
+# 'kcadm: ' that names the identity it used (client procure-automation or the bootstrap admin, and why).
 $script:KeycloakKcadmSignIn = @'
 IFS= read -r KC_AUTOMATION_SECRET || true
 KC_AUTOMATION_SECRET=${KC_AUTOMATION_SECRET%$'\r'}
 kc_sign_in() {
-  if [ -n "$KC_AUTOMATION_SECRET" ] && KC_CLI_CLIENT_SECRET="$KC_AUTOMATION_SECRET" /opt/keycloak/bin/kcadm.sh config credentials \
-      --config "$1" --server http://localhost:8080 --realm master --client procure-automation </dev/null >/dev/null 2>&1; then
+  # One line on stderr names the identity used (fix round 3, review m9; never a value), so a broken client cannot hide behind the fallback.
+  local why='no automation secret'
+  if [ -n "$KC_AUTOMATION_SECRET" ]; then
+    if KC_CLI_CLIENT_SECRET="$KC_AUTOMATION_SECRET" /opt/keycloak/bin/kcadm.sh config credentials \
+        --config "$1" --server http://localhost:8080 --realm master --client procure-automation </dev/null >/dev/null 2>&1; then
+      echo 'kcadm: signed in as client procure-automation' >&2
+      return 0
+    fi
+    why='client sign-in failed'
+  fi
+  if KC_CLI_PASSWORD="${KC_BOOTSTRAP_ADMIN_PASSWORD:-}" /opt/keycloak/bin/kcadm.sh config credentials --config "$1" --server http://localhost:8080 \
+      --realm master --user "${KC_BOOTSTRAP_ADMIN_USERNAME:-}" </dev/null >/dev/null 2>&1; then
+    echo "kcadm: $why, signed in as bootstrap admin" >&2
     return 0
   fi
-  KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" /opt/keycloak/bin/kcadm.sh config credentials --config "$1" --server http://localhost:8080 \
-    --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" </dev/null >/dev/null 2>&1
+  echo "kcadm: $why, bootstrap admin sign-in failed too" >&2
+  return 1
 }
 '@ -replace "`r", ''
 
