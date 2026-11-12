@@ -3,3 +3,6 @@ env: local
 observability:
   # The collector and the Aspire dashboard (procure-ai deploy/charts/procure-observability, values envs/local/observability.yaml).
   enabled: true
+operator:
+  # pgAdmin, DbGate and Redis Insight at https://pgadmin|mongo|redis.procure.localtest.me (plan 08b Task 4).
+  enabled: true

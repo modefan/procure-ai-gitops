@@ -23,7 +23,7 @@
 {{ include "procure-apps.application" (dict "root" $ "name" "argocd" "app" . "sources" $sources "finalizer" false) }}
 {{- end }}
 {{- end }}
-{{- range $name, $file := dict "platform" "platform.yaml" "observability" "observability.yaml" "procure-ai" "procure-ai.yaml" }}
+{{- range $name, $file := dict "platform" "platform.yaml" "observability" "observability.yaml" "operator" "operator.yaml" "procure-ai" "procure-ai.yaml" }}
 {{- $app := index $.Values (ternary "procureAi" $name (eq $name "procure-ai")) }}
 {{- if $app.enabled }}
 {{- $sources := include "procure-apps.appRepoSources" (dict "root" $ "app" $app "valuesFile" $file) | fromYamlArray }}

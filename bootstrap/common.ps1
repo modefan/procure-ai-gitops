@@ -64,7 +64,9 @@ $script:HostedMonthlyPrice = 'EUR 14.00'
 $script:HostedRootPasswordSecretName = 'procure-hosted-root-password'
 # The Cloudflare DNS records Terraform keeps (one A record each, DNS only; no AAAA, k3s is IPv4 only): <host>.<domain> -> the server.
 $script:HostedDomain = 'daleabels.com'
-$script:HostedDnsHosts = @('procure', 'auth', 'dashboard')
+# The operator's own hosts (plan 08b Task 4): pgAdmin, the MongoDB UI, Redis Insight, RabbitMQ's management UI, the break-glass dashboard. Keep
+# infra/hosted/variables.tf dns_hosts equal; every name is on the one public certificate (install-cert-manager.ps1).
+$script:HostedDnsHosts = @('procure', 'auth', 'dashboard', 'pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct')
 $script:HostedCloudflareZoneId = '93c854c6f17e0cbb8f2b7e9395f7828c'
 # The hosted ghcr-pull Secret holds a classic read-only PAT (read:packages, user modefan; DEMO PASSWORDS.txt "GitHub Container Registry
 # (GHCR)", user env var GHCR_READ_TOKEN). It expires on this date: while the packages are private an expired token makes the next hosted
@@ -505,4 +507,67 @@ function Sync-DemoPasswordSection {
     }
     if ($changed -gt 0) { Write-DemoPasswordsFile -Lines $lines -Path $Path }
     $changed
+}
+
+# --- The operator's logins (plan 08b Task 4): read back from DEMO PASSWORDS.txt, and the one-time codes computed from it. ---
+function Read-DemoPasswordSection([string] $section, [string] $prefix, [string] $Path = $script:DemoPasswordsFile) {
+    # name -> value of every "<prefix><name>: <value>" line of the section "=== <section>..." of DEMO PASSWORDS.txt (indent ignored).
+    # Values are returned, never printed.
+    if (-not (Test-Path -LiteralPath $Path)) { throw "$Path not found." }
+    $entries = @{}
+    $inside = $false
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        if ($line.StartsWith('===')) { $inside = $line.StartsWith("=== $section"); continue }
+        if (-not $inside) { continue }
+        $text = $line.TrimStart()
+        if (-not $text.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
+        $colon = $text.IndexOf(': ', $prefix.Length)
+        if ($colon -lt 0) { continue }
+        $entries[$text.Substring($prefix.Length, $colon - $prefix.Length)] = $text.Substring($colon + 2)
+    }
+    if ($entries.Count -eq 0) { throw "No entries in the section '=== $section' of $Path (bootstrap/new-secrets.ps1 writes it)." }
+    $entries
+}
+
+function Get-ServerClockOffset([string] $Url, [string] $ResolveTo) {
+    # Seconds to add to this PC's clock to get the time of the server behind $Url (its HTTP Date header, one HEAD request; whole seconds).
+    # A one-time code is only valid for 30 seconds and this PC's clock was 35 s fast on 2026-11-08 (Windows time sync off or slow), so the
+    # codes are computed with the server's time. $null when the server cannot be asked.
+    $curl = @("$env:SystemRoot\System32\curl.exe", 'C:\Program Files\Git\mingw64\bin\curl.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $resolve = if ($ResolveTo) { @('--resolve', "$(([Uri] $Url).Host):443:$ResolveTo") } else { @() }
+    $before = [DateTimeOffset]::UtcNow
+    $headers = & $curl -sS -k --ssl-no-revoke --max-time 10 -I @resolve $Url 2>$null
+    $after = [DateTimeOffset]::UtcNow
+    $date = $headers | Where-Object { $_ -match '^date:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1
+    $server = [DateTimeOffset]::MinValue
+    if (-not $date -or -not [DateTimeOffset]::TryParse($date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref] $server)) { return $null }
+    $local = $before.AddTicks(($after - $before).Ticks / 2)
+    [int] [Math]::Round(($server - $local).TotalSeconds)
+}
+
+function Get-TotpCode([string] $base32, [int] $OffsetSeconds = 0) {
+    # RFC 6238 with the authenticator defaults (HMAC-SHA1, 6 digits, 30-second steps) over the RFC 4648 Base32 key. -OffsetSeconds: the
+    # server's clock minus this PC's (Get-ServerClockOffset).
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+    $clean = $base32.ToUpperInvariant().TrimEnd('=').Replace(' ', '')
+    $bits = -join ($clean.ToCharArray() | ForEach-Object {
+        $index = $alphabet.IndexOf($_)
+        if ($index -lt 0) { throw 'The TOTP secret is not Base32.' }
+        [Convert]::ToString($index, 2).PadLeft(5, '0')
+    })
+    $key = [byte[]] @(for ($i = 0; $i + 8 -le $bits.Length; $i += 8) { [Convert]::ToByte($bits.Substring($i, 8), 2) })
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $OffsetSeconds
+    $counter = [BitConverter]::GetBytes([long][Math]::Floor($now / 30))
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($counter) }
+    $hash = [Security.Cryptography.HMACSHA1]::new($key).ComputeHash($counter)
+    $offset = $hash[$hash.Length - 1] -band 0x0f
+    # Every term in its own parentheses: PowerShell's -band, -bor and -shl share one precedence and run left to right.
+    $binary = ((([int] $hash[$offset]) -band 0x7f) -shl 24) -bor (([int] $hash[$offset + 1]) -shl 16) -bor (([int] $hash[$offset + 2]) -shl 8) -bor ([int] $hash[$offset + 3])
+    [pscustomobject]@{ Code = ($binary % 1000000).ToString('000000'); SecondsLeft = 30 - ($now % 30) }
+}
+
+function Read-OperatorSecrets([ValidateSet('hosted', 'local')] [string] $Environment, [string] $Path = $script:DemoPasswordsFile) {
+    # The section bootstrap/new-secrets.ps1 keeps for the environment (plan 08b Task 4): hosted "<name>: <value>", local "Parameters:<name>: <value>".
+    if ($Environment -eq 'hosted') { Read-DemoPasswordSection 'procure-ai hosted (Contabo) secrets' '' $Path }
+    else { Read-DemoPasswordSection 'procure-ai local: all AppHost user secrets' 'Parameters:' $Path }
 }

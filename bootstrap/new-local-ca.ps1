@@ -16,7 +16,7 @@
     Cluster objects (kubectl apply, so a second run reports "unchanged"):
       procure/Secret procure-tls (kubernetes.io/tls)   + procure/TLSStore default (Traefik's default certificate)
       procure/Secret mongo-tls   (tls.crt, tls.key, ca.crt, mongo.pem)
-      procure, observability and (local only) argocd/ConfigMap procure-ca   (key <openssl subject hash>.0 for SSL_CERT_DIR, and ca.crt)
+      procure, observability, operator and (local only) argocd/ConfigMap procure-ca   (key <openssl subject hash>.0 for SSL_CERT_DIR, and ca.crt)
     Browsers do not trust this CA unless Dale imports it himself (trust-local-ca.ps1, optional).
     -CaDir and -FilesOnly (tests/Test-LocalCa.ps1): write the files into another folder and leave the cluster alone.
 
@@ -163,7 +163,9 @@ Write-Host (Invoke-Apply (New-SecretObject -Namespace procure -Name mongo-tls -T
 $caPem = Get-Content -Raw $caCrt
 # argocd (local only): Argo CD's server checks Keycloak's certificate when it reads the OIDC issuer (envs/local/argocd.yaml, Task 12c); the
 # hosted issuer has a Let's Encrypt certificate.
-$caNamespaces = @('procure', 'observability') + @(if (-not $hosted) { 'argocd' })
+# operator (plan 08b Task 4): the MongoDB web UI (procure-ai deploy/charts/procure-ops) connects over TLS; the namespace may not exist yet.
+$caNamespaces = @('procure', 'observability', 'operator') + @(if (-not $hosted) { 'argocd' })
+Write-Host (Invoke-Apply (New-NamespaceObject 'operator'))
 foreach ($namespace in $caNamespaces) {
     Write-Host (Invoke-Apply ([ordered]@{
         apiVersion = 'v1'

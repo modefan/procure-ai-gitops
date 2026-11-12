@@ -14,6 +14,9 @@
 //   DASHBOARD_NO_NUDGE    1: block /_procure/virtualize-nudge.js (shows whether the dashboard's tables load without the workaround)
 //   DASHBOARD_IGNORE_TLS  1: accept any certificate (the local cluster's CA, when it is not trusted in Windows)
 //   DASHBOARD_HEADED      1: show the browser
+//   DASHBOARD_BASIC_AUTH  1: the break-glass dashboard (plan 08b Task 4): DASHBOARD_USER / DASHBOARD_PASSWORD go to Traefik's basic-auth
+//                         login (the browser's HTTP credentials) instead of Keycloak's sign-in form
+//   DASHBOARD_RESOLVE     <ip>: send the dashboard's host name to this address (before its DNS record exists)
 import { chromium } from 'playwright-core';
 
 const base = (process.env.DASHBOARD_URL || '').replace(/\/$/, '');
@@ -125,20 +128,30 @@ async function scrollGridToEnd(page) {
   return grid;
 }
 
-const browser = await chromium.launch({ channel: 'msedge', headless: process.env.DASHBOARD_HEADED !== '1' });
+const basicAuth = process.env.DASHBOARD_BASIC_AUTH === '1';
+const resolveTo = process.env.DASHBOARD_RESOLVE;
+const launchArgs = resolveTo ? [`--host-resolver-rules=MAP ${new URL(base).hostname} ${resolveTo}`] : [];
+const browser = await chromium.launch({ channel: 'msedge', headless: process.env.DASHBOARD_HEADED !== '1', args: launchArgs });
 try {
-  const context = await browser.newContext({ locale: 'en-US', ignoreHTTPSErrors: process.env.DASHBOARD_IGNORE_TLS === '1', viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ locale: 'en-US', ignoreHTTPSErrors: process.env.DASHBOARD_IGNORE_TLS === '1', viewport: { width: 1440, height: 900 },
+    ...(basicAuth ? { httpCredentials: { username: user, password, origin: base } } : {}) });
   const page = await context.newPage();
   if (noNudge) await page.route('**/_procure/virtualize-nudge.js', route => route.abort());
 
-  // 1. Sign in at Keycloak: user name first, then the password.
-  await page.goto(`${base}/`);
-  await page.locator('input[name=username]').fill(user);
-  await page.locator('input[name=username]').press('Enter');
-  await page.locator('input[name=password]').fill(password);
-  await page.locator('input[name=password]').press('Enter');
-  await page.waitForURL(u => u.toString().startsWith(base + '/'), { timeout: 30000 });
-  ok(`signed in to ${base} as ${user}`);
+  // 1. Sign in at Keycloak: user name first, then the password. The break-glass dashboard: the browser answers Traefik's basic-auth login.
+  if (basicAuth) {
+    const response = await page.goto(`${base}/`);
+    if (!response || response.status() >= 400) fail(`${base}/ answered ${response ? response.status() : 'nothing'} with the basic-auth login`);
+    else ok(`signed in to ${base} as ${user} (basic auth, no Keycloak)`);
+  } else {
+    await page.goto(`${base}/`);
+    await page.locator('input[name=username]').fill(user);
+    await page.locator('input[name=username]').press('Enter');
+    await page.locator('input[name=password]').fill(password);
+    await page.locator('input[name=password]').press('Enter');
+    await page.waitForURL(u => u.toString().startsWith(base + '/'), { timeout: 30000 });
+    ok(`signed in to ${base} as ${user}`);
+  }
 
   // The Blazor circuit must be up (finding 1: every circuit was refused with 403 behind Traefik).
   let socket = false;

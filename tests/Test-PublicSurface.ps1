@@ -3,7 +3,8 @@
 .SYNOPSIS
     What the hosted demo shows the internet (plan 08 Review Focus 2), checked from outside the VM (Dale's PC).
 .DESCRIPTION
-    1. DNS (public resolver 1.1.1.1): procure, auth and dashboard.<domain> have an A record to the VM's IPv4 address and no AAAA record
+    1. DNS (public resolver 1.1.1.1): procure, auth and dashboard.<domain>, and the operator's hosts (plan 08b Task 4: pgadmin, mongo, redis,
+       rabbitmq, dashboard-direct; -OperatorHosts) have an A record to the VM's IPv4 address and no AAAA record
        (the k3s cluster is IPv4-only; plan 08 Task 12 ruling).
     2. Port scan of the VM's IPv4 address (TCP connect; 1-1024, the well-known database, broker, Kubernetes, OTLP and dashboard ports, and
        the whole NodePort range 30000-32767): only 22, 80 and 443 answer. 6443 (Kubernetes API), 4317/4318 (OTLP), 8025 (Mailpit),
@@ -13,10 +14,11 @@
     5. Each host's certificate is issued by Let's Encrypt (production; -AllowStaging accepts the staging CA, "(STAGING)"), valid for the
        host name, verified against Git for Windows' CA bundle with openssl (not .NET: ESET on this PC intercepts TLS from pwsh), and
        valid for at least 14 more days (cert-manager renews 30 days before the end).
-    6. Keycloak's public host serves only the procure realm and static resources: /admin, /admin/master/console/, the master realm's
-       discovery and token endpoints, the welcome page and /metrics answer 404, also when reached by path tricks (/realms/procure/../master
-       sent as is, /realms/procure/%2e%2e/master, /realms//master, /resources/%2e%2e/admin); the procure realm's discovery answers 200 with
-       issuer https://auth.<domain>/realms/procure, and realm ops (Argo CD's sign-in, fix wave ruling R6c) with issuer .../realms/ops.
+    6. Keycloak's public host serves the procure realm, realm ops, static resources and (plan 08b Task 4, Dale 2026-11-08) the admin console
+       with the master realm's sign-in: the welcome page, /metrics, /health and /js answer 404, also by path tricks; the procure realm's
+       discovery answers 200 with issuer https://auth.<domain>/realms/procure, realm ops (Argo CD's sign-in, fix wave ruling R6c) with
+       .../realms/ops, the master realm with .../realms/master; the admin console answers 200 and its REST API 401 without a token; a
+       password grant with wrong credentials gets 401 from the master realm. Who can sign in there: tests/Test-OperatorTools.ps1.
     7. No other site answers on 443: Argo CD and Mailpit host names (hosted and local spellings) and the bare IP give Traefik's 404.
     8. The dashboard redirects to Keycloak's sign-in for client aspire-dashboard, and its telemetry API answers 404.
     9. The app (https://procure.<domain>/) answers 200. Every host sends Strict-Transport-Security (max-age at least 180 days, no preload),
@@ -47,6 +49,8 @@ param(
     [string] $AppHost = "procure.$Domain",
     [string] $KeycloakHost = "auth.$Domain",
     [string] $DashboardHost = "dashboard.$Domain",
+    # The operator's own hosts (plan 08b Task 4); tests/Test-OperatorTools.ps1 checks their sign-ins.
+    [string[]] $OperatorHosts = @('pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct' | ForEach-Object { "$_.$Domain" }),
     # The VM's IPv4 address; default: host.json of the hosted bootstrap.
     [string] $Ip,
     # Accept certificates from Let's Encrypt's staging CA (before the production issuer is switched on).
@@ -72,7 +76,7 @@ function Pass([string] $message) { Write-Host "ok:   $message" -ForegroundColor 
 function Write-Step([string] $text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 
 if (-not $Ip) { $Ip = (Get-HostedHost).ipv4 }
-$hosts = @($AppHost, $KeycloakHost, $DashboardHost)
+$hosts = @($AppHost, $KeycloakHost, $DashboardHost) + $OperatorHosts
 $curl = @("$env:SystemRoot\System32\curl.exe", 'C:\Program Files\Git\mingw64\bin\curl.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $curl) { throw 'curl not found.' }
 $openssl = Get-OpenSsl
@@ -179,22 +183,25 @@ try {
 
     # --- 6. Keycloak: the procure realm and static resources only ---------------------------------------------------------------------
     Write-Step "Keycloak's public paths (https://$KeycloakHost)"
-    foreach ($path in '/admin', '/admin/', '/admin/master/console/', '/admin/realms/procure/users', '/realms/master/.well-known/openid-configuration',
-        '/realms/master/account', '/', '/metrics', '/health/ready', '/js/keycloak.js',
+    foreach ($path in '/', '/metrics', '/health/ready', '/js/keycloak.js',
         # Path tricks (Task 12 review): dot segments sent as is (curl --path-as-is; curl folds them otherwise), encoded dots, empty segments.
-        '/realms/procure/../master/.well-known/openid-configuration', '/realms/procure/%2e%2e/master/.well-known/openid-configuration',
-        '/realms/procure/%2E%2E/master/account', '/realms//master/.well-known/openid-configuration', '/realms/procure/..%2fmaster/account',
-        '/resources/../admin/master/console/', '/resources/%2e%2e/admin/master/console/') {
+        '/realms/procure/../../metrics', '/realms/procure/%2e%2e/%2e%2e/health/ready', '/resources/../metrics', '/resources/%2e%2e/js/keycloak.js',
+        '/admin/../metrics', '/realms//../metrics') {
         $r = Invoke-Http "https://$KeycloakHost$path" -Extra @('--path-as-is')
         if ($r.Status -eq 404) { Pass "$path answers 404" } else { Fail "https://$KeycloakHost$path answered $($r.Status), expected 404 (not a public path)" }
     }
-    foreach ($path in '/realms/procure/../master/protocol/openid-connect/token', '/realms//master/protocol/openid-connect/token') {
-        $r = Invoke-Http "https://$KeycloakHost$path" -Method POST -Extra @('--path-as-is', '--data', 'grant_type=password&client_id=admin-cli&username=x&password=x')
-        if ($r.Status -eq 404) { Pass "POST $path answers 404" } else { Fail "POST https://$KeycloakHost$path answered $($r.Status), expected 404" }
-    }
-    $r = Invoke-Http "https://$KeycloakHost/realms/master/protocol/openid-connect/token" -Method POST -Extra @('--data', 'grant_type=password&client_id=admin-cli&username=x&password=x')
-    if ($r.Status -eq 404) { Pass 'the master realm token endpoint answers 404 (no admin login from outside)' }
-    else { Fail "the master realm token endpoint answered $($r.Status), expected 404" }
+    # The admin console and the master realm (plan 08b Task 4): public, with their own sign-in (password and one-time code).
+    $r = Invoke-Http "https://$KeycloakHost/admin/master/console/"
+    if ($r.Status -eq 200) { Pass '/admin/master/console/ answers 200 (the admin console, master realm sign-in)' } else { Fail "/admin/master/console/ answered $($r.Status), expected 200" }
+    $r = Invoke-Http "https://$KeycloakHost/admin/realms/procure/users"
+    if ($r.Status -eq 401) { Pass 'the admin REST API answers 401 without a token' } else { Fail "/admin/realms/procure/users answered $($r.Status) without a token, expected 401" }
+    $r = Invoke-Http "https://$KeycloakHost/realms/master/protocol/openid-connect/token" -Method POST -Extra @('--data', 'grant_type=password&client_id=admin-cli&username=surface-probe&password=x')
+    if ($r.Status -eq 401) { Pass "the master realm's token endpoint refuses wrong credentials (401)" }
+    else { Fail "the master realm token endpoint answered $($r.Status) to wrong credentials, expected 401" }
+    $masterIssuer = "https://$KeycloakHost/realms/master"
+    $r = Invoke-Http "$masterIssuer/.well-known/openid-configuration"
+    if ($r.Status -eq 200 -and ($r.Body | ConvertFrom-Json).issuer -eq $masterIssuer) { Pass "the master realm's discovery answers 200, issuer $masterIssuer" }
+    else { Fail "the master realm's discovery answered $($r.Status)" }
     $issuer = "https://$KeycloakHost/realms/procure"
     $r = Invoke-Http "$issuer/.well-known/openid-configuration"
     if ($r.Status -eq 200 -and ($r.Body | ConvertFrom-Json).issuer -eq $issuer) { Pass "the procure realm's discovery answers 200, issuer $issuer" }

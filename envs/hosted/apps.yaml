@@ -15,3 +15,6 @@ observability:
   enabled: true
 procureAi:
   enabled: true
+operator:
+  # pgAdmin, DbGate and Redis Insight at https://pgadmin|mongo|redis.daleabels.com, each with its own login (plan 08b Task 4).
+  enabled: true

@@ -6,6 +6,48 @@ set:
   observability:
     enabled: true
 tests:
+  - it: the operator's web UIs (plan 08b Task 4) are off by default
+    asserts:
+      - hasDocuments:
+          count: 4
+
+  - it: an environment turns the operator's web UIs on, in namespace operator from the procure-ops chart at appRevision
+    set:
+      operator:
+        enabled: true
+    asserts:
+      - hasDocuments:
+          count: 5
+      - equal:
+          path: spec.destination.namespace
+          value: operator
+        documentSelector: { path: metadata.name, value: operator }
+      - equal:
+          path: spec.sources[0]
+          value:
+            repoURL: git@github.com:modefan/procure-ai.git
+            targetRevision: 0123456789abcdef0123456789abcdef01234567
+            path: deploy/charts/procure-ops
+            helm:
+              releaseName: operator
+              valueFiles:
+                - $values/envs/local/operator.yaml
+              valuesObject:
+                global:
+                  imageTag: 0123456789abcdef0123456789abcdef01234567
+        documentSelector: { path: metadata.name, value: operator }
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "0"
+        documentSelector: { path: metadata.name, value: operator }
+      - notExists:
+          path: metadata.annotations["procure-ai/wave-gate"]
+        documentSelector: { path: metadata.name, value: operator }
+      - equal:
+          path: spec.syncPolicy.automated
+          value: { prune: true, selfHeal: true }
+        documentSelector: { path: metadata.name, value: operator }
+
   - it: applications have the sync waves
     asserts:
       - hasDocuments:

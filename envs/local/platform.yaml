@@ -15,6 +15,7 @@ hosts:
   keycloak: auth.procure.localtest.me
   dashboard: dashboard.procure.localtest.me
   mailpit: mail.procure.localtest.me
+  rabbitmq: rabbitmq.procure.localtest.me
 
 keycloak:
   # Argo CD's address (the Keycloak client argocd's redirect base, plan 08 Task 12c); equal to configs.cm.url in envs/local/argocd.yaml.
@@ -26,4 +27,27 @@ postgres:
 mongo:
   storage: 2Gi
 rabbitmq:
+  # The operator's own management login (Secret procure-rabbitmq key operator-password); the UI at https://<hosts.rabbitmq>.
+  operator: { key: operator-password, user: operator, tags: administrator }
   storage: 1Gi
+
+# The operator's direct access (plan 08b Task 4, Dale 2026-11-08; procure-ai docs/hosting.md "Operate from the browser"): every component
+# on its own address with its own login, not through Keycloak or the gateway. The Secret keys these name come from bootstrap/new-secrets.ps1
+# (run it before this file reaches the cluster: a Secret key is never optional).
+operatorReaders:
+  postgresKey: operator-reader-postgres-password
+  mongoKey: operator-reader-mongo-password
+  redis:
+    key: operator-reader-password
+operatorAccess:
+  tools: { postgres: pgadmin, mongo: mongo-ui, redis: redis-insight }
+  rabbitmq:
+    enabled: true
+keycloakConfig:
+  # The admin console asks for a one-time code; Dale's own master admin `operator` (password and authenticator from DEMO PASSWORDS.txt).
+  masterRealm:
+    enabled: true
+  operatorUser:
+    username: operator
+    passwordKey: operator-password
+    totpKey: operator-totp-base32

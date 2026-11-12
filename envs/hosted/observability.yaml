@@ -3,6 +3,8 @@
 # No secrets here: the dashboard's client secret is Secret observability/procure-keycloak (bootstrap/new-secrets.ps1 -Environment hosted).
 hosts:
   dashboard: dashboard.daleabels.com
+  # The break-glass dashboard (plan 08b Task 4): its own login (Traefik basic auth), no Keycloak (Get-OperatorLogin.ps1 -Tool dashboard).
+  dashboardDirect: dashboard-direct.daleabels.com
   keycloak: auth.daleabels.com
 ingressClassName: traefik
 appNamespace: procure

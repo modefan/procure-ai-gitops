@@ -30,6 +30,12 @@
 
     Needs Node.js and Microsoft Edge; the first run installs playwright-core (pinned, tests/dashboard/package-lock.json) into
     tests/dashboard/node_modules. Nothing secret is printed. Exit code 1 on any failure.
+
+    -Direct (plan 08b Task 4): the same checks on the break-glass dashboard (https://dashboard-direct.<domain>), which has Traefik's
+    basic-auth login in front instead of Keycloak (user operator, DEMO PASSWORDS.txt operator-dashboard-token, read like
+    bootstrap/hosted/Get-OperatorLogin.ps1). -ResolveTo <VM address> and -SkipCertificateCheck: before its DNS record and certificate exist.
+.EXAMPLE
+    ./tests/Test-Dashboard.ps1 -Environment hosted -Direct -ResolveTo 45.13.235.178 -SkipCertificateCheck
 #>
 [CmdletBinding()]
 param(
@@ -42,7 +48,13 @@ param(
     [int] $Loads = 3,
     [string] $Tenant = 'acme',
     [switch] $NoNudge,
-    [switch] $Headed
+    [switch] $Headed,
+    # The break-glass dashboard (basic auth, no Keycloak) instead of the main one.
+    [switch] $Direct,
+    # Send the dashboard's host name to this address (before its DNS record exists).
+    [string] $ResolveTo,
+    # Accept any certificate (before the public certificate names the host).
+    [switch] $SkipCertificateCheck
 )
 
 . (Join-Path $PSScriptRoot '..\bootstrap\common.ps1')
@@ -50,7 +62,7 @@ Select-ProcureCluster $Environment
 $hosted = $Environment -eq 'hosted'
 $baseDomain = if ($hosted) { $HostedDomain } else { 'procure.localtest.me' }
 $appHost = if ($hosted) { "procure.$HostedDomain" } else { 'procure.localtest.me' }
-$dashboardHost = "dashboard.$baseDomain"
+$dashboardHost = if ($Direct) { "dashboard-direct.$baseDomain" } else { "dashboard.$baseDomain" }
 $adminKeyVar = if ($hosted) { 'DEMO_ADMIN_API_KEY_HOSTED' } else { 'DEMO_ADMIN_API_KEY' }
 $failures = [System.Collections.Generic.List[string]]::new()
 function Fail([string] $message) { $failures.Add($message); Write-Host "FAIL: $message" -ForegroundColor Red }
@@ -65,6 +77,8 @@ if (-not $hosted) {
     if (-not (Test-Path $caFile)) { throw "Local CA $caFile not found (bootstrap/new-local-ca.ps1)." }
     $tlsArgs += @('--cacert', $caFile)
 }
+if ($SkipCertificateCheck) { $tlsArgs += '--insecure' }
+$dashboardArgs = @(if ($ResolveTo) { '--resolve', "$($dashboardHost):443:$ResolveTo" })
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("procure-dashboard-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 Set-CurrentUserOnlyAcl $work
@@ -85,8 +99,17 @@ try {
     }
 
     # --- 2. Blazor's WebSocket Origin check -----------------------------------------------------------------------------------------
+    # -Direct: Traefik's basic-auth login first (the credentials in a curl config file in the private work folder, never on a command line).
+    $authArgs = @()
+    if ($Direct) {
+        $operatorPassword = (Read-OperatorSecrets -Environment $Environment)['operator-dashboard-token']
+        if (-not $operatorPassword) { throw "No entry 'operator-dashboard-token' in DEMO PASSWORDS.txt (bootstrap/new-secrets.ps1)." }
+        $authFile = Join-Path $work 'auth.curlrc'
+        Set-Content -Path $authFile -Value ('user = "operator:' + ($operatorPassword -replace '\\', '\\' -replace '"', '\"') + '"')
+        $authArgs = @('--config', $authFile)
+    }
     function Get-UpgradeStatus([string] $Path, [string] $Origin) {
-        $code = & $curl -sS --http1.1 --max-time 15 @tlsArgs -o (Join-Path $work 'upgrade.txt') -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' `
+        $code = & $curl -sS --http1.1 --max-time 15 @tlsArgs @dashboardArgs @authArgs -o (Join-Path $work 'upgrade.txt') -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' `
             -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: $Origin" "https://$dashboardHost$Path" 2>&1
         "$code"
     }
@@ -112,12 +135,15 @@ try {
         Push-Location $dir
         try { & npm ci --no-audit --no-fund --loglevel=error | Out-Host; if ($LASTEXITCODE -ne 0) { throw 'npm ci failed in tests/dashboard.' } } finally { Pop-Location }
     }
-    $password = (Read-UserSecrets)['Parameters:keycloak-demo-password']
+    $password = if ($Direct) { $operatorPassword } else { (Read-UserSecrets)['Parameters:keycloak-demo-password'] }
+    $operatorPassword = $null
     if (-not $password) { Fail "user secret Parameters:keycloak-demo-password is missing in $UserSecretsId" }
     else {
         $env:DASHBOARD_URL = "https://$dashboardHost"
-        $env:DASHBOARD_USER = 'admin@acme.test'
+        $env:DASHBOARD_USER = if ($Direct) { 'operator' } else { 'admin@acme.test' }
         $env:DASHBOARD_PASSWORD = $password
+        $env:DASHBOARD_BASIC_AUTH = if ($Direct) { '1' } else { '' }
+        $env:DASHBOARD_RESOLVE = $ResolveTo
         $password = $null
         $env:DASHBOARD_LOG_SERVICES = $LogServices -join ','
         $env:DASHBOARD_TRACE_SERVICES = $TraceServices -join ','
@@ -125,7 +151,7 @@ try {
         $env:DASHBOARD_MAX_AGE_MIN = "$MaxAgeMinutes"
         $env:DASHBOARD_LOADS = "$Loads"
         $env:DASHBOARD_NO_NUDGE = if ($NoNudge) { '1' } else { '' }
-        $env:DASHBOARD_IGNORE_TLS = if ($hosted) { '' } else { '1' }
+        $env:DASHBOARD_IGNORE_TLS = if ($hosted -and -not $SkipCertificateCheck) { '' } else { '1' }
         $env:DASHBOARD_HEADED = if ($Headed) { '1' } else { '' }
         try {
             Push-Location $dir
@@ -133,7 +159,7 @@ try {
         } finally {
             Pop-Location
             foreach ($name in 'DASHBOARD_URL', 'DASHBOARD_USER', 'DASHBOARD_PASSWORD', 'DASHBOARD_LOG_SERVICES', 'DASHBOARD_TRACE_SERVICES', 'DASHBOARD_TRACE_ROOT', 'DASHBOARD_MAX_AGE_MIN', 'DASHBOARD_LOADS',
-                              'DASHBOARD_NO_NUDGE', 'DASHBOARD_IGNORE_TLS', 'DASHBOARD_HEADED') {
+                              'DASHBOARD_NO_NUDGE', 'DASHBOARD_IGNORE_TLS', 'DASHBOARD_HEADED', 'DASHBOARD_BASIC_AUTH', 'DASHBOARD_RESOLVE') {
                 Remove-Item "Env:$name" -ErrorAction SilentlyContinue
             }
         }

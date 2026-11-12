@@ -91,6 +91,19 @@ observability:
   releaseName: observability
   waveGate: ""
 
+# The operator's web UIs for the data stores (procure-ai deploy/charts/procure-ops, plan 08b Task 4): pgAdmin, DbGate (MongoDB), Redis
+# Insight, each on its own public host with its own login (values envs/<env>/operator.yaml). Off by default (an environment turns it on in
+# envs/<env>/apps.yaml, once bootstrap/new-secrets.ps1 made namespace operator and its Secrets, and new-local-ca.ps1 its procure-ca
+# ConfigMap). Its own namespace; the platform's NetworkPolicies (operatorAccess.tools in envs/<env>/platform.yaml) let each tool reach
+# its store. No wave gate: nothing waits for it.
+operator:
+  enabled: false
+  namespace: operator
+  wave: 0
+  path: deploy/charts/procure-ops
+  releaseName: operator
+  waveGate: ""
+
 # The apps (procure-ai deploy/charts/procure-ai): migrations (Sync hooks), APIs, gateway, web, demo data.
 procureAi:
   enabled: true

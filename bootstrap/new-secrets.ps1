@@ -37,6 +37,18 @@
                                  the user env var GHCR_READ_TOKEN (classic PAT, read:packages only; plan 08 D4)
     In namespace observability (a pod reads Secrets of its own namespace only):
       procure-keycloak           dashboard-secret only (the Aspire dashboard's Keycloak client aspire-dashboard)
+      aspire-dashboard-direct-basic-auth  kubernetes.io/basic-auth: username operator, password operator-dashboard-token (the break-glass
+                                 dashboard's login in front of it, Traefik basicAuth; plan 08b Task 4)
+
+    The operator's direct access (plan 08b Task 4; procure-ai docs/hosting.md "Operate from the browser"): every tool has its own long
+    generated login, kept only in the store, DEMO PASSWORDS.txt and these Secrets (bootstrap/hosted/Get-OperatorLogin.ps1 reads them back):
+      procure (added keys)       procure-db-roles operator-reader-postgres-password, operator-reader-mongo-password; procure-redis
+                                 operator-reader-password; procure-rabbitmq operator-password; procure-keycloak operator-password,
+                                 operator-totp-base32 (Keycloak's master-realm user `operator`)
+      operator (namespace)       operator-pgadmin (password, totp-base32, reader-password), operator-mongo-ui (password,
+                                 reader-password), operator-redis-insight (reader-password, encryption-key),
+                                 operator-redis-insight-basic-auth (kubernetes.io/basic-auth: username, password)
+    The TOTP secrets are Base32 (an authenticator app takes them as they are; Get-OperatorLogin.ps1 prints the current code).
 
     -Environment hosted (plan 08 ruling 11): the same Secrets on the hosted VM (bootstrap/hosted/, through the SSH tunnel), from a separate
     user-secrets store `procure-ai-hosted` that shares no value with the AppHost. Every value is generated there on the first run (32
@@ -80,9 +92,23 @@ $required = 'postgres-password', 'rabbitmq-password', 'redis-password', 'mongo-p
     'debezium-mongo-password', 'admin-api-key', 'admin-api-key-sha256', 'simulator-api-key',
     'supplier-webhook-secret', 'audit-log-reader-password'
 $required += $databasePasswords
+# The operator's logins and read-only database users (plan 08b Task 4), generated in both stores.
+$operatorParameters = 'operator-pgadmin-password', 'operator-pgadmin-totp-base32', 'operator-reader-postgres-password',
+    'operator-reader-mongo-password', 'operator-reader-redis-password', 'operator-mongo-ui-password', 'operator-redis-insight-password',
+    'operator-redis-insight-encryption-key', 'operator-rabbitmq-password', 'operator-keycloak-password', 'operator-keycloak-totp-base32',
+    'operator-dashboard-token'
+$required += $operatorParameters
 
 function New-RandomText([int] $length) {
     [Security.Cryptography.RandomNumberGenerator]::GetString([char[]] 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', $length)
+}
+function New-TotpSecret {
+    # 20 letters and digits, Base32-encoded (32 characters, no padding): what an authenticator app takes, and what Keycloak's OTP credential
+    # holds as text after decoding (procure-ai deploy/charts/procure-platform/files/keycloak-operator-user.sh); pgAdmin keeps the Base32 form.
+    $bytes = [Text.Encoding]::ASCII.GetBytes((New-RandomText 20))
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+    $bits = ($bytes | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') }) -join ''
+    -join (0..($bits.Length / 5 - 1) | ForEach-Object { $alphabet[[Convert]::ToInt32($bits.Substring($_ * 5, 5), 2)] })
 }
 function Test-Missing([string] $name) { -not $secrets.ContainsKey("Parameters:$name") -or [string]::IsNullOrEmpty($secrets["Parameters:$name"]) }
 
@@ -90,13 +116,14 @@ function Test-Missing([string] $name) { -not $secrets.ContainsKey("Parameters:$n
 # new in plan 07 and 08; the AppHost generates the same names on its first run (persisted parameters), whichever runs first, both then
 # share the value. Hosted: every value (the store is this script's alone), plus the user name the hosted RabbitMQ uses.
 $generated = [ordered]@{}
-$toGenerate = if ($hosted) { $required } else { @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords }
+$toGenerate = if ($hosted) { $required } else { @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords + $operatorParameters }
 foreach ($name in $toGenerate) {
     if (-not (Test-Missing $name)) { continue }
     switch ($name) {
         'admin-api-key' { $generated["Parameters:$name"] = New-RandomText 64 }
         'admin-api-key-sha256' { }  # derived from the key below
         'mongo-keyfile-content' { $generated["Parameters:$name"] = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48)) }
+        { $_ -like '*-totp-base32' } { $generated["Parameters:$name"] = New-TotpSecret }
         default { $generated["Parameters:$name"] = New-RandomText 32 }
     }
 }
@@ -207,8 +234,8 @@ function Set-ProcureSecret([string] $name, [System.Collections.IDictionary] $dat
 }
 
 Set-ProcureSecret procure-postgres ([ordered]@{ password = $postgresPassword })
-Set-ProcureSecret procure-rabbitmq ([ordered]@{ username = $rabbitUser; password = $rabbitPassword })
-Set-ProcureSecret procure-redis ([ordered]@{ password = $redisPassword })
+Set-ProcureSecret procure-rabbitmq ([ordered]@{ username = $rabbitUser; password = $rabbitPassword; 'operator-password' = Get-Parameter 'operator-rabbitmq-password' })
+Set-ProcureSecret procure-redis ([ordered]@{ password = $redisPassword; 'operator-reader-password' = Get-Parameter 'operator-reader-redis-password' })
 Set-ProcureSecret procure-mongo ([ordered]@{ username = $mongoUser; password = $mongoPassword; keyfile = (Get-Parameter 'mongo-keyfile-content') })
 Set-ProcureSecret procure-keycloak ([ordered]@{
     'admin-username'      = $keycloakAdmin
@@ -220,9 +247,17 @@ Set-ProcureSecret procure-keycloak ([ordered]@{
     'demo-login-secret'   = Get-Parameter 'keycloak-demo-login-secret'
     'dashboard-secret'    = Get-Parameter 'keycloak-dashboard-secret'
     'db-password'         = Get-Parameter 'keycloak-db-password'
+    # Dale's own master-realm admin `operator` (plan 08b Task 4; the keycloak-config Job's operator-user container).
+    'operator-password'    = Get-Parameter 'operator-keycloak-password'
+    'operator-totp-base32' = Get-Parameter 'operator-keycloak-totp-base32'
 })
-# The Aspire dashboard (namespace observability) gets only its own client secret, not the other Keycloak values.
+# The Aspire dashboard (namespace observability) gets only its own client secret, not the other Keycloak values; the break-glass dashboard
+# (plan 08b Task 4) the basic-auth login Traefik asks for in front of it (the entry keeps its first name, operator-dashboard-token).
 Set-Secret observability procure-keycloak ([ordered]@{ 'dashboard-secret' = Get-Parameter 'keycloak-dashboard-secret' })
+Set-Secret observability aspire-dashboard-direct-basic-auth ([ordered]@{
+    'username' = 'operator'
+    'password' = Get-Parameter 'operator-dashboard-token'
+}) 'kubernetes.io/basic-auth'
 # debezium-mongo's MongoDB user; the Postgres Debeziums each replicate as their database's own role (procure-db-roles).
 Set-ProcureSecret procure-debezium ([ordered]@{ 'mongo-password' = Get-Parameter 'debezium-mongo-password' })
 $dbRoles = [ordered]@{}
@@ -230,6 +265,8 @@ foreach ($service in $postgresServices + 'suppliers') { $dbRoles["$service-passw
 foreach ($service in $capturedServices) { $dbRoles["$service-cdc-password"] = Get-Parameter "db-$service-cdc-password" }
 $dbRoles['assistant-mongo-password'] = Get-Parameter 'db-assistant-mongo-password'
 $dbRoles['audit-log-reader-password'] = $auditLogReaderPassword
+$dbRoles['operator-reader-postgres-password'] = Get-Parameter 'operator-reader-postgres-password'
+$dbRoles['operator-reader-mongo-password'] = Get-Parameter 'operator-reader-mongo-password'
 Set-ProcureSecret procure-db-roles $dbRoles
 Set-ProcureSecret procure-api-keys ([ordered]@{
     'admin-api-key'           = Get-Parameter 'admin-api-key'
@@ -300,5 +337,26 @@ $dockerConfig = [ordered]@{ auths = [ordered]@{ 'ghcr.io' = [ordered]@{
 } } } | ConvertTo-Json -Depth 5 -Compress
 Set-ProcureSecret ghcr-pull ([ordered]@{ '.dockerconfigjson' = $dockerConfig }) 'kubernetes.io/dockerconfigjson'
 
+# --- The operator's web UIs (namespace operator, procure-ai deploy/charts/procure-ops; plan 08b Task 4). ---
+$results.Add((Invoke-Apply (New-NamespaceObject 'operator')))
+Set-Secret operator operator-pgadmin ([ordered]@{
+    'password'        = Get-Parameter 'operator-pgadmin-password'
+    'totp-base32'     = Get-Parameter 'operator-pgadmin-totp-base32'
+    'reader-password' = Get-Parameter 'operator-reader-postgres-password'
+})
+Set-Secret operator operator-mongo-ui ([ordered]@{
+    'password'        = Get-Parameter 'operator-mongo-ui-password'
+    'reader-password' = Get-Parameter 'operator-reader-mongo-password'
+})
+Set-Secret operator operator-redis-insight ([ordered]@{
+    'reader-password' = Get-Parameter 'operator-reader-redis-password'
+    'encryption-key'  = Get-Parameter 'operator-redis-insight-encryption-key'
+})
+# Traefik's basicAuth middleware reads a kubernetes.io/basic-auth Secret (user name and password as they are; it is their one place here).
+Set-Secret operator operator-redis-insight-basic-auth ([ordered]@{
+    'username' = 'operator'
+    'password' = Get-Parameter 'operator-redis-insight-password'
+}) 'kubernetes.io/basic-auth'
+
 $results | ForEach-Object { Write-Host $_ }
-Write-Host "Secrets in namespaces procure and observability: $($results.Count) applied (names only shown)."
+Write-Host "Secrets in namespaces procure, observability and operator: $($results.Count) applied (names only shown)."

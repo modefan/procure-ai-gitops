@@ -6,7 +6,8 @@
     This repo has no CI (Argo CD reads it), so nothing else renders envs/<env>/*.yaml before Argo CD does on the cluster; for the hosted
     environment that is the public demo. For each environment (local and hosted, or -Environment):
       1. the app of apps (apps/) with envs/<env>/apps.yaml and release.yaml (appRevision and the platform image tags must pass its checks);
-      2. procure-ai's charts procure-platform, procure-ai and procure-observability, taken from the procure-ai clone at the environment's
+      2. procure-ai's charts procure-platform, procure-ai, procure-observability and (when envs/<env>/apps.yaml turns `operator` on, plan 08b
+         Task 4) procure-ops, taken from the procure-ai clone at the environment's
          appRevision (git archive; -AppRef renders another commit or 'WORKTREE' for the clone's files as they are, e.g. an unpushed chart
          change), with envs/<env>/<chart values file> and the image tags the Application passes (global.imageTag = appRevision,
          global.imageTags = platformImageTags). Dependencies as Argo CD's repo-server resolves them: the chart is rendered as committed and
@@ -124,7 +125,19 @@ $charts = @(
     @{ Name = 'platform'; Path = 'procure-platform'; Values = 'platform.yaml'; Namespace = 'procure' }
     @{ Name = 'procure-ai'; Path = 'procure-ai'; Values = 'procure-ai.yaml'; Namespace = 'procure' }
     @{ Name = 'observability'; Path = 'procure-observability'; Values = 'observability.yaml'; Namespace = 'observability' }
+    # Only where envs/<env>/apps.yaml has `operator: enabled: true` (apps/values.yaml: off by default).
+    @{ Name = 'operator'; Path = 'procure-ops'; Values = 'operator.yaml'; Namespace = 'operator'; Switch = 'operator' }
 )
+function Test-AppEnabled([string] $envDir, [string] $key) {
+    # The Application's `enabled` in envs/<env>/apps.yaml over apps/values.yaml (false there for every switchable Application).
+    $value = $false
+    foreach ($file in (Join-Path $root 'apps/values.yaml'), (Join-Path $envDir 'apps.yaml')) {
+        $block = [regex]::Match((Get-Content -Raw $file), "(?ms)^$($key):\s*\r?\n(.*?)(?=^\S|\z)").Groups[1].Value
+        $m = [regex]::Match($block, '(?m)^\s+enabled:\s*(true|false)\s*(#.*)?$')
+        if ($m.Success) { $value = $m.Groups[1].Value -eq 'true' }
+    }
+    $value
+}
 $exports = @{}
 try {
     foreach ($env in $Environment) {
@@ -140,6 +153,7 @@ try {
         if (-not $exports.ContainsKey($ref)) {
             $exports[$ref] = Export-Charts $ref
             foreach ($c in $charts) {
+                if (-not (Test-Path (Join-Path $exports[$ref] "deploy/charts/$($c.Path)"))) { continue }
                 $how = Resolve-Dependencies (Join-Path $exports[$ref] "deploy/charts/$($c.Path)")
                 Write-Host "        dependencies of $($c.Path): $how"
             }
@@ -147,7 +161,11 @@ try {
         $sets = @('--set', "global.imageTag=$($release.AppRevision)")
         foreach ($name in $release.ImageTags.Keys) { $sets += @('--set', "global.imageTags.$name=$($release.ImageTags[$name])") }
         foreach ($c in $charts) {
+            if ($c['Switch'] -and -not (Test-AppEnabled $envDir $c['Switch'])) { Write-Host "skip:   $($c.Name) ($env): off in envs/$env/apps.yaml"; continue }
             $chartDir = Join-Path $exports[$ref] "deploy/charts/$($c.Path)"
+            # A chart the release's procure-ai commit does not have yet: Argo CD's Application would fail the same way (push procure-ai
+            # and let its publish workflow write release.yaml first).
+            if (-not (Test-Path $chartDir)) { Fail "$($c.Name) ($env): procure-ai $ref has no deploy/charts/$($c.Path), but envs/$env/apps.yaml turns it on"; continue }
             Invoke-Render "$($c.Name) ($env)" (@($c.Name, $chartDir, '--namespace', $c.Namespace, '-f', (Join-Path $envDir $c.Values)) + $sets)
         }
 

@@ -11,6 +11,7 @@ hosts:
   app: procure.daleabels.com
   keycloak: auth.daleabels.com
   dashboard: dashboard.daleabels.com
+  rabbitmq: rabbitmq.daleabels.com
 
 # The VM's disk is 290 GB; the demo data is small. Postgres also holds the WAL the Debezium slots keep (max_slot_wal_keep_size 1GB each).
 postgres:
@@ -18,6 +19,8 @@ postgres:
 mongo:
   storage: 5Gi
 rabbitmq:
+  # The operator's own management login (Secret procure-rabbitmq key operator-password); the UI at https://<hosts.rabbitmq>.
+  operator: { key: operator-password, user: operator, tags: administrator }
   storage: 2Gi
 
 keycloak:
@@ -25,8 +28,10 @@ keycloak:
     # Plan 08 ruling 4: only Keycloak's public paths of the procure realm (no admin console, admin REST API, master realm or welcome page).
     publicPathsOnly: true
     # The demo realm and realm ops (Argo CD's sign-in, ruling R6c: the browser opens its login page at auth.daleabels.com/realms/ops/;
-    # brute-force lockout and an authenticator app protect it). Never master.
+    # brute-force lockout and an authenticator app protect it). master only with adminConsole (below).
     publicRealms: [procure, ops]
+    # The admin console and the master realm on the public host too (plan 08b Task 4): Dale manages Keycloak from any browser.
+    adminConsole: true
     # Plan 08 fix wave rulings R6b/R6c: per-client-address rate limits on every path of the Keycloak host, the token endpoints with their
     # own higher limit (numbers: the chart's defaults, deploy/charts/procure-platform/values.yaml keycloak.ingress.rateLimit). The demo
     # realm's own brute-force lockout stays off (it let anyone keep the shared demo users locked); realm ops has one.
@@ -37,3 +42,24 @@ mailpit:
   ingress:
     # Plan 08 ruling 4: no public Mailpit; kubectl port-forward svc/mailpit 8025 over the SSH tunnel.
     enabled: false
+
+# The operator's direct access (plan 08b Task 4, Dale 2026-11-08; procure-ai docs/hosting.md "Operate from the browser"): every component
+# on its own address with its own login, not through Keycloak or the gateway. The Secret keys these name come from bootstrap/new-secrets.ps1
+# (run it before this file reaches the cluster: a Secret key is never optional).
+operatorReaders:
+  postgresKey: operator-reader-postgres-password
+  mongoKey: operator-reader-mongo-password
+  redis:
+    key: operator-reader-password
+operatorAccess:
+  tools: { postgres: pgadmin, mongo: mongo-ui, redis: redis-insight }
+  rabbitmq:
+    enabled: true
+keycloakConfig:
+  # The admin console asks for a one-time code; Dale's own master admin `operator` (password and authenticator from DEMO PASSWORDS.txt).
+  masterRealm:
+    enabled: true
+  operatorUser:
+    username: operator
+    passwordKey: operator-password
+    totpKey: operator-totp-base32

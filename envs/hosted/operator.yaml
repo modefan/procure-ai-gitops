@@ -1,0 +1,10 @@
+# Values of the procure-ops chart (procure-ai deploy/charts/procure-ops) for the hosted VM: the operator's web UIs for the data stores
+# (plan 08b Task 4), each on its own public host with its own login (not Keycloak, not the gateway). No secrets here: the Secrets of
+# namespace operator come from bootstrap/new-secrets.ps1 -Environment hosted; bootstrap/hosted/Get-OperatorLogin.ps1 reads them back.
+hosts:
+  pgadmin: pgadmin.daleabels.com
+  mongo: mongo.daleabels.com
+  redis: redis.daleabels.com
+pgadmin:
+  # pgAdmin's user name (an e-mail address it never writes to).
+  email: operator@daleabels.com

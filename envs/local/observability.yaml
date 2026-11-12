@@ -3,6 +3,8 @@
 # dashboard-viewer only). No secrets here: the dashboard's client secret is Secret observability/procure-keycloak (bootstrap/new-secrets.ps1).
 hosts:
   dashboard: dashboard.procure.localtest.me
+  # The break-glass dashboard (plan 08b Task 4): its own login (Traefik basic auth), no Keycloak (Get-OperatorLogin.ps1 -Tool dashboard).
+  dashboardDirect: dashboard-direct.procure.localtest.me
   keycloak: auth.procure.localtest.me
 ingressClassName: traefik
 appNamespace: procure

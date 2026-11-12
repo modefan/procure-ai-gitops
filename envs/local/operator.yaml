@@ -1,0 +1,8 @@
+# Values of the procure-ops chart (procure-ai deploy/charts/procure-ops) for the local k3d cluster `procure`: the operator's web UIs for
+# the data stores (plan 08b Task 4). No secrets here: the Secrets of namespace operator come from bootstrap/new-secrets.ps1.
+hosts:
+  pgadmin: pgadmin.procure.localtest.me
+  mongo: mongo.procure.localtest.me
+  redis: redis.procure.localtest.me
+pgadmin:
+  email: operator@procure.localtest.me
