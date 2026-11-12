@@ -355,16 +355,17 @@ WHERE (pg_stat_file('log/postgresql-' || day || '.csv', true)).size IS NOT NULL 
     # placeholders filled in as the chart fills them, against Keycloak's partial export (secrets masked) read with kcadm in the pod: per
     # client of the file its redirect URIs, web origins, post-logout redirect URIs, default and optional client scopes (the full lists:
     # a client may name only scopes the realm defines, RealmFileTests) and client roles; the file's client scopes with their mappers; the realm roles (plus Keycloak's own). The keycloak-config Job
-    # (plan 08 ruling 7) keeps them equal on every sync. kcadm gets the admin password from the pod's environment (KC_CLI_PASSWORD).
-    $kcadmExport = @'
-export KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD"; k=/opt/keycloak/bin/kcadm.sh; c=/tmp/kcadm-smoke.config
-$k config credentials --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --config $c >/dev/null &&
+    # (plan 08 ruling 7) keeps them equal on every sync. kcadm signs in as the automation client (its secret on stdin) or, on an older
+    # cluster, as the bootstrap admin from the pod's environment (common.ps1 $KeycloakKcadmSignIn).
+    $kcadmExport = $KeycloakKcadmSignIn + "`n" + @'
+k=/opt/keycloak/bin/kcadm.sh; c=/tmp/kcadm-smoke.config
+kc_sign_in $c &&
   $k create partial-export -r procure -q exportClients=true -q exportGroupsAndRoles=true -o --config $c; rc=$?; rm -f $c; exit $rc
 '@
     $realmText = & kubectl @KubectlArgs -n procure exec deploy/keycloak -c keycloak -- cat /opt/keycloak/data/import/procure-realm.json 2>&1
     $realmOk = $LASTEXITCODE -eq 0
     # stdout is the export; stderr (kcadm's "Logging into ..." and any error) stays apart for the FAIL message.
-    $exportOut = & kubectl @KubectlArgs -n procure exec deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '') 2>&1
+    $exportOut = (Get-KeycloakKcadmSecretLine) | & kubectl @KubectlArgs -n procure exec -i deploy/keycloak -c keycloak -- bash -c ($kcadmExport -replace "`r", '') 2>&1
     $exportExit = $LASTEXITCODE
     $liveText = @($exportOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     $exportErr = @($exportOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })

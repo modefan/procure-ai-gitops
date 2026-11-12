@@ -271,6 +271,18 @@ try {
         if ($r.Status -eq 200 -and 'guest' -notin $users) { Pass "no guest user ($($users.Count) users: the apps' and the operator's)" }
         elseif ($hosted) { Fail "RabbitMQ users: $($r.Status) [$($users -join ', ')]: guest must not exist on the public host" }
         else { Write-Host 'note: the local cluster runs the apps as guest (not public)' -ForegroundColor Yellow }
+        # Fix round 1 I2: the apps' shared user has no management tag, so its password (which the services and Debezium hold) is no admin
+        # login on this public host; its AMQP connections are unaffected (the services and Debezium are connected as it).
+        $appUser = if ($secrets['rabbitmq-username']) { $secrets['rabbitmq-username'] } else { 'guest' }
+        $r = Invoke-Http "$base/api/overview" -User $appUser -Password (Get-Secret 'rabbitmq-password')
+        if ($r.Status -eq 401) { Pass "the apps' user $appUser cannot sign in to the management API (401)" } else { Fail "the apps' user $appUser on /api/overview: $($r.Status), expected 401" }
+        $r = Invoke-Http "$base/api/users/$appUser" -User 'operator' -Password $password
+        $tags = if ($r.Status -eq 200) { @(@(($r.Body | ConvertFrom-Json).tags) | Where-Object { $_ }) } else { @('?') }
+        if ($r.Status -eq 200 -and @($tags).Count -eq 0) { Pass "the apps' user $appUser has no tags (AMQP only)" } else { Fail "the apps' user $appUser tags: [$($tags -join ', ')] ($($r.Status))" }
+        $r = Invoke-Http "$base/api/connections?columns=user,client_properties.connection_name" -User 'operator' -Password $password
+        $connections = if ($r.Status -eq 200) { @($r.Body | ConvertFrom-Json | Where-Object { $_.user -eq $appUser }) } else { @() }
+        if (@($connections).Count -gt 0) { Pass "the services and Debezium are connected over AMQP as $appUser ($(@($connections).Count) connections)" }
+        else { Fail "no AMQP connection as $appUser ($($r.Status)): the apps cannot reach the broker" }
     }
 
     if ('keycloak' -in $Only) {
@@ -287,6 +299,28 @@ try {
         $password = Get-Secret 'operator-keycloak-password'
         $r = Invoke-Http $tokenUrl -Method POST -Form ([ordered]@{ grant_type = 'password'; client_id = 'admin-cli'; username = 'operator'; password = $password })
         if (Test-Refused $r) { Pass "operator's password alone gets no token ($($r.Status): the one-time code is required)" } else { Fail "operator's password alone: $($r.Status), expected 400/401 invalid_grant" }
+        # Fix round 1 (review I3/R3): the bootstrap admin is disabled (break-glass only) and, like every master-realm user, would need a code
+        # anyway; the automation signs in as the confidential client procure-automation (client credentials, no user to lock out).
+        $r = Invoke-Http $tokenUrl -Method POST -Form ([ordered]@{ grant_type = 'password'; client_id = 'admin-cli'; username = $(if ($secrets['keycloak-admin']) { $secrets['keycloak-admin'] } else { 'keycloak-admin' }); password = (Get-Secret 'keycloak-admin-password') })
+        if (Test-Refused $r) { Pass "the bootstrap admin's password gets no token ($($r.Status) $(if ($r.Body -match 'disabled') { 'account disabled' } else { 'refused' }))" }
+        else { Fail "the bootstrap admin's password: $($r.Status), expected a refusal" }
+        $r = Invoke-Http $tokenUrl -Method POST -Form ([ordered]@{ grant_type = 'client_credentials'; client_id = 'procure-automation'; client_secret = (Get-Secret 'keycloak-automation-client-secret') })
+        $adminToken = if ($r.Status -eq 200) { try { ($r.Body | ConvertFrom-Json).access_token } catch { $null } }
+        if ($adminToken) { Pass 'the automation client procure-automation gets a token with its secret (client credentials)' } else { Fail "procure-automation client credentials: $($r.Status)" }
+        $r = Invoke-Http $tokenUrl -Method POST -Form ([ordered]@{ grant_type = 'password'; client_id = 'procure-automation'; client_secret = (Get-Secret 'keycloak-automation-client-secret'); username = 'operator'; password = $password; totp = '000000' })
+        if ($r.Status -in 400, 401 -and $r.Body -notmatch 'access_token') { Pass "procure-automation allows no password grant ($($r.Status))" } else { Fail "procure-automation password grant: $($r.Status), expected a refusal" }
+        if ($adminToken) {
+            $adminName = if ($secrets['keycloak-admin']) { $secrets['keycloak-admin'] } else { 'keycloak-admin' }
+            $r = Invoke-Http "$base/admin/realms/master/users?exact=true&username=$([uri]::EscapeDataString($adminName))" -Header @{ Authorization = "Bearer $adminToken" }
+            $found = try { @($r.Body | ConvertFrom-Json) } catch { @() }
+            if ($r.Status -eq 200 -and @($found).Count -eq 1 -and -not @($found)[0].enabled) { Pass "the bootstrap admin $adminName exists and is disabled (break-glass)" }
+            else { Fail "the bootstrap admin ${adminName}: $($r.Status), $(@($found).Count) found, enabled $($found | ForEach-Object enabled)" }
+            $r = Invoke-Http "$base/admin/realms/master" -Header @{ Authorization = "Bearer $adminToken" }
+            $realm = try { $r.Body | ConvertFrom-Json } catch { $null }
+            if ($realm -and $realm.directGrantFlow -eq 'operator direct grant' -and $realm.browserFlow -eq 'operator browser') { Pass "the master realm binds 'operator browser' and 'operator direct grant' (one-time code for every password sign-in)" }
+            else { Fail "the master realm's flows: browser '$($realm.browserFlow)', direct grant '$($realm.directGrantFlow)'" }
+            $adminToken = $null
+        }
         # The browser sign-in of the admin console: password, then the one-time code, then the redirect with an authorization code.
         $verifier = -join ((1..64) | ForEach-Object { 'abcdefghijklmnopqrstuvwxyz0123456789'[(Get-Random -Maximum 36)] })
         $challenge = [Convert]::ToBase64String([Security.Cryptography.SHA256]::HashData([Text.Encoding]::ASCII.GetBytes($verifier))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
@@ -306,6 +340,14 @@ try {
             else { Fail "after the one-time code the sign-in answered $($done.Status) '$($done.Location)'" }
             Test-CookieFlags 'Keycloak' @($done.Cookies | Where-Object { $_ -match 'KEYCLOAK_SESSION|KEYCLOAK_IDENTITY' }) -SecureOnly 'KEYCLOAK_SESSION'
         }
+        # A password grant with the password AND a code works (direct grant flow "operator direct grant", fix round 1). A code is good once
+        # (Keycloak's OTP policy: not reusable), so wait for the next 30-second step after the browser sign-in's code.
+        $offset = [int] (Get-ServerClockOffset $base $ResolveTo)
+        Start-Sleep -Seconds ((Get-TotpCode (Get-Secret 'operator-keycloak-totp-base32') -OffsetSeconds $offset).SecondsLeft + 1)
+        $code = (Get-TotpCode (Get-Secret 'operator-keycloak-totp-base32') -OffsetSeconds $offset).Code
+        $r = Invoke-Http $tokenUrl -Method POST -Form ([ordered]@{ grant_type = 'password'; client_id = 'admin-cli'; username = 'operator'; password = $password; totp = $code })
+        if ($r.Status -eq 200 -and $r.Body -match 'access_token') { Pass "operator's password AND the current one-time code get a token (OTP REQUIRED in password grants)" }
+        else { Fail "operator's password and code: $($r.Status), expected 200 with a token" }
     }
 
     if ('dashboard' -in $Only) {
@@ -328,6 +370,27 @@ try {
         $foreign = Invoke-Http "$base/_blazor?id=operator-probe" -User 'operator' -Password $password -Header ($ws + @{ Origin = 'https://evil.example' })
         if ($foreign.Status -eq 403 -and $own.Status -in 400, 404) { Pass "its WebSocket: own Origin passes the origin check ($($own.Status) unknown circuit), a foreign one gets 403" }
         else { Fail "dashboard WebSocket: own Origin $($own.Status), foreign $($foreign.Status) (expected 400/404 and 403)" }
+    }
+
+    # --- 4b. Cross-site requests (fix round 1, review M5) ----------------------------------------------------------------------------
+    # A browser sends a cached basic-auth login (and cookies) with requests other sites make, and a text/plain POST needs no CORS preflight
+    # (RabbitMQ's management API published a message that way before the guard). Every request with a foreign Origin gets 403 from Traefik,
+    # with the right login too; the tool's own Origin and requests without one pass.
+    $originProbes = [ordered]@{
+        pgadmin  = @{ Path = '/login'; User = ''; Password = '' }
+        mongo    = @{ Path = '/'; User = 'operator'; Password = $(if ('mongo' -in $Only) { Get-Secret 'operator-mongo-ui-password' }) }
+        redis    = @{ Path = '/'; User = 'operator'; Password = $(if ('redis' -in $Only) { Get-Secret 'operator-redis-insight-password' }) }
+        rabbitmq = @{ Path = '/api/overview'; User = 'operator'; Password = $(if ('rabbitmq' -in $Only) { Get-Secret 'operator-rabbitmq-password' }) }
+    }
+    $originTools = @($Only | Where-Object { $originProbes.Contains($_) })
+    if ($originTools) { Write-Step 'Cross-site requests (a foreign Origin) are refused' }
+    foreach ($tool in $originTools) {
+        $p = $originProbes[$tool]; $base = "https://$($hostOf[$tool])"
+        $foreign = Invoke-Http "$base$($p.Path)" -Method POST -User $p.User -Password $p.Password -Header @{ Origin = 'https://evil.example'; 'Content-Type' = 'text/plain' } -Body 'operator-origin-probe'
+        $foreignGet = Invoke-Http "$base$($p.Path)" -User $p.User -Password $p.Password -Header @{ Origin = 'https://evil.example' }
+        $own = Invoke-Http "$base$($p.Path)" -User $p.User -Password $p.Password -Header @{ Origin = $base }
+        if ($foreign.Status -eq 403 -and $foreignGet.Status -eq 403 -and $own.Status -ne 403) { Pass "$($tool): a foreign Origin gets 403 (POST and GET, with the right login), its own Origin $($own.Status)" }
+        else { Fail "$($tool): foreign Origin POST $($foreign.Status), GET $($foreignGet.Status) (expected 403); own Origin $($own.Status)" }
     }
 
     # --- 5. Raw ports closed from the internet ---------------------------------------------------------------------------------------
@@ -391,14 +454,22 @@ rm -f /tmp/probe.js
         $redis = Invoke-InPod 'deploy/redis' '' (Get-Secret 'operator-reader-redis-password') @'
 export REDISCLI_AUTH="$P"
 c() { printf '%s=' "$1"; shift; redis-cli --no-auth-warning --user operator_reader "$@" 2>&1 | head -n 1; }
-c ping PING; c get GET operator-probe; c scan SCAN 0 COUNT 10; c set SET operator-probe 1; c del DEL operator-probe; c keys KEYS '*'
+c ping PING; c get GET v2:operator-probe; c scan SCAN 0 COUNT 10; c set SET v2:operator-probe 1; c del DEL v2:operator-probe; c keys KEYS '*'
 c flushall FLUSHALL; c config CONFIG GET maxmemory; c debug DEBUG SLEEP 0; c acl ACL LIST; c eval EVAL 'return 1' 0
+c ring LRANGE procure:bff:data-protection-keys 0 0; c ringtype TYPE procure:bff:data-protection-keys
+c session GET procure:bff:session:operator-probe; c user HGETALL procure:bff:user:operator-probe; c ticket GET procure:bff:switch-ticket:operator-probe
+c other GET operator-probe-not-allowed
 '@
         $v = @{}; foreach ($line in $redis) { if ($line -match '^(\w+)=(.*)$') { $v[$Matches[1]] = $Matches[2] } }
-        if ($v.ping -eq 'PONG' -and $v.get -notmatch 'NOPERM' -and $v.scan -notmatch 'NOPERM') { Pass 'Redis: operator_reader may PING, GET and SCAN' } else { Fail "Redis reads: ping '$($v.ping)' get '$($v.get)' scan '$($v.scan)'" }
+        if ($v.ping -eq 'PONG' -and $v.get -notmatch 'NOPERM' -and $v.scan -notmatch 'NOPERM') { Pass 'Redis: operator_reader may PING, GET (an allowed key family) and SCAN' } else { Fail "Redis reads: ping '$($v.ping)' get '$($v.get)' scan '$($v.scan)'" }
         foreach ($k in 'set', 'del', 'keys', 'flushall', 'config', 'debug', 'acl', 'eval') {
             # DEBUG is refused before the ACL is asked (enable-debug-command is off on the server); either refusal counts.
             if ($v[$k] -match 'NOPERM|DEBUG command not allowed') { Pass "Redis: $($k.ToUpper()) refused ($(($v[$k] -split ' ')[0]))" } else { Fail "Redis $($k.ToUpper()): '$($v[$k])' (expected a refusal)" }
+        }
+        # Fix round 1 I1: the gateway's Data Protection key ring and its session, user and tenant-switch tickets are not readable (with them
+        # a reader could forge a session for any signed-in user); nor is a key outside the allow-list.
+        foreach ($k in 'ring', 'ringtype', 'session', 'user', 'ticket', 'other') {
+            if ($v[$k] -match 'NOPERM') { Pass "Redis: operator_reader cannot read the gateway's secrets ($($k): NOPERM)" } else { Fail "Redis $($k): '$($v[$k])' (expected NOPERM: the key ring and tickets must stay closed)" }
         }
     }
 

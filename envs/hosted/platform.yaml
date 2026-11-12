@@ -19,7 +19,8 @@ postgres:
 mongo:
   storage: 5Gi
 rabbitmq:
-  # The operator's own management login (Secret procure-rabbitmq key operator-password); the UI at https://<hosts.rabbitmq>.
+  # The operator's own management login (Secret procure-rabbitmq key operator-password); the UI at https://<hosts.rabbitmq>. The apps'
+  # user then loses its management tags (AMQP only; plan 08b Task 4 fix round 1).
   operator: { key: operator-password, user: operator, tags: administrator }
   storage: 2Gi
 
@@ -56,9 +57,17 @@ operatorAccess:
   rabbitmq:
     enabled: true
 keycloakConfig:
-  # The admin console asks for a one-time code; Dale's own master admin `operator` (password and authenticator from DEMO PASSWORDS.txt).
+  # Every password sign-in to the master realm asks for a one-time code (admin console and password grants); Dale's own master admin
+  # `operator` (password and authenticator from DEMO PASSWORDS.txt).
   masterRealm:
     enabled: true
+  # The automation signs in as the confidential client procure-automation (client credentials, Secret procure-keycloak key
+  # automation-client-secret from bootstrap/new-secrets.ps1), never with a password; the bootstrap admin is disabled once the client works
+  # (break-glass only: procure-ai docs/hosting.md "Keycloak's automation client and the bootstrap admin"). Plan 08b Task 4 fix round 1.
+  automationClient:
+    clientId: procure-automation
+    secretKey: automation-client-secret
+    disableBootstrapAdmin: true
   operatorUser:
     username: operator
     passwordKey: operator-password

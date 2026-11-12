@@ -32,19 +32,21 @@ $failures = [System.Collections.Generic.List[string]]::new()
 function Pass([string] $message) { Write-Host "  PASS  $message" -ForegroundColor Green }
 function Fail([string] $message) { Write-Host "  FAIL  $message" -ForegroundColor Red; $failures.Add($message) }
 
-# kcadm in the Keycloak pod, signed in as the bootstrap admin from the pod's environment (KC_CLI_PASSWORD: not on a command line).
-$preamble = @'
+# kcadm in the Keycloak pod, signed in as the automation client (its secret as stdin's first line) or, on an older cluster, as the bootstrap
+# admin from the pod's environment (common.ps1 $KeycloakKcadmSignIn; nothing secret on a command line).
+$preamble = $KeycloakKcadmSignIn + "`n" + @'
 set -eu
 export HOME=/tmp
 cfg=$(mktemp /tmp/kcadm-XXXXXX.config)
 trap 'rm -f "$cfg"' EXIT
 K=/opt/keycloak/bin/kcadm.sh
-KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" $K config credentials --config "$cfg" --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" </dev/null >/dev/null 2>&1
+kc_sign_in "$cfg"
 kc() { $K "$@" --config "$cfg" -r ops; }
 '@
+$kcadmSecret = Get-KeycloakKcadmSecretLine
 function Invoke-Kc([string] $body, [string[]] $arguments = @()) {
     $text = ($preamble + "`n" + $body) -replace "`r", ''
-    $out = & kubectl @KubectlArgs -n procure exec deploy/keycloak -c keycloak -- bash -c $text _ @arguments 2>&1
+    $out = $kcadmSecret | & kubectl @KubectlArgs -n procure exec -i deploy/keycloak -c keycloak -- bash -c $text _ @arguments 2>&1
     if ($LASTEXITCODE -ne 0) { throw "kcadm failed ($LASTEXITCODE): $(($out | ForEach-Object { "$_" }) -join ' ')" }
     @($out | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^Logging into' })
 }

@@ -165,11 +165,12 @@ foreach ($ns in $Namespaces) {
 
 $expectedSecrets = [ordered]@{
     'procure-postgres'           = @('password')
-    'procure-rabbitmq'           = @('username', 'password')
-    'procure-redis'              = @('password')
+    'procure-rabbitmq'           = @('username', 'password', 'operator-password')
+    'procure-redis'              = @('password', 'operator-reader-password')
     'procure-mongo'              = @('username', 'password', 'keyfile')
     'procure-keycloak'           = @('admin-username', 'admin-password', 'demo-password', 'gateway-secret', 'internal-secret',
-                                     'access-admin-secret', 'demo-login-secret', 'dashboard-secret', 'db-password')
+                                     'access-admin-secret', 'demo-login-secret', 'dashboard-secret', 'db-password',
+                                     'operator-password', 'operator-totp-base32', 'automation-client-secret')
     'procure-debezium'           = @('mongo-password')
     'procure-db-roles'           = @('access-password', 'approvals-password', 'assistant-password', 'audit-password', 'budgets-password',
                                      'invoicing-password', 'purchasing-password', 'requests-password', 'suppliers-password',

@@ -196,8 +196,9 @@ try {
     $r = Invoke-Http "https://$KeycloakHost/admin/realms/procure/users"
     if ($r.Status -eq 401) { Pass 'the admin REST API answers 401 without a token' } else { Fail "/admin/realms/procure/users answered $($r.Status) without a token, expected 401" }
     $r = Invoke-Http "https://$KeycloakHost/realms/master/protocol/openid-connect/token" -Method POST -Extra @('--data', 'grant_type=password&client_id=admin-cli&username=surface-probe&password=x')
-    if ($r.Status -eq 401) { Pass "the master realm's token endpoint refuses wrong credentials (401)" }
-    else { Fail "the master realm token endpoint answered $($r.Status) to wrong credentials, expected 401" }
+    # 401, or 400 invalid_grant (Keycloak 26.8 for some refusals; tests/Test-OperatorTools.ps1); never a token.
+    if ($r.Status -in 400, 401 -and $r.Body -notmatch 'access_token') { Pass "the master realm's token endpoint refuses wrong credentials ($($r.Status))" }
+    else { Fail "the master realm token endpoint answered $($r.Status) to wrong credentials, expected 401 or 400" }
     $masterIssuer = "https://$KeycloakHost/realms/master"
     $r = Invoke-Http "$masterIssuer/.well-known/openid-configuration"
     if ($r.Status -eq 200 -and ($r.Body | ConvertFrom-Json).issuer -eq $masterIssuer) { Pass "the master realm's discovery answers 200, issuer $masterIssuer" }

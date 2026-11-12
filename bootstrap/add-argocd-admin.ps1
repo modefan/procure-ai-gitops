@@ -9,8 +9,9 @@
     For Dale's own user (CLAUDE.md "Hosting plan": he picks the user name and password himself; Claude does not create it). Keycloak's
     admin console is not reachable on the hosted VM (the public host serves /realms/procure/ and /realms/ops/ only, and the console always
     sends the browser to that public host), so this script uses Keycloak's own admin CLI (kcadm.sh) inside the Keycloak pod, through the SSH tunnel:
-      - signs in to the master realm as the bootstrap admin from the pod's own environment (KC_CLI_PASSWORD, so no admin password leaves
-        the cluster or appears on a command line),
+      - signs in to the master realm as the automation client procure-automation (its secret from Secret procure-keycloak, to the pod on
+        kubectl's stdin; plan 08b Task 4 fix round 1), or on an older cluster as the bootstrap admin from the pod's own environment
+        (KC_CLI_PASSWORD), so no admin secret appears on a command line,
       - creates the user (enabled, e-mail verified) and sets its password, which goes to the pod on kubectl's stdin and to Keycloak on
         kcadm's stdin (never on a command line),
       - makes sure the user must set up an authenticator app at the next sign-in (required action Configure OTP) unless it already has
@@ -66,9 +67,10 @@ function Read-NewPassword {
     $a
 }
 
-# bash in the Keycloak pod. Arguments: action (check | add | remove), user name, first name, last name, e-mail. For add, the first stdin
-# line is the password credential as one line of JSON (empty: keep the password). `check` and `add` run the same guard (refuse.. exit 6).
-$script = @'
+# bash in the Keycloak pod. Arguments: action (check | add | remove), user name, first name, last name, e-mail. stdin: the first line is
+# the automation client's secret for kc_sign_in (common.ps1 $KeycloakKcadmSignIn; empty: the bootstrap admin), the second, for add, the
+# password credential as one line of JSON (empty: keep the password). `check` and `add` run the same guard (refuse.. exit 6).
+$script = $KeycloakKcadmSignIn + "`n" + @'
 set -eu
 export HOME=/tmp
 cfg=$(mktemp /tmp/kcadm-XXXXXX.config)
@@ -76,7 +78,7 @@ trap 'rm -f "$cfg"' EXIT
 K="/opt/keycloak/bin/kcadm.sh"
 IFS= read -r CRED || true
 CRED=${CRED%$'\r'}   # PowerShell ends the piped line with CRLF
-KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" $K config credentials --config "$cfg" --server http://localhost:8080 --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" </dev/null >/dev/null 2>&1 || { echo "admin sign-in to Keycloak (master realm) failed"; exit 2; }
+kc_sign_in "$cfg" || { echo "admin sign-in to Keycloak (master realm) failed"; exit 2; }
 kc() { $K "$@" --config "$cfg" -r ops; }
 ACTION=$1; NAME=$2; EMAIL=${5:-}
 GID=$(kc get groups -q exact=true -q search=argocd-admins --fields id,name --format csv --noquotes | while IFS=, read -r id name; do [ "$name" = argocd-admins ] && echo "$id"; done || true)
@@ -144,8 +146,9 @@ echo "members of argocd-admins:"
 kc get "groups/$GID/members" --fields username --format csv --noquotes
 '@ -replace "`r", ''
 
+$kcadmSecret = Get-KeycloakKcadmSecretLine
 function Invoke-KeycloakScript([string] $action, [string] $stdinLine = '') {
-    $out = $stdinLine | & kubectl @KubectlArgs -n procure exec -i deploy/keycloak -c keycloak -- bash -c $script _ $action $UserName $FirstName $LastName $Email 2>&1
+    $out = ($kcadmSecret + "`n" + $stdinLine) | & kubectl @KubectlArgs -n procure exec -i deploy/keycloak -c keycloak -- bash -c $script _ $action $UserName $FirstName $LastName $Email 2>&1
     $code = $LASTEXITCODE
     $lines = @($out | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^Logging into' })
     if ($code -eq 6) { throw ($lines -join [Environment]::NewLine) }

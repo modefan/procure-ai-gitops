@@ -21,7 +21,8 @@
       procure-redis              password
       procure-mongo              username, password, keyfile
       procure-keycloak           admin-username, admin-password, demo-password, gateway-secret, internal-secret, access-admin-secret,
-                                 demo-login-secret, dashboard-secret, db-password
+                                 demo-login-secret, dashboard-secret, db-password, automation-client-secret (the master-realm client
+                                 procure-automation the keycloak-config Job and kcadm sign in with; plan 08b Task 4 fix round 1)
       procure-debezium           mongo-password (debezium-mongo's MongoDB user)
       procure-db-roles           <service>-password (accessdb ... requestsdb, suppliers on MongoDB), <service>-cdc-password (each Postgres
                                  database a Debezium reads), assistant-mongo-password, audit-log-reader-password: what the platform's
@@ -98,6 +99,10 @@ $operatorParameters = 'operator-pgadmin-password', 'operator-pgadmin-totp-base32
     'operator-redis-insight-encryption-key', 'operator-rabbitmq-password', 'operator-keycloak-password', 'operator-keycloak-totp-base32',
     'operator-dashboard-token'
 $required += $operatorParameters
+# The automation's own Keycloak master-realm client procure-automation (plan 08b Task 4 fix round 1; procure-ai keycloakConfig.automationClient):
+# the keycloak-config Job and kcadm sign in with it instead of the bootstrap admin's password. Generated in both stores.
+$automationParameters = @('keycloak-automation-client-secret')
+$required += $automationParameters
 
 function New-RandomText([int] $length) {
     [Security.Cryptography.RandomNumberGenerator]::GetString([char[]] 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', $length)
@@ -116,7 +121,7 @@ function Test-Missing([string] $name) { -not $secrets.ContainsKey("Parameters:$n
 # new in plan 07 and 08; the AppHost generates the same names on its first run (persisted parameters), whichever runs first, both then
 # share the value. Hosted: every value (the store is this script's alone), plus the user name the hosted RabbitMQ uses.
 $generated = [ordered]@{}
-$toGenerate = if ($hosted) { $required } else { @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords + $operatorParameters }
+$toGenerate = if ($hosted) { $required } else { @('keycloak-db-password', 'keycloak-dashboard-secret', 'debezium-mongo-password') + $databasePasswords + $operatorParameters + $automationParameters }
 foreach ($name in $toGenerate) {
     if (-not (Test-Missing $name)) { continue }
     switch ($name) {
@@ -250,6 +255,8 @@ Set-ProcureSecret procure-keycloak ([ordered]@{
     # Dale's own master-realm admin `operator` (plan 08b Task 4; the keycloak-config Job's operator-user container).
     'operator-password'    = Get-Parameter 'operator-keycloak-password'
     'operator-totp-base32' = Get-Parameter 'operator-keycloak-totp-base32'
+    # The automation's master-realm client procure-automation (plan 08b Task 4 fix round 1): the keycloak-config Job and kcadm sign in with it.
+    'automation-client-secret' = Get-Parameter 'keycloak-automation-client-secret'
 })
 # The Aspire dashboard (namespace observability) gets only its own client secret, not the other Keycloak values; the break-glass dashboard
 # (plan 08b Task 4) the basic-auth login Traefik asks for in front of it (the entry keeps its first name, operator-dashboard-token).

@@ -8,3 +8,18 @@ hosts:
   keycloak: auth.procure.localtest.me
 ingressClassName: traefik
 appNamespace: procure
+
+# The break-glass dashboard (plan 08b Task 4; off in the chart by default, fix round 1 M4) and the collector's second exporter to it in
+# every pipeline (the exporter otlp/direct itself is defined in the chart's values).
+dashboardDirect:
+  enabled: true
+opentelemetry-collector:
+  alternateConfig:
+    service:
+      pipelines:
+        logs:
+          exporters: [otlp, otlp/direct]
+        metrics:
+          exporters: [otlp, otlp/direct]
+        traces:
+          exporters: [otlp, otlp/direct]

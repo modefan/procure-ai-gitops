@@ -571,3 +571,30 @@ function Read-OperatorSecrets([ValidateSet('hosted', 'local')] [string] $Environ
     if ($Environment -eq 'hosted') { Read-DemoPasswordSection 'procure-ai hosted (Contabo) secrets' '' $Path }
     else { Read-DemoPasswordSection 'procure-ai local: all AppHost user secrets' 'Parameters:' $Path }
 }
+
+# kcadm inside the Keycloak pod (add-argocd-admin.ps1, tests/Test-AddArgocdAdmin.ps1, tests/Test-Smoke.ps1) signs in to the master realm as
+# the automation client procure-automation (plan 08b Task 4 fix round 1: the bootstrap admin is disabled once that client works) when Secret
+# procure-keycloak holds automation-client-secret, else as the bootstrap admin from the pod's own environment. The client's secret goes to
+# the pod as the FIRST line of kubectl exec's stdin (Get-KeycloakKcadmSecretLine), never on a command line; $KeycloakKcadmSignIn is the bash
+# that reads that line and defines kc_sign_in <config file>.
+$script:KeycloakKcadmSignIn = @'
+IFS= read -r KC_AUTOMATION_SECRET || true
+KC_AUTOMATION_SECRET=${KC_AUTOMATION_SECRET%$'\r'}
+kc_sign_in() {
+  if [ -n "$KC_AUTOMATION_SECRET" ]; then
+    KC_CLI_CLIENT_SECRET="$KC_AUTOMATION_SECRET" /opt/keycloak/bin/kcadm.sh config credentials --config "$1" --server http://localhost:8080 \
+      --realm master --client procure-automation </dev/null >/dev/null 2>&1
+  else
+    KC_CLI_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" /opt/keycloak/bin/kcadm.sh config credentials --config "$1" --server http://localhost:8080 \
+      --realm master --user "$KC_BOOTSTRAP_ADMIN_USERNAME" </dev/null >/dev/null 2>&1
+  fi
+}
+'@ -replace "`r", ''
+
+function Get-KeycloakKcadmSecretLine {
+    # The automation client's secret from Secret procure/procure-keycloak (key automation-client-secret), '' when the key does not exist (an
+    # older cluster: kc_sign_in then uses the bootstrap admin). Never printed.
+    $encoded = & kubectl @script:KubectlArgs -n procure get secret procure-keycloak -o 'jsonpath={.data.automation-client-secret}' 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$encoded")) { return '' }
+    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("$encoded".Trim()))
+}
