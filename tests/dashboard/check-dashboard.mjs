@@ -172,15 +172,26 @@ try {
   // 3. Each service has fresh rows: its own page (/structuredlogs/resource/<name>, /traces/resource/<name>), newest row's time.
   for (const name of ['structuredlogs', 'traces']) {
     for (const service of servicesOf[name]) {
-      const response = await page.goto(`${base}/${name}/resource/${encodeURIComponent(service)}`, { waitUntil: 'load' });
-      const serverDate = response && response.headers()['date'] ? new Date(response.headers()['date']) : null;
-      const now = serverDate && !isNaN(serverDate) ? serverDate : new Date();
-      const loaded = await waitForRows(page);
-      if (loaded.ms === null) { fail(`/${name}/resource/${service}: no rows (grid ${loaded.grid.found ? `holds ${loaded.grid.count}` : 'not found'})`); continue; }
-      const grid = await scrollGridToEnd(page);
-      const col = grid.headers.indexOf('Timestamp');
-      const ages = grid.rows.map(r => ageMinutes(r[col], now)).filter(a => a !== null);
-      const newest = ages.length ? Math.min(...ages) : null;      if (newest !== null && newest <= maxAgeMin) ok(`/${name}/resource/${service}: newest row ${newest.toFixed(1)} min old (${grid.count} in all)`);
+      // A service that logs little (requests-api: one row per check run) can show a stale newest row when that row lands just after
+      // the read, or when the grid is still partly drawn (2026-11-13: 209 min old, then 0.7 min on the next run). Read up to 3 times,
+      // 10 s apart, reloading the page each time, before calling it stale.
+      let grid = null, col = -1, now = new Date(), newest = null, noRows = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) await page.waitForTimeout(10000);
+        const response = await page.goto(`${base}/${name}/resource/${encodeURIComponent(service)}`, { waitUntil: 'load' });
+        const serverDate = response && response.headers()['date'] ? new Date(response.headers()['date']) : null;
+        now = serverDate && !isNaN(serverDate) ? serverDate : new Date();
+        const loaded = await waitForRows(page);
+        if (loaded.ms === null) { noRows = loaded; continue; }
+        noRows = null;
+        grid = await scrollGridToEnd(page);
+        col = grid.headers.indexOf('Timestamp');
+        const ages = grid.rows.map(r => ageMinutes(r[col], now)).filter(a => a !== null);
+        newest = ages.length ? Math.min(...ages) : null;
+        if (newest !== null && newest <= maxAgeMin) break;
+      }
+      if (noRows) { fail(`/${name}/resource/${service}: no rows (grid ${noRows.grid.found ? `holds ${noRows.grid.count}` : 'not found'})`); continue; }
+      if (newest !== null && newest <= maxAgeMin) ok(`/${name}/resource/${service}: newest row ${newest.toFixed(1)} min old (${grid.count} in all)`);
       else fail(`/${name}/resource/${service}: newest row ${newest === null ? 'has no time' : `${newest.toFixed(1)} min old`}, expected under ${maxAgeMin} min (${grid.count} in all)`);
       // Traces: some trace from the window is a request that came in through the gateway (its name is "<root resource>: <operation>").
       // Not only the newest one: a message or job trace may land between this check's own request and the page read (review I2).
