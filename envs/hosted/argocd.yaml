@@ -1,12 +1,29 @@
 # Values of the argo-cd chart for the hosted VM, over argocd/values.yaml (plan 08 Task 12c): the second values file of the argocd
-# Application (apps chart) and of bootstrap/install-argocd.ps1. The switches (admin user on as break-glass, no ingress) stay in
+# Application (apps chart) and of bootstrap/install-argocd.ps1. The switches (admin user on as break-glass, ingress on) stay in
 # envs/hosted/apps.yaml.
+#
+# The public host https://argocd.daleabels.com (plan 08c Task 1, rulings R1-R4, R9-R10; Dale 2026-11-13: "hide it behind keycloak so that only
+# me and you can get in"). Every request to the host passes, in Traefik:
+#   1. the edge router below (IngressRoute argocd-edge, highest priority): POST /api/v1/session and the gRPC-web session create (the
+#      username/password login, i.e. the break-glass admin) and cross-site requests (a foreign Origin) answer 403 and never reach Argo CD
+#      (R2: admin stays break-glass, through the tunnel only); /oauth2/ goes to the gate itself (sign-in start, Keycloak's callback);
+#   2. everything else: the chart's Ingress (server.ingress, switched on by argocd.ingressEnabled in envs/hosted/apps.yaml) with the
+#      middlewares rate limit, security headers and the Keycloak gate: a Traefik forwardAuth to oauth2-proxy (argocd-gate below), which
+#      answers 202 for a gate session of a member of the Keycloak group argocd-admins (realm ops; Traefik then passes the request to
+#      argocd-server), 302 to Keycloak's sign-in for a browser without one (401 for an API call with Accept: application/json), and 403
+#      for anyone signed in to realm ops but not in the group. No Argo CD page or API answer reaches anyone else.
+# Behind the gate Argo CD signs people in with Keycloak as before ("Log in via Keycloak"; silent, the same Keycloak session). The tunnel
+# path stays: bootstrap/hosted/open-argocd.ps1 -Tunnel (kubectl port-forward to 127.0.0.1:8080, no gate; admin, SSO through additionalUrls).
+# Claude uses the `claude` API token and kubectl through the tunnel (R10: no Claude user in Keycloak; it requires an authenticator app).
 configs:
   cm:
-    # No public address: Argo CD is opened through the SSH tunnel and `kubectl port-forward` on Dale's PC
-    # (bootstrap/hosted/open-argocd.ps1, 127.0.0.1:8080). The OIDC redirect URIs are <url>/auth/callback and <url>/pkce/verify, which the
-    # Keycloak client `argocd` allows (platform chart keycloak.argocdUrl, default http://127.0.0.1:8080: keep both equal).
-    url: http://127.0.0.1:8080
+    # The address people open (R3); the OIDC redirect URIs are <url>/auth/callback and <url>/pkce/verify, which the Keycloak client
+    # `argocd` allows (platform chart keycloak.argocdUrl in envs/hosted/platform.yaml: keep both equal).
+    url: https://argocd.daleabels.com
+    # The tunnel's port-forward (open-argocd.ps1 -Tunnel): Argo CD answers a request to this address with redirect URIs under it, so a
+    # tunnel session still finishes the Keycloak sign-in (the client also allows them: keycloak.argocdTunnelUrl, default 127.0.0.1:8080).
+    additionalUrls: |
+      - http://127.0.0.1:8080
     # Keycloak sign-in (see the header of argocd/values.yaml): realm ops (not the demo realm; ruling R6c) at auth.daleabels.com (Let's Encrypt certificate; the
     # server reaches it through the CoreDNS rewrite, bootstrap/hosted/coredns-custom.yaml). Public client with PKCE, no client secret.
     oidc.config: |
@@ -17,20 +34,36 @@ configs:
       requestedScopes: ["openid", "profile"]
       refreshTokenThreshold: 2m
 
-# Network policies (review 12c M5). The chart's own NetworkPolicy for argocd-server allows ingress from everywhere (`ingress: [{}]`, not
-# configurable), so with the admin login on (break-glass) every pod of the cluster could try POST /api/v1/session as admin. On the VM nobody
-# needs to reach argocd-server over the pod network: there is no ingress (people and Claude come through `kubectl port-forward`, which the
-# kubelet carries into the pod's own network namespace, so a NetworkPolicy does not apply to it), and no Argo CD component calls the server
-# (the controller and the repo server talk to each other and to Redis). The chart's policies are switched off here and the same set is
-# declared below, with argocd-server allowing no ingress at all. The other three are copies of the chart's (10.11.7) policies: compare
-# them with the chart when argocd.chartVersion changes (tests/Test-ArgocdNetworkPolicy.ps1 renders the chart and checks the set).
-# Local keeps the chart's policies (its Traefik ingress must reach the server).
+server:
+  ingress:
+    # Default only: argocd.ingressEnabled (envs/hosted/apps.yaml) decides. The chart's Ingress serves every path of the host except what the
+    # edge router (extraObjects) takes first; its middlewares (Traefik, namespace argocd) are declared in extraObjects too.
+    hostname: argocd.daleabels.com
+    annotations:
+      traefik.ingress.kubernetes.io/router.middlewares: argocd-edge-ratelimit@kubernetescrd,argocd-edge-headers@kubernetescrd,argocd-edge-gate@kubernetescrd
+    # No secretName: Traefik's default certificate, the Let's Encrypt one of bootstrap/hosted/install-cert-manager.ps1 (its name list is
+    # bootstrap/common.ps1 $HostedDnsHosts, which holds argocd).
+    tls: false
+    extraTls:
+      - hosts:
+          - argocd.daleabels.com
+
+# Network policies (review 12c M5; plan 08c Task 1). The chart's own NetworkPolicy for argocd-server allows ingress from everywhere (`ingress:
+# [{}]`, not configurable), so with the admin login on (break-glass) every pod of the cluster could try POST /api/v1/session as admin. The
+# chart's policies are switched off here and the same set is declared below. argocd-server: with the ingress on, Traefik's pods only (k3s's
+# bundled Traefik in kube-system, hostPorts 80/443 on the node, so its pod address is the source), on the server port; with it off, no
+# ingress at all. People and Claude also come through `kubectl port-forward`, which the kubelet carries into the pod's own network namespace,
+# so a NetworkPolicy does not apply to it; no Argo CD component calls the server. The other three are copies of the chart's (10.11.7)
+# policies: compare them with the chart when argocd.chartVersion changes (tests/Test-ArgocdNetworkPolicy.ps1 renders the chart and checks the
+# set). Local keeps the chart's policies (its Traefik ingress must reach the server).
 global:
   networkPolicy:
     create: false
 
 extraObjects:
-  - apiVersion: networking.k8s.io/v1
+  # A string, so the chart's tpl sees the ingress switch (the chart renders every extraObjects entry through tpl).
+  - |
+    apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy
     metadata:
       name: argocd-server
@@ -40,8 +73,18 @@ extraObjects:
       podSelector:
         matchLabels: { app.kubernetes.io/name: argocd-server, app.kubernetes.io/instance: argocd }
       policyTypes: [Ingress]
+    {{- if .Values.server.ingress.enabled }}
+      # Traefik's pods only, on the server's port (kubelet probes from the node are still allowed by k3s's policy controller).
+      ingress:
+        - from:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+              podSelector: { matchLabels: { app.kubernetes.io/name: traefik } }
+          ports:
+            - { port: server, protocol: TCP }
+    {{- else }}
       # No rule: no ingress over the pod network (kubelet probes from the node are still allowed by k3s's policy controller).
       ingress: []
+    {{- end }}
   - apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy
     metadata:
@@ -95,3 +138,241 @@ extraObjects:
             - namespaceSelector: {}
           ports:
             - port: metrics
+
+  # The public host's edge and the Keycloak gate (R1, R2, R9): only with the ingress on. Same edge pattern as the operator's hosts
+  # (procure-ai deploy/charts/procure-ops: per-client-address rate limit, security headers, cross-site guard; HSTS from Traefik's
+  # websecure entry point, bootstrap/hosted/traefik-config.yaml).
+  - |
+    {{- if .Values.server.ingress.enabled }}
+    {{- $host := .Values.server.ingress.hostname }}
+    # A per-client-address rate limit (Traefik takes 80/443 as host ports, so the remote address is the visitor's own). Higher than the
+    # operator tools' (300 a minute): Argo CD's UI loads an Application's resource tree and keeps event streams open.
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: edge-ratelimit
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: edge }
+    spec:
+      rateLimit:
+        average: 600
+        period: 1m
+        burst: 200
+    ---
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: edge-headers
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: edge }
+    spec:
+      headers:
+        customFrameOptionsValue: SAMEORIGIN
+        contentTypeNosniff: true
+        referrerPolicy: no-referrer
+        customResponseHeaders:
+          X-Robots-Tag: "noindex, nofollow"
+    ---
+    # The Keycloak gate (R9): every request of the chart's Ingress is first sent to oauth2-proxy's root path (its static upstream answers 202
+    # for a valid gate session). Traefik passes the request's headers (cookies, Accept) and sets X-Forwarded-Method/Proto/Host/Uri/For, from
+    # which oauth2-proxy (--reverse-proxy) builds the address to return to after the sign-in. A non-2xx answer (302 to Keycloak, 401, 403)
+    # goes back to the browser as it is, with its Set-Cookie (oauth2-proxy's CSRF cookie of the sign-in).
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: edge-gate
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: edge }
+    spec:
+      forwardAuth:
+        address: http://argocd-gate.argocd.svc.cluster.local:4180/
+        trustForwardHeader: false
+    ---
+    # Answers every request it gets with 403 (an ipAllowList no visitor matches), as procure-ops' operator-foreign-origin.
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: edge-deny
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: edge }
+    spec:
+      ipAllowList:
+        sourceRange: ["127.0.0.1/32"]
+    ---
+    # The routes that come before the chart's Ingress (its router has the rule length as priority, far below these).
+    apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: argocd-edge
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: edge }
+    spec:
+      entryPoints: [websecure]
+      routes:
+        # R2: no username/password login on the public host (the break-glass admin signs in through the tunnel only), also not behind a
+        # valid gate session: Argo CD's REST login (POST /api/v1/session; DELETE there is the UI's logout and passes) and its gRPC-web twin
+        # (the CLI's --grpc-web login). Traefik cleans the path (dot segments, double slashes) before it matches.
+        - kind: Rule
+          match: {{ printf "Host(`%s`) && ((Method(`POST`) && PathRegexp(`^/api/v1/session/?$`)) || PathPrefix(`/session.SessionService/`))" $host | quote }}
+          priority: 100001
+          middlewares:
+            - name: edge-headers
+            - name: edge-deny
+          services:
+            - name: noop@internal
+              kind: TraefikService
+        # Cross-site requests (a foreign Origin: cross-site POST, PUT, DELETE, WebSocket upgrade) answer 403, as on the operator's hosts.
+        - kind: Rule
+          match: {{ printf "Host(`%s`) && HeaderRegexp(`Origin`, `.+`) && !Header(`Origin`, `https://%s`)" $host $host | quote }}
+          priority: 100000
+          middlewares:
+            - name: edge-headers
+            - name: edge-deny
+          services:
+            - name: noop@internal
+              kind: TraefikService
+        # The gate's own paths (sign-in start, Keycloak's callback, sign-out): to oauth2-proxy itself, not through forwardAuth.
+        - kind: Rule
+          match: {{ printf "Host(`%s`) && PathPrefix(`/oauth2/`)" $host | quote }}
+          priority: 1000
+          middlewares:
+            - name: edge-ratelimit
+            - name: edge-headers
+          services:
+            - name: argocd-gate
+              port: http
+      # Traefik's default certificate (as the Ingress).
+      tls: {}
+    ---
+    # oauth2-proxy (Apache 2.0) as the gate (R9). Realm ops' client argocd-gate (procure-ai infra/keycloak/ops-realm.json): public, code flow
+    # with PKCE; Keycloak checks no secret for a public client, so the client secret file is empty (/dev/null). Allowed: group argocd-admins
+    # (the groups claim of the ID token); anyone else who signs in gets 403. No OIDC discovery at start: the endpoints are given, so the gate
+    # starts while Keycloak is not up yet (a fresh cluster brings Argo CD up first; install-argocd.ps1 waits for every Deployment).
+    # The session is the cookie __Host-argocd-gate (Secure, HttpOnly, SameSite=Lax, host-only, encrypted with Secret argocd/argocd-gate key
+    # cookie-secret from bootstrap/new-secrets.ps1 -Environment hosted), 8 hours, without the tokens (session-cookie-minimal) and without
+    # refresh: a member taken out of argocd-admins keeps the gate for at most 8 hours (Argo CD's own sign-in checks the group again).
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: argocd-gate
+      namespace: argocd
+      labels: { app.kubernetes.io/name: argocd-gate, app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: gate }
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: { app.kubernetes.io/name: argocd-gate }
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: argocd-gate, app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: gate }
+        spec:
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: oauth2-proxy
+              # oauth2-proxy v7.15.5 (2026-10-01; distroless, user 65532), pinned. v7.15.6 (2026-11-05) is newer than two weeks: move to it
+              # (or later) once it is.
+              image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5
+              imagePullPolicy: IfNotPresent
+              args:
+                - --http-address=0.0.0.0:4180
+                - --reverse-proxy=true
+                # X-Forwarded-* only from the pod network (k3s's cluster CIDR: Traefik's pod); the NetworkPolicy below lets only Traefik in anyway.
+                - --trusted-proxy-ip=10.42.0.0/16
+                - --upstream=static://202
+                - --provider=oidc
+                - --provider-display-name=Keycloak (realm ops)
+                - --client-id=argocd-gate
+                - --client-secret-file=/dev/null
+                - --code-challenge-method=S256
+                - --oidc-issuer-url=https://auth.daleabels.com/realms/ops
+                - --skip-oidc-discovery=true
+                - --login-url=https://auth.daleabels.com/realms/ops/protocol/openid-connect/auth
+                - --redeem-url=https://auth.daleabels.com/realms/ops/protocol/openid-connect/token
+                - --oidc-jwks-url=https://auth.daleabels.com/realms/ops/protocol/openid-connect/certs
+                - --insecure-oidc-skip-nonce=false
+                - --skip-claims-from-profile-url=true
+                - --scope=openid
+                - --allowed-group=argocd-admins
+                - --email-domain=*
+                - {{ printf "--redirect-url=https://%s/oauth2/callback" $host }}
+                - {{ printf "--whitelist-domain=%s" $host }}
+                - --skip-provider-button=true
+                - --cookie-name=__Host-argocd-gate
+                - --cookie-secure=true
+                - --cookie-httponly=true
+                - --cookie-samesite=lax
+                - --cookie-expire=8h
+                - --cookie-refresh=0
+                - --cookie-csrf-per-request=true
+                - --cookie-csrf-expire=10m
+                - --session-cookie-minimal=true
+                - --footer=-
+                - --silence-ping-logging=true
+              env:
+                - name: OAUTH2_PROXY_COOKIE_SECRET
+                  valueFrom:
+                    secretKeyRef: { name: argocd-gate, key: cookie-secret }
+                - name: GOMEMLIMIT
+                  value: 48MiB
+              ports:
+                - { name: http, containerPort: 4180, protocol: TCP }
+              readinessProbe:
+                httpGet: { path: /ready, port: http }
+                periodSeconds: 10
+              livenessProbe:
+                httpGet: { path: /ping, port: http }
+                periodSeconds: 20
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 64Mi }
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities: { drop: [ALL] }
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: argocd-gate
+      namespace: argocd
+      labels: { app.kubernetes.io/name: argocd-gate, app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: gate }
+    spec:
+      selector: { app.kubernetes.io/name: argocd-gate }
+      ports:
+        - { name: http, port: 4180, targetPort: http, protocol: TCP }
+    ---
+    # The gate: Traefik only in (forwardAuth and the /oauth2/ route); out only DNS and Traefik's https port (Keycloak at auth.daleabels.com,
+    # which CoreDNS rewrites to Traefik inside the cluster, bootstrap/hosted/coredns-custom.yaml).
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: argocd-gate
+      namespace: argocd
+      labels: { app.kubernetes.io/part-of: argocd, app.kubernetes.io/component: gate }
+    spec:
+      podSelector:
+        matchLabels: { app.kubernetes.io/name: argocd-gate }
+      policyTypes: [Ingress, Egress]
+      ingress:
+        - from:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+              podSelector: { matchLabels: { app.kubernetes.io/name: traefik } }
+          ports:
+            - { port: http, protocol: TCP }
+      egress:
+        - to:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+              podSelector: { matchLabels: { k8s-app: kube-dns } }
+          ports:
+            - { port: 53, protocol: UDP }
+            - { port: 53, protocol: TCP }
+        - to:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+              podSelector: { matchLabels: { app.kubernetes.io/name: traefik } }
+          ports:
+            - { port: websecure, protocol: TCP }
+    {{- end }}

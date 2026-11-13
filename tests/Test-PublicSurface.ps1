@@ -3,8 +3,8 @@
 .SYNOPSIS
     What the hosted demo shows the internet (plan 08 Review Focus 2), checked from outside the VM (Dale's PC).
 .DESCRIPTION
-    1. DNS (public resolver 1.1.1.1): procure, auth and dashboard.<domain>, and the operator's hosts (plan 08b Task 4: pgadmin, mongo, redis,
-       rabbitmq, dashboard-direct; -OperatorHosts) have an A record to the VM's IPv4 address and no AAAA record
+    1. DNS (public resolver 1.1.1.1): procure, auth and dashboard.<domain>, the operator's hosts (plan 08b Task 4: pgadmin, mongo, redis,
+       rabbitmq, dashboard-direct; -OperatorHosts) and argocd (plan 08c Task 1; -ArgocdHost) have an A record to the VM's IPv4 address and no AAAA record
        (the k3s cluster is IPv4-only; plan 08 Task 12 ruling).
     2. Port scan of the VM's IPv4 address (TCP connect; 1-1024, the well-known database, broker, Kubernetes, OTLP and dashboard ports, and
        the whole NodePort range 30000-32767): only 22, 80 and 443 answer. 6443 (Kubernetes API), 4317/4318 (OTLP), 8025 (Mailpit),
@@ -19,7 +19,14 @@
        discovery answers 200 with issuer https://auth.<domain>/realms/procure, realm ops (Argo CD's sign-in, fix wave ruling R6c) with
        .../realms/ops, the master realm with .../realms/master; the admin console answers 200 and its REST API 401 without a token; a
        password grant with wrong credentials gets 401 from the master realm. Who can sign in there: tests/Test-OperatorTools.ps1.
-    7. No other site answers on 443: Argo CD and Mailpit host names (hosted and local spellings) and the bare IP give Traefik's 404.
+    7. No other site answers on 443: Mailpit host names (hosted and local spellings), Argo CD's local spelling and the bare IP give
+       Traefik's 404.
+   7b. Argo CD (https://argocd.<domain>, plan 08c Task 1, rulings R1, R2, R9; -ArgocdHost) sits behind its Keycloak gate: without a gate
+       session every path (the UI, /api/*, /auth/*, /swagger-ui, /healthz, path tricks through /oauth2/) answers a redirect to realm ops'
+       sign-in (https://<Keycloak host>/realms/ops/..., client argocd-gate) or 400/401/403/404 (an API call: 401), never Argo CD content
+       and never a software version; POST /api/v1/session (the username/password login) answers 403, also with a made-up gate cookie,
+       and so does the gRPC-web session create; a cross-site request (foreign Origin) answers 403. DNS, http -> https, certificate and
+       HSTS as for every host (steps 1, 4, 5, 9). Who gets through the gate (members of argocd-admins only): tests/Test-AddArgocdAdmin.ps1.
     8. The dashboard redirects to Keycloak's sign-in for client aspire-dashboard, and its telemetry API answers 404.
     9. The app (https://procure.<domain>/) answers 200. Every host sends Strict-Transport-Security (max-age at least 180 days, no preload),
        and no Server header names a version (nginx/1.2.3).
@@ -55,6 +62,8 @@ param(
     [string] $DashboardHost = "dashboard.$Domain",
     # The operator's own hosts (plan 08b Task 4); tests/Test-OperatorTools.ps1 checks their sign-ins.
     [string[]] $OperatorHosts = @('pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct' | ForEach-Object { "$_.$Domain" }),
+    # Argo CD behind its Keycloak gate (plan 08c Task 1, step 7b).
+    [string] $ArgocdHost = "argocd.$Domain",
     # The bare domain and www (plan 09 Task 5): A record, certificate and http -> https like every host, and step 9c: 301 to the app, nothing else.
     [string[]] $RedirectHosts = @($Domain, "www.$Domain"),
     # The VM's IPv4 address; default: host.json of the hosted bootstrap.
@@ -82,7 +91,7 @@ function Pass([string] $message) { Write-Host "ok:   $message" -ForegroundColor 
 function Write-Step([string] $text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 
 if (-not $Ip) { $Ip = (Get-HostedHost).ipv4 }
-$hosts = @($AppHost, $KeycloakHost, $DashboardHost) + $OperatorHosts + $RedirectHosts
+$hosts = @($AppHost, $KeycloakHost, $DashboardHost) + $OperatorHosts + @($ArgocdHost) + $RedirectHosts
 $curl = @("$env:SystemRoot\System32\curl.exe", 'C:\Program Files\Git\mingw64\bin\curl.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $curl) { throw 'curl not found.' }
 $openssl = Get-OpenSsl
@@ -219,13 +228,53 @@ try {
     else { Fail "realm ops' discovery answered $($r.Status) (Argo CD's sign-in needs it public)" }
 
     # --- 7. No other site on 443 --------------------------------------------------------------------------------------------------------
-    Write-Step 'Nothing else answers on 443 (Argo CD, Mailpit, the bare address)'
-    foreach ($h in "argocd.$Domain", "mail.$Domain", "mailpit.$Domain", 'argocd.procure.localtest.me', 'mail.procure.localtest.me') {
+    Write-Step "Nothing else answers on 443 (Mailpit, Argo CD's local name, the bare address)"
+    foreach ($h in "mail.$Domain", "mailpit.$Domain", 'argocd.procure.localtest.me', 'mail.procure.localtest.me') {
         $r = Invoke-Http "https://$h/" -Resolve
         if ($r.Status -eq 404) { Pass "https://$h/ (sent to $Ip) answers 404" } else { Fail "https://$h/ (sent to $Ip) answered $($r.Status), expected 404" }
     }
     $r = Invoke-Http "https://$Ip/"
     if ($r.Status -eq 404) { Pass "https://$Ip/ (no host name) answers 404" } else { Fail "https://$Ip/ answered $($r.Status), expected 404" }
+
+    # --- 7b. Argo CD behind its Keycloak gate ------------------------------------------------------------------------------------------
+    Write-Step "Argo CD behind its Keycloak gate (https://$ArgocdHost)"
+    $opsAuth = "https://$KeycloakHost/realms/ops/protocol/openid-connect/auth?"
+    # Argo CD content: its UI's title, or JSON fields of its API (lists, version, settings, user info), or its API docs.
+    $argoContent = '<title>Argo CD</title>|"Version"\s*:|"items"\s*:|"metadata"\s*:|"loggedIn"\s*:|"oidcConfig"\s*:|swagger'
+    $versioned = 'v\d+\.\d+\.\d+|oauth2.proxy'
+    foreach ($path in '/', '/applications', '/applications/argocd/root', '/settings', '/api/v1/applications', '/api/v1/settings', '/api/version',
+        '/api/v1/session/userinfo', '/auth/login', '/auth/callback?code=x&state=y', '/swagger-ui', '/swagger.json', '/healthz',
+        '/assets/favicon/favicon-32x32.png', '/session.SessionService/Create',
+        # Path tricks around the gate's own prefix (sent as is): dot segments, encoded dots and slash, double slashes, case.
+        '/oauth2/../api/v1/applications', '/oauth2/%2e%2e/api/v1/applications', '/oauth2/..%2fapi/v1/applications', '//api/v1/applications',
+        '/OAUTH2/../api/version', '/oauth2/sign_in/../../applications') {
+        $r = Invoke-Http "https://$ArgocdHost$path" -Extra @('--path-as-is', '-H', 'Accept: text/html')
+        $noArgo = $r.Body -notmatch $argoContent
+        $toOps = $r.Status -eq 302 -and "$($r.Location)".StartsWith($opsAuth) -and "$($r.Location)" -match '[?&]client_id=argocd-gate(&|$)'
+        if ($noArgo -and ($toOps -or $r.Status -in 400, 401, 403, 404)) {
+            Pass "$path -> $($r.Status)$(if ($toOps) { " to realm ops' sign-in (client argocd-gate)" }), no Argo CD content"
+        } else { Fail "https://$ArgocdHost$path answered $($r.Status), Location '$($r.Location)'$(if (-not $noArgo) { ', WITH Argo CD content' }) (expected the gate: realm ops' sign-in, or 400/401/403/404)" }
+        if ($r.Body -match $versioned -or @($r.Headers | Where-Object { $_ -match '^server:.*\d+\.\d+' }).Count -gt 0) { Fail "https://$ArgocdHost$path names a software version" }
+    }
+    # An API call (Accept: application/json) gets 401 from the gate, not a redirect.
+    $r = Invoke-Http "https://$ArgocdHost/api/v1/applications" -Extra @('-H', 'Accept: application/json')
+    if ($r.Status -eq 401 -and $r.Body -notmatch $argoContent) { Pass '/api/v1/applications with Accept: application/json -> 401 from the gate' }
+    else { Fail "https://$ArgocdHost/api/v1/applications (JSON) answered $($r.Status), expected 401 from the gate" }
+    # The username/password login (R2): 403 at the edge, also with a made-up gate cookie; the gRPC-web twin too.
+    $login = '{"username":"admin","password":"surface-probe-wrong"}'
+    $json = @('-H', 'Content-Type: application/json', '--data-binary', $login)
+    foreach ($case in @(
+            @{ Name = 'POST /api/v1/session'; Path = '/api/v1/session'; Extra = $json }
+            @{ Name = 'POST /api/v1/session/ (trailing slash)'; Path = '/api/v1/session/'; Extra = $json }
+            @{ Name = 'POST //api/v1/session (double slash)'; Path = '//api/v1/session'; Extra = $json }
+            @{ Name = 'POST /api/v1/session with a made-up gate cookie'; Path = '/api/v1/session'; Extra = @('-H', 'Cookie: __Host-argocd-gate=forged; __Host-argocd-gate_0=forged') + $json }
+            @{ Name = 'POST /session.SessionService/Create (gRPC-web)'; Path = '/session.SessionService/Create'; Extra = @('-H', 'Content-Type: application/grpc-web+proto', '--data-binary', 'x') })) {
+        $r = Invoke-Http "https://$ArgocdHost$($case.Path)" -Method POST -Extra (@('--path-as-is') + $case.Extra)
+        if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent -and $r.Body -notmatch 'token') { Pass "$($case.Name) -> 403 (the admin login is tunnel-only)" }
+        else { Fail "$($case.Name) on https://$ArgocdHost answered $($r.Status): $($r.Body.Substring(0, [Math]::Min(160, $r.Body.Length)))" }
+    }
+    $r = Invoke-Http "https://$ArgocdHost/api/v1/applications" -Method POST -Extra @('-H', 'Origin: https://evil.example', '-H', 'Content-Type: text/plain', '--data-binary', 'x')
+    if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent) { Pass 'a cross-site POST (foreign Origin) -> 403' } else { Fail "a cross-site POST to https://$ArgocdHost answered $($r.Status), expected 403" }
 
     # --- 8. The dashboard needs a Keycloak sign-in -------------------------------------------------------------------------------------
     Write-Step "The dashboard (https://$DashboardHost)"
@@ -251,7 +300,7 @@ try {
     if ($r.Status -eq 200) { Pass "https://$AppHost/ answers 200" } else { Fail "https://$AppHost/ answered $($r.Status)" }
 
     Write-Step 'HSTS and Server headers'
-    foreach ($url in @("https://$AppHost/", "https://$KeycloakHost/realms/procure/.well-known/openid-configuration", "https://$DashboardHost/") + @($RedirectHosts | ForEach-Object { "https://$_/" })) {
+    foreach ($url in @("https://$AppHost/", "https://$KeycloakHost/realms/procure/.well-known/openid-configuration", "https://$DashboardHost/", "https://$ArgocdHost/") + @($RedirectHosts | ForEach-Object { "https://$_/" })) {
         $r = Invoke-Http $url
         $sts = @($r.Headers | Where-Object { $_ -match '^strict-transport-security:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
         $maxAge = if ("$($sts | Select-Object -First 1)" -match 'max-age=(\d+)') { [long] $Matches[1] } else { 0 }

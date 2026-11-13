@@ -25,6 +25,10 @@ rabbitmq:
   storage: 2Gi
 
 keycloak:
+  # Argo CD's public address (plan 08c Task 1, ruling R3): the argocd client's redirect URIs and the argocd-gate client's callback. Equal
+  # to configs.cm.url in envs/hosted/argocd.yaml. The tunnel's port-forward stays allowed too (keycloak.argocdTunnelUrl, default
+  # http://127.0.0.1:8080, = configs.cm.additionalUrls there).
+  argocdUrl: https://argocd.daleabels.com
   ingress:
     # Plan 08 ruling 4: only Keycloak's public paths of the procure realm (no admin console, admin REST API, master realm or welcome page).
     publicPathsOnly: true

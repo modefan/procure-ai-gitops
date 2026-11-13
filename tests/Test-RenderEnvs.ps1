@@ -13,7 +13,10 @@
          global.imageTags = platformImageTags). Dependencies as Argo CD's repo-server resolves them: the chart is rendered as committed and
          `helm dependency build` runs only for a dependency missing from charts/ (the umbrella's file:// procure-app);
       3. Argo CD's own chart (apps/values.yaml chartRepo/chartVersion, OCI) with argocd/values.yaml, envs/<env>/argocd.yaml and the
-         environment's switches.
+         environment's switches; for an environment with argocd.ingressEnabled and a hostname other than the local one (hosted, plan 08c
+         Task 1) also the public host's edge: the Ingress for that host with the middlewares rate limit, headers and the Keycloak gate
+         (in that order), each Middleware rendered, the IngressRoute argocd-edge (403 for POST /api/v1/session and the gRPC-web session
+         create, the cross-site guard, /oauth2/ to the gate) and the gate's Deployment (pinned image, memory limit, group argocd-admins).
     Every render goes through `kubeconform -strict`: Kubernetes schemas, and custom resources (Traefik's Middleware, Argo CD's) against the
     community CRD schema catalog (datreeio/CRDs-catalog); a custom resource neither knows is skipped and counted. Exit code 1 when a
     render or a validation fails.
@@ -76,10 +79,58 @@ function Invoke-Render([string] $label, [string[]] $helmArgs) {
     } finally { Remove-Item $errFile -ErrorAction SilentlyContinue }
     $yaml = ($out | ForEach-Object { "$_" }) -join "`n"
     $crds = 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+    $script:LastRender = $yaml
     $result = $yaml | & kubeconform -strict -ignore-missing-schemas -schema-location default -schema-location $crds -summary -output text 2>&1
     $summary = ($result | Where-Object { "$_" -match '^Summary:' }) -join ''
     if ($LASTEXITCODE -ne 0) { Fail "$label`: kubeconform: $(($result | Select-Object -First 6) -join ' | ')"; return }
     Pass "$label`: $($summary -replace '^Summary:\s*', '')"
+}
+
+function Test-ArgocdEdge([string] $label, [string] $yaml) {
+    # The public Argo CD host of an environment (plan 08c Task 1): what must be in the render, by kind and name. A missing field (strict
+    # mode) is a FAIL with its message.
+    try { Test-ArgocdEdgeDocs $label $yaml } catch { Fail "$label`: $($_.Exception.Message)" }
+}
+function Test-ArgocdEdgeDocs([string] $label, [string] $yaml) {
+    $json = $yaml | & python -c 'import sys, yaml, json; print(json.dumps([d for d in yaml.safe_load_all(sys.stdin) if d]))'
+    if ($LASTEXITCODE -ne 0) { Fail "$label`: YAML to JSON (python, PyYAML) failed"; return }
+    $docs = @(($json -join "`n") | ConvertFrom-Json -Depth 100)
+    function Find([string] $kind, [string] $name) { @($docs | Where-Object { $_.kind -eq $kind -and $_.metadata.name -eq $name }) | Select-Object -First 1 }
+    $ingress = Find 'Ingress' 'argocd-server'
+    $hostName = "$($ingress.spec.rules[0].host)"
+    if (-not $ingress -or -not $hostName) { Fail "$label`: no Ingress argocd-server with a host"; return }
+    $middlewares = "$($ingress.metadata.annotations.'traefik.ingress.kubernetes.io/router.middlewares')"
+    if ($middlewares -eq 'argocd-edge-ratelimit@kubernetescrd,argocd-edge-headers@kubernetescrd,argocd-edge-gate@kubernetescrd') {
+        Pass "$label`: Ingress $hostName with rate limit, headers and the Keycloak gate"
+    } else { Fail "$label`: Ingress $hostName middlewares '$middlewares' (expected rate limit, headers, gate)" }
+    foreach ($name in 'edge-ratelimit', 'edge-headers', 'edge-gate', 'edge-deny') {
+        if (-not (Find 'Middleware' $name)) { Fail "$label`: Middleware $name missing" }
+    }
+    $gateMw = Find 'Middleware' 'edge-gate'
+    if ($gateMw -and "$($gateMw.spec.forwardAuth.address)" -eq 'http://argocd-gate.argocd.svc.cluster.local:4180/') { Pass "$label`: forwardAuth to the gate (argocd-gate:4180)" }
+    else { Fail "$label`: Middleware edge-gate is not a forwardAuth to http://argocd-gate.argocd.svc.cluster.local:4180/" }
+    $route = Find 'IngressRoute' 'argocd-edge'
+    if (-not $route) { Fail "$label`: IngressRoute argocd-edge missing"; return }
+    $routes = @($route.spec.routes)
+    $session = @($routes | Where-Object { $_.match -match [regex]::Escape("Host(``$hostName``)") -and $_.match -match 'Method\(`POST`\) && PathRegexp\(`\^/api/v1/session/\?\$`\)' -and $_.match -match 'PathPrefix\(`/session\.SessionService/`\)' })
+    $denies = { param($r) @($r.middlewares | ForEach-Object { $_.name }) -contains 'edge-deny' -and $r.services[0].name -eq 'noop@internal' }
+    if ($session.Count -eq 1 -and (& $denies $session[0]) -and [int] $session[0].priority -gt 10000) { Pass "$label`: POST /api/v1/session and the gRPC-web session create answer 403 (edge-deny, priority $($session[0].priority))" }
+    else { Fail "$label`: no high-priority 403 route for POST /api/v1/session and /session.SessionService/" }
+    $origin = @($routes | Where-Object { $_.match -match 'HeaderRegexp\(`Origin`' -and $_.match -match [regex]::Escape("!Header(``Origin``, ``https://$hostName``)") })
+    if ($origin.Count -eq 1 -and (& $denies $origin[0])) { Pass "$label`: cross-site requests (foreign Origin) answer 403" } else { Fail "$label`: no cross-site guard route" }
+    $oauth = @($routes | Where-Object { $_.match -match 'PathPrefix\(`/oauth2/`\)' })
+    if ($oauth.Count -eq 1 -and $oauth[0].services[0].name -eq 'argocd-gate' -and -not (@($oauth[0].middlewares | ForEach-Object { $_.name }) -contains 'edge-gate')) {
+        Pass "$label`: /oauth2/ goes to the gate itself (no forwardAuth)"
+    } else { Fail "$label`: no /oauth2/ route to the gate" }
+    $deploy = Find 'Deployment' 'argocd-gate'
+    $container = if ($deploy) { $deploy.spec.template.spec.containers[0] } else { $null }
+    $cargs = @($container.args)
+    $ok = $container -and "$($container.image)" -match '^quay\.io/oauth2-proxy/oauth2-proxy:v\d+\.\d+\.\d+$' -and "$($container.resources.limits.memory)" -and
+        '--allowed-group=argocd-admins' -in $cargs -and '--client-id=argocd-gate' -in $cargs -and '--code-challenge-method=S256' -in $cargs -and
+        "--redirect-url=https://$hostName/oauth2/callback" -in $cargs -and '--upstream=static://202' -in $cargs -and
+        '--cookie-secure=true' -in $cargs -and '--insecure-oidc-skip-nonce=false' -in $cargs
+    if ($ok) { Pass "$label`: gate Deployment ($($container.image), memory limit $($container.resources.limits.memory), group argocd-admins only)" }
+    else { Fail "$label`: gate Deployment argocd-gate missing or not as expected (pinned oauth2-proxy image, memory limit, argocd-gate client with PKCE, group argocd-admins)" }
 }
 
 function Export-Charts([string] $ref) {
@@ -181,9 +232,15 @@ try {
             }
             $switch[$name] = $value
         }
+        $script:LastRender = ''
         Invoke-Render "argocd ($env, chart $argoVersion)" @('argocd', $argoChart, '--version', $argoVersion, '--namespace', 'argocd',
             '-f', (Join-Path $root 'argocd/values.yaml'), '-f', (Join-Path $envDir 'argocd.yaml'),
             '--set', "configs.cm.admin\.enabled=$($switch.adminEnabled)", '--set', "server.ingress.enabled=$($switch.ingressEnabled)")
+        # The public host's edge and gate (plan 08c Task 1): every environment but local (whose Argo CD is behind the local CA's wildcard).
+        if ($env -ne 'local') {
+            if ($switch.ingressEnabled -ne 'true') { Fail "argocd ($env): argocd.ingressEnabled is not true (plan 08c Task 1: the public host behind the Keycloak gate)" }
+            elseif ($script:LastRender) { Test-ArgocdEdge "argocd edge ($env)" $script:LastRender }
+        }
     }
 } finally {
     foreach ($dir in $exports.Values) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }

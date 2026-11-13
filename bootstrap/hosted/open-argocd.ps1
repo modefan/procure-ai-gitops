@@ -1,16 +1,20 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Opens Argo CD of the hosted VM on Dale's PC: SSH tunnel, kubectl port-forward to 127.0.0.1:8080 and the browser. -Close stops both.
+    Opens Argo CD of the hosted VM on Dale's PC: by default its public address https://argocd.daleabels.com in the browser; with -Tunnel
+    the SSH tunnel, kubectl port-forward to 127.0.0.1:8080 and the browser. -Close stops the port-forward and the tunnel.
 .DESCRIPTION
-    Argo CD has no public address on the VM (plan 08 ruling 4). This script
+    Default (plan 08c Task 1): opens https://<argocd host> (bootstrap/common.ps1 $HostedDomain) in the default browser and says how to sign
+    in. The host sits behind a Keycloak gate: realm ops (password and the authenticator app's code), group argocd-admins only; Argo CD's
+    own "Log in via Keycloak" then needs no second sign-in. The username/password login (admin) is refused there (403): use -Tunnel.
+    -Tunnel (the path before plan 08c; break-glass when Keycloak or the public host is down, and the admin login):
       1. opens the SSH tunnel to the Kubernetes API (open-tunnel.ps1; an open tunnel is reused as it is),
       2. starts `kubectl port-forward svc/argocd-server 8080:80` on the loopback address only, as a hidden background process (PID in
          argocd-port-forward.pid next to the hosted kubeconfig), and waits until Argo CD answers,
       3. opens http://127.0.0.1:8080 in the default browser (-NoBrowser: not),
       4. says how to sign in, naming where the passwords are kept, never a value.
-    Sign in with "Log in via Keycloak" (members of the Keycloak group argocd-admins get the admin role; Argo CD's url and the Keycloak
-    client's redirect URIs are http://127.0.0.1:8080, envs/hosted/argocd.yaml), or as admin (break-glass, when Keycloak is down).
+    Sign in with "Log in via Keycloak" (members of the Keycloak group argocd-admins get the admin role; Argo CD's additionalUrls and the
+    Keycloak client's redirect URIs include http://127.0.0.1:8080, envs/hosted/argocd.yaml), or as admin (break-glass, when Keycloak is down).
     The port-forward ends when -Close runs, the tunnel drops or the PC restarts; run the script again.
     -Close stops the port-forward and the tunnel, but only a tunnel this script opened (a tunnel that was already open, e.g. for another
     script, is left as it is). Ownership is decided by the tunnel's ssh process, not by whether the API answers (review 12c M3): the
@@ -21,6 +25,8 @@
 param(
     # Stop the port-forward (and the tunnel, if this script opened it).
     [switch] $Close,
+    # The SSH tunnel and a port-forward instead of the public address (break-glass, the admin login).
+    [switch] $Tunnel,
     # Do not open the browser.
     [switch] $NoBrowser,
     # The local port (Argo CD's url and the Keycloak redirect URIs name 8080; another port works for the admin and API logins only).
@@ -79,6 +85,18 @@ if ($Close) {
             & (Join-Path $PSScriptRoot 'open-tunnel.ps1') -Close
         }
     }
+    return
+}
+
+if (-not $Tunnel) {
+    # The public address behind the Keycloak gate (plan 08c Task 1); nothing to start on this PC.
+    $publicUrl = "https://argocd.$HostedDomain"
+    if (-not $NoBrowser) { Start-Process $publicUrl }
+    Write-Host "Argo CD: $publicUrl"
+    Write-Host '  Sign in:      your own Keycloak user of realm ops (password, then the authenticator app''s code; group argocd-admins only),'
+    Write-Host '                then "Log in via Keycloak" on Argo CD''s page (no second sign-in). docs/hosting.md in procure-ai.'
+    Write-Host '  Break-glass:  the admin login is refused on the public address: bootstrap/hosted/open-argocd.ps1 -Tunnel.'
+    Write-Host '  Claude:       API token in user env var ARGOCD_AUTH_TOKEN_HOSTED, through the tunnel (-Tunnel) or kubectl.'
     return
 }
 

@@ -216,7 +216,7 @@ $root = [ordered]@{
 }
 Write-Host (Invoke-Apply $root)
 if ($Environment -eq 'hosted') {
-    Write-Host "Argo CD now brings up envs/$Environment (kubectl --kubeconfig $HostedKubeconfig --context $KubeContext -n argocd get applications). UI: bootstrap/hosted/open-argocd.ps1 (tunnel + port-forward, no public ingress, plan 08 ruling 4); Keycloak sign-in, admin as break-glass."
+    Write-Host "Argo CD now brings up envs/$Environment (kubectl --kubeconfig $HostedKubeconfig --context $KubeContext -n argocd get applications). UI: https://argocd.$HostedDomain behind the Keycloak gate (bootstrap/hosted/open-argocd.ps1; plan 08c Task 1), or tunnel + port-forward with -Tunnel (admin as break-glass)."
 } else {
     Write-Host "Argo CD now brings up envs/$Environment (kubectl --context $KubeContext -n argocd get applications). UI: https://argocd.procure.localtest.me (admin; password in Secret argocd/argocd-initial-admin-secret)."
 }

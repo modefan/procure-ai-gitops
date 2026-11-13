@@ -172,6 +172,6 @@ try {
 }
 $out | Write-Host
 if (-not $Remove) {
-    $where = if ($Environment -eq 'hosted') { 'bootstrap/hosted/open-argocd.ps1, then "Log in via Keycloak"' } else { 'https://argocd.procure.localtest.me, "Log in via Keycloak"' }
+    $where = if ($Environment -eq 'hosted') { "https://argocd.$HostedDomain (bootstrap/hosted/open-argocd.ps1): the Keycloak gate's sign-in, then ""Log in via Keycloak"" on Argo CD's page" } else { 'https://argocd.procure.localtest.me, "Log in via Keycloak"' }
     Write-Host "Done. Sign in to Argo CD: $where (realm ops: password, then the authenticator app's code; the first time it asks you to scan a QR code)."
 }

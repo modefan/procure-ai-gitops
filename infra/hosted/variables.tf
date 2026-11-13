@@ -74,9 +74,9 @@ variable "domain" {
 }
 
 variable "dns_hosts" {
-  description = "Host names that point at the server (one A record each): the app, Keycloak, the Aspire dashboard and the operator's own hosts (plan 08b Task 4). Equal to $HostedDnsHosts in bootstrap/common.ps1."
+  description = "Host names that point at the server (one A record each): the app, Keycloak, the Aspire dashboard, the operator's own hosts (plan 08b Task 4) and Argo CD behind its Keycloak gate (plan 08c Task 1). Equal to $HostedDnsHosts in bootstrap/common.ps1."
   type        = list(string)
-  default     = ["procure", "auth", "dashboard", "pgadmin", "mongo", "redis", "rabbitmq", "dashboard-direct"]
+  default     = ["procure", "auth", "dashboard", "pgadmin", "mongo", "redis", "rabbitmq", "dashboard-direct", "argocd"]
 }
 
 variable "redirect_hosts" {

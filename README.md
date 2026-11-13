@@ -99,7 +99,9 @@ procure-ai push to main -> CI -> publish.yml: app images ghcr.io/modefan/procure
 - Argo CD UI: https://argocd.procure.localtest.me, user `admin`, password in Secret `argocd/argocd-initial-admin-secret`
   (`kubectl --context k3d-procure -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}'`, base64).
   `argocd.adminEnabled` and `argocd.ingressEnabled` in `envs/<env>/apps.yaml` (default on, as local) turn the admin user and the ingress
-  off for a public host (plan 08 ruling 4); the argocd Application and `install-argocd.ps1` both apply them.
+  off for a public host (plan 08 ruling 4); the argocd Application and `install-argocd.ps1` both apply them. Hosted (plan 08c Task 1):
+  both on; the ingress is https://argocd.daleabels.com behind a Keycloak gate (oauth2-proxy, realm `ops`, group `argocd-admins` only;
+  `envs/hosted/argocd.yaml`), the admin login answers 403 there and works only through the tunnel (`bootstrap/hosted/open-argocd.ps1 -Tunnel`).
 - Chart checks for `apps/`: `helm unittest apps` and `helm template root apps -f envs/local/apps.yaml -f envs/local/release.yaml |
   kubeconform -strict -summary -schema-location default -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'`
   (the Application schema from the CRDs catalog).

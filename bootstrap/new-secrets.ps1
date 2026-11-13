@@ -51,6 +51,11 @@
                                  operator-redis-insight-basic-auth (kubernetes.io/basic-auth: username, password)
     The TOTP secrets are Base32 (an authenticator app takes them as they are; Get-OperatorLogin.ps1 prints the current code).
 
+    Argo CD's public host (hosted only, plan 08c Task 1, ruling R9): the Keycloak gate in front of it (oauth2-proxy, envs/hosted/argocd.yaml)
+    encrypts its session cookie with
+      argocd (namespace)         argocd-gate (cookie-secret: 32 letters and digits, the AES-256 key; parameter argocd-gate-cookie-secret)
+    Rotating it signs everyone out of the gate (they sign in again with Keycloak); restart deploy/argocd-gate after a new value.
+
     -Environment hosted (plan 08 ruling 11): the same Secrets on the hosted VM (bootstrap/hosted/, through the SSH tunnel), from a separate
     user-secrets store `procure-ai-hosted` that shares no value with the AppHost. Every value is generated there on the first run (32
     letters and digits; the admin API key 64, its SHA-256 derived from it; the MongoDB keyfile 48 random bytes in base64) and kept, so a
@@ -103,6 +108,8 @@ $required += $operatorParameters
 # the keycloak-config Job and kcadm sign in with it instead of the bootstrap admin's password. Generated in both stores.
 $automationParameters = @('keycloak-automation-client-secret')
 $required += $automationParameters
+# The Keycloak gate of Argo CD's public host (plan 08c Task 1): hosted only (the local cluster has no gate).
+if ($hosted) { $required += 'argocd-gate-cookie-secret' }
 
 function New-RandomText([int] $length) {
     [Security.Cryptography.RandomNumberGenerator]::GetString([char[]] 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', $length)
@@ -365,5 +372,11 @@ Set-Secret operator operator-redis-insight-basic-auth ([ordered]@{
     'password' = Get-Parameter 'operator-redis-insight-password'
 }) 'kubernetes.io/basic-auth'
 
+# --- The Keycloak gate of Argo CD's public host (hosted only; plan 08c Task 1, envs/hosted/argocd.yaml). ---
+if ($hosted) {
+    $results.Add((Invoke-Apply (New-NamespaceObject 'argocd')))
+    Set-Secret argocd argocd-gate ([ordered]@{ 'cookie-secret' = Get-Parameter 'argocd-gate-cookie-secret' })
+}
+
 $results | ForEach-Object { Write-Host $_ }
-Write-Host "Secrets in namespaces procure, observability and operator: $($results.Count) applied (names only shown)."
+Write-Host "Secrets in namespaces procure, observability, operator$(if ($hosted) { ' and argocd' }): $($results.Count) applied (names only shown)."

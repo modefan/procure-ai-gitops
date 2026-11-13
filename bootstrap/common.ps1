@@ -64,9 +64,10 @@ $script:HostedMonthlyPrice = 'EUR 14.00'
 $script:HostedRootPasswordSecretName = 'procure-hosted-root-password'
 # The Cloudflare DNS records Terraform keeps (one A record each, DNS only; no AAAA, k3s is IPv4 only): <host>.<domain> -> the server.
 $script:HostedDomain = 'daleabels.com'
-# The operator's own hosts (plan 08b Task 4): pgAdmin, the MongoDB UI, Redis Insight, RabbitMQ's management UI, the break-glass dashboard. Keep
-# infra/hosted/variables.tf dns_hosts equal; every name is on the one public certificate (install-cert-manager.ps1).
-$script:HostedDnsHosts = @('procure', 'auth', 'dashboard', 'pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct')
+# The operator's own hosts (plan 08b Task 4): pgAdmin, the MongoDB UI, Redis Insight, RabbitMQ's management UI, the break-glass dashboard;
+# and Argo CD behind its Keycloak gate (plan 08c Task 1). Keep infra/hosted/variables.tf dns_hosts equal; every name is on the one public
+# certificate (install-cert-manager.ps1).
+$script:HostedDnsHosts = @('procure', 'auth', 'dashboard', 'pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct', 'argocd')
 # The bare domain and www (plan 09 Task 5): A records and certificate names like the hosts above, but they serve nothing; Traefik answers every
 # request with a 301 to https://procure.<domain> (bootstrap/hosted/bare-domain-redirect.yaml). '@' is the apex. Keep infra/hosted/variables.tf
 # redirect_hosts equal.

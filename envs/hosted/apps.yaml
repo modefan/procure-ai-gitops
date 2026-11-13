@@ -3,11 +3,13 @@
 # bootstrap/new-local-ca.ps1 -Environment hosted (the internal CA for MongoDB's TLS) and bootstrap/new-secrets.ps1 -Environment hosted.
 env: hosted
 argocd:
-  # A public host (plan 08 ruling 4): no ingress; the UI only through kubectl port-forward over the SSH tunnel
-  # (bootstrap/hosted/open-argocd.ps1). People sign in with Keycloak (envs/hosted/argocd.yaml); the admin login stays on as break-glass
-  # for when Keycloak is down (Dale 2026-11-08, Task 12c), reachable only through the tunnel like the rest of Argo CD.
+  # The public host https://argocd.daleabels.com behind a Keycloak gate (plan 08c Task 1, rulings R1, R2, R9; Dale 2026-11-13): the ingress
+  # switch turns on the chart's Ingress, the edge router, the gate (oauth2-proxy: realm ops, group argocd-admins only) and the argocd-server
+  # NetworkPolicy rule for Traefik (envs/hosted/argocd.yaml). People sign in with Keycloak; the admin login stays on as break-glass for when
+  # Keycloak is down (Dale 2026-11-08, Task 12c), and the public host refuses it (403): admin only through the tunnel
+  # (bootstrap/hosted/open-argocd.ps1 -Tunnel). false: no public host, the tunnel only (as before plan 08c).
   adminEnabled: true
-  ingressEnabled: false
+  ingressEnabled: true
 platform:
   enabled: true
 observability:
