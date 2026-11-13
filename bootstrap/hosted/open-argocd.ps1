@@ -69,12 +69,12 @@ if ($Close) {
     Remove-Item $pidFile -ErrorAction SilentlyContinue
     $markedPid = if (Test-Path $tunnelMarker) { (Get-Content -Raw $tunnelMarker).Trim() } else { '' }
     Remove-Item $tunnelMarker -ErrorAction SilentlyContinue
-    $tunnel = Get-HostedTunnelProcess
+    $sshTunnel = Get-HostedTunnelProcess   # not $tunnel: variables ignore case, and -Tunnel is a [switch]
     if (-not $markedPid) {
         Write-Host 'The SSH tunnel was not opened by this script: left open.'
-    } elseif (-not $tunnel -or "$($tunnel.Id)" -ne $markedPid) {
+    } elseif (-not $sshTunnel -or "$($sshTunnel.Id)" -ne $markedPid) {
         # The tunnel this script opened is gone; a tunnel running now was started by another script (or replaced): not ours to close.
-        Write-Host "The SSH tunnel this script opened (ssh PID $markedPid) is no longer running$(if ($tunnel) { "; the open tunnel (ssh PID $($tunnel.Id)) belongs to another script and stays open" })."
+        Write-Host "The SSH tunnel this script opened (ssh PID $markedPid) is no longer running$(if ($sshTunnel) { "; the open tunnel (ssh PID $($sshTunnel.Id)) belongs to another script and stays open" })."
     } else {
         Start-Sleep -Milliseconds 500   # the stopped port-forward's connection closes
         $users = @(Get-TunnelUsers)
