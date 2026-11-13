@@ -2,7 +2,7 @@
 # after CI passed and the images were pushed (since plan 08 Task 12 it bumps local and hosted in one commit; it never moves a file
 # backwards, so pinning an older revision here by hand holds until a newer commit is published). Roll back by setting a revision whose
 # images are in GHCR (the retention workflow keeps every tag of envs/*/release.yaml's recent history).
-appRevision: "a3c5f1d78261ca217f3cd8f34307c8a5392a4c96"
+appRevision: "97a542749d5155094a242e5a5abcad8c0d78df97"
 platformImageTags:
   postgres: "759bf35a49d02d062fda527e93451d911ead437e"
   keycloak: "de8790c9548b26fe40a8ce88b449b9112fc7456d"
