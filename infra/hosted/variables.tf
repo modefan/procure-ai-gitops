@@ -79,6 +79,12 @@ variable "dns_hosts" {
   default     = ["procure", "auth", "dashboard", "pgadmin", "mongo", "redis", "rabbitmq", "dashboard-direct"]
 }
 
+variable "redirect_hosts" {
+  description = "Host labels that only redirect to the app (plan 09 Task 5): one A record each, '@' is the apex (daleabels.com). Equal to $HostedRedirectHosts in bootstrap/common.ps1."
+  type        = list(string)
+  default     = ["@", "www"]
+}
+
 variable "dns_ttl" {
   description = "TTL of the records in seconds (short, so a move to another server is quick)."
   type        = number

@@ -23,6 +23,10 @@
     8. The dashboard redirects to Keycloak's sign-in for client aspire-dashboard, and its telemetry API answers 404.
     9. The app (https://procure.<domain>/) answers 200. Every host sends Strict-Transport-Security (max-age at least 180 days, no preload),
        and no Server header names a version (nginx/1.2.3).
+   9c. The bare domain and www.<domain> (plan 09 Task 5; -RedirectHosts) have DNS and a certificate like the other hosts (steps 1, 4, 5) and
+       redirect: https://<host>/<path>?<query> answers 301 with Location https://procure.<domain>/<path>?<query> (path and query kept, also
+       with a deep path and encoded characters), for POST as well as GET; http:// reaches the same target in two permanent hops (Traefik's
+       http -> https redirect first, step 4); nothing is served on those names (no 200, no other status).
    9b. The Keycloak host's rate limit (fix wave rulings R6b/R6c). Traefik keeps one bucket per router, i.e. per path prefix
        (/realms/procure/, /realms/ops/, /resources/, each token endpoint), so each prefix gets its own burst of -RateLimitBurst parallel
        requests (default 150) and must answer some 429s. The first burst goes to /realms/procure/protocol/openid-connect/token/../auth
@@ -51,6 +55,8 @@ param(
     [string] $DashboardHost = "dashboard.$Domain",
     # The operator's own hosts (plan 08b Task 4); tests/Test-OperatorTools.ps1 checks their sign-ins.
     [string[]] $OperatorHosts = @('pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct' | ForEach-Object { "$_.$Domain" }),
+    # The bare domain and www (plan 09 Task 5): A record, certificate and http -> https like every host, and step 9c: 301 to the app, nothing else.
+    [string[]] $RedirectHosts = @($Domain, "www.$Domain"),
     # The VM's IPv4 address; default: host.json of the hosted bootstrap.
     [string] $Ip,
     # Accept certificates from Let's Encrypt's staging CA (before the production issuer is switched on).
@@ -76,7 +82,7 @@ function Pass([string] $message) { Write-Host "ok:   $message" -ForegroundColor 
 function Write-Step([string] $text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 
 if (-not $Ip) { $Ip = (Get-HostedHost).ipv4 }
-$hosts = @($AppHost, $KeycloakHost, $DashboardHost) + $OperatorHosts
+$hosts = @($AppHost, $KeycloakHost, $DashboardHost) + $OperatorHosts + $RedirectHosts
 $curl = @("$env:SystemRoot\System32\curl.exe", 'C:\Program Files\Git\mingw64\bin\curl.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $curl) { throw 'curl not found.' }
 $openssl = Get-OpenSsl
@@ -254,6 +260,27 @@ try {
         $server = @($r.Headers | Where-Object { $_ -match '^server:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
         if (@($server | Where-Object { $_ -match '\d+\.\d+' }).Count -eq 0) { Pass "$url names no server version ($(if ($server) { $server -join ', ' } else { 'no Server header' }))" }
         else { Fail "$url Server header '$($server -join ', ')' names a version" }
+    }
+
+    # --- 9c. The bare domain and www redirect to the app -------------------------------------------------------------------------------
+    Write-Step "The bare domain and www redirect to https://$AppHost"
+    foreach ($h in $RedirectHosts) {
+        foreach ($path in '/', '/some/path?x=1&y=a%20b', '/deep/er/path/', '/login?returnUrl=%2Fadmin') {
+            $want = "https://$AppHost$path"
+            $r = Invoke-Http "https://$h$path"
+            if ($r.Status -eq 301 -and $r.Location -eq $want) { Pass "https://$h$path -> 301 $want" }
+            else { Fail "https://$h$path answered $($r.Status), Location '$($r.Location)' (expected 301 to $want)" }
+        }
+        $r = Invoke-Http "https://$h/some/path?x=1" -Method POST -Extra @('--data', 'a=1')
+        if ($r.Status -in 301, 308 -and $r.Location -eq "https://$AppHost/some/path?x=1") { Pass "POST https://$h/ is redirected too ($($r.Status)); nothing is served there" }
+        else { Fail "POST https://$h/some/path?x=1 answered $($r.Status), Location '$($r.Location)' (expected a redirect to the app)" }
+        # http:// : first hop to https on the same host (Traefik's entry point), second hop to the app.
+        $r = Invoke-Http "http://$h/some/path?x=1"
+        if ($r.Status -in 301, 308 -and $r.Location -eq "https://$h/some/path?x=1") {
+            $r2 = Invoke-Http $r.Location
+            if ($r2.Status -eq 301 -and $r2.Location -eq "https://$AppHost/some/path?x=1") { Pass "http://$h/some/path?x=1 -> https://$h/... -> 301 https://$AppHost/some/path?x=1" }
+            else { Fail "http://$h/some/path?x=1 second hop answered $($r2.Status), Location '$($r2.Location)' (expected 301 to https://$AppHost/some/path?x=1)" }
+        } else { Fail "http://$h/some/path?x=1 answered $($r.Status), Location '$($r.Location)' (expected a redirect to https://$h/...)" }
     }
 
     # --- 9b. The Keycloak host's rate limit covers every path ------------------------------------------------------------------------

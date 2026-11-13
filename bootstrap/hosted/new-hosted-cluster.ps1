@@ -161,9 +161,9 @@ function Get-ImportIds {
     if ($keys.Count -ne 1) { throw "Expected exactly one Contabo SSH key secret '$keyName', found $($keys.Count)." }
     $ids['contabo_secret.ssh'] = "$($keys[0].secretId)"
     $records = Get-HostedDnsRecords
-    foreach ($h in $HostedDnsHosts) {
-        $a = @($records | Where-Object { $_.name -eq "$h.$HostedDomain" -and $_.type -eq 'A' })
-        if ($a.Count -gt 1) { throw "$($a.Count) A records for $h.$HostedDomain; expected at most one." }
+    foreach ($h in @($HostedDnsHosts) + @($HostedRedirectHosts)) {
+        $a = @($records | Where-Object { $_.name -eq (Get-HostedFqdn $h) -and $_.type -eq 'A' })
+        if ($a.Count -gt 1) { throw "$($a.Count) A records for $(Get-HostedFqdn $h); expected at most one." }
         # cloudflare_dns_record (provider 5.x) imports as <zone_id>/<record_id>; a record that does not exist is simply created by the plan.
         if ($a.Count -eq 1) { $ids["cloudflare_dns_record.host[""$h-A""]"] = "$HostedCloudflareZoneId/$($a[0].id)" }
     }
@@ -191,7 +191,7 @@ function Get-ChangedAttributes($rc) {
 # The plan check: only the expected resources, never a new or a cancelled instance (details in the help above). Returns the problems; an
 # empty list means the plan may be applied. -DestroyOnly: the plan may only delete our own DNS records.
 function Test-Plan($plan, [switch] $DestroyOnly) {
-    $dnsKeys = foreach ($h in $HostedDnsHosts) { "$h-A" }
+    $dnsKeys = foreach ($h in @($HostedDnsHosts) + @($HostedRedirectHosts)) { "$h-A" }
     $expected = @('contabo_secret.ssh', 'contabo_instance.vps', 'contabo_firewall.public') + @($dnsKeys | ForEach-Object { "cloudflare_dns_record.host[""$_""]" })
     $problems = [System.Collections.Generic.List[string]]::new()
     $planAddresses = @($plan.resource_changes | ForEach-Object { "$($_.address)" })
@@ -240,7 +240,7 @@ function Test-Plan($plan, [switch] $DestroyOnly) {
         }
         if ("$(@($a.instance_ids) -join ',')" -ne $HostedInstanceId) { $problems.Add("firewall holds instances '$(@($a.instance_ids) -join ',')', expected $HostedInstanceId") }
     }
-    $wantNames = $HostedDnsHosts | ForEach-Object { "$_.$HostedDomain" }
+    $wantNames = @($HostedDnsHosts) + @($HostedRedirectHosts) | ForEach-Object { Get-HostedFqdn $_ }
     foreach ($rc in @($plan.resource_changes | Where-Object type -eq 'cloudflare_dns_record')) {
         $a = $rc.change.after
         if (-not $a) { continue }

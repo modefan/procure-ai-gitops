@@ -355,11 +355,12 @@ Add-Check 'Cloudflare API: one A record each for procure, auth, dashboard to the
     if (-not $hostInfo) { throw 'no VM (host.json missing)' }
     $records = Get-HostedDnsRecords
     $problems = @()
-    foreach ($h in $HostedDnsHosts) {
-        $a = @($records | Where-Object { $_.name -eq "$h.$HostedDomain" -and $_.type -eq 'A' })
-        if ($a.Count -ne 1) { $problems += "A $h.$($HostedDomain): $($a.Count) records"; continue }
-        if ($a[0].content -ne $hostInfo.ipv4) { $problems += "A $h.$($HostedDomain) -> $($a[0].content), server is $($hostInfo.ipv4)" }
-        if ($a[0].proxied) { $problems += "A $h.$($HostedDomain) is proxied" }
+    foreach ($h in @($HostedDnsHosts) + @($HostedRedirectHosts)) {
+        $fqdn = Get-HostedFqdn $h
+        $a = @($records | Where-Object { $_.name -eq $fqdn -and $_.type -eq 'A' })
+        if ($a.Count -ne 1) { $problems += "A ${fqdn}: $($a.Count) records"; continue }
+        if ($a[0].content -ne $hostInfo.ipv4) { $problems += "A $fqdn -> $($a[0].content), server is $($hostInfo.ipv4)" }
+        if ($a[0].proxied) { $problems += "A $fqdn is proxied" }
     }
     $aaaa = @($records | Where-Object type -eq 'AAAA')
     if ($aaaa) { $problems += "AAAA records exist: $(($aaaa | ForEach-Object name) -join ', ')" }

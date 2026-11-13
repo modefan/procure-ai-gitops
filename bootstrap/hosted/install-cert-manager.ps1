@@ -14,10 +14,12 @@
        e-mail comes from the user env var PROCURE_ACME_EMAIL (not in the repo); without it the accounts are registered without one
        (Let's Encrypt sends no expiry mails any more, so nothing is lost).
     5. Namespace ingress-tls (no NetworkPolicies, so cert-manager's HTTP-01 solver pod is reachable from Traefik; procure denies by default):
-       Certificate procure-public for procure, auth and dashboard.<domain> (one certificate, one ACME order) from the chosen issuer, Secret
+       Certificate procure-public for every hosted name (the app, auth, dashboard, the operator's hosts, the bare domain and www; one certificate, one ACME order) from the chosen issuer, Secret
        procure-public-tls, and TLSStore ingress-tls/default pointing at it: Traefik's default certificate, the one every Ingress without its
        own secretName gets - the hosted twin of the local CA's TLSStore (bootstrap/new-local-ca.ps1). The charts stay unchanged.
        Waits until the Certificate is Ready and prints its issuer and dates.
+    6. The bare domain and www.<domain> (plan 09 Task 5): bare-domain-redirect.yaml, a Traefik redirectRegex Middleware and an IngressRoute that
+       answer 301 to https://procure.<domain>/<path> and serve nothing else.
     The certificate comes from the staging issuer unless -Production is given (Let's Encrypt's staging CA: untrusted, but no rate limits
     that matter); switch to production once staging issued for every host. Changing the issuer reissues the certificate, so a run without
     -Production refuses to downgrade a certificate that already comes from production (a rebuild of the VM starts with staging again, and a
@@ -39,7 +41,7 @@ Select-ProcureCluster hosted
 Assert-ClusterReachable
 
 $namespace = 'ingress-tls'
-$hosts = @($HostedDnsHosts | ForEach-Object { "$_.$HostedDomain" })
+$hosts = @(@($HostedDnsHosts) + @($HostedRedirectHosts) | ForEach-Object { Get-HostedFqdn $_ })
 $Issuer = if ($Production) { 'production' } else { 'staging' }
 $issuerName = "letsencrypt-$Issuer"
 if (-not $Production) {
@@ -147,7 +149,15 @@ while ($true) {
     $cert = Invoke-Kubectl -n $namespace get certificate procure-public -o json | Out-String | ConvertFrom-Json
     $ready = @($cert.status.conditions | Where-Object { $_.type -eq 'Ready' }) | Select-Object -First 1
     $secretIssuer = & kubectl @KubectlArgs -n $namespace get secret procure-public-tls -o jsonpath='{.metadata.annotations.cert-manager\.io/issuer-name}' 2>$null
-    if ($ready -and $ready.status -eq 'True' -and $secretIssuer -eq $issuerName) { break }
+    # A changed name list reissues the certificate: Ready can still be True for a moment with the old one, so also require every name in the Secret's certificate.
+    $secretPem = & kubectl @KubectlArgs -n $namespace get secret procure-public-tls -o jsonpath='{.data.tls\.crt}' 2>$null
+    $missingNames = @($hosts)
+    if ($secretPem) {
+        $sans = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($secretPem)).Extensions |
+            Where-Object { $_.Oid.Value -eq '2.5.29.17' } | ForEach-Object { $_.Format($false) }
+        $missingNames = @($hosts | Where-Object { "$sans" -notmatch "DNS Name=$([regex]::Escape($_))(,|$)" })
+    }
+    if ($ready -and $ready.status -eq 'True' -and $secretIssuer -eq $issuerName -and $missingNames.Count -eq 0) { break }
     if ((Get-Date) -gt $deadline) {
         $orders = & kubectl @KubectlArgs -n $namespace get certificaterequests,orders,challenges 2>&1
         throw "Certificate procure-public not Ready from $issuerName within $TimeoutMinutes min: $($ready.message)`n$($orders -join [Environment]::NewLine)"
@@ -157,3 +167,9 @@ while ($true) {
 $pem = & kubectl @KubectlArgs -n $namespace get secret procure-public-tls -o jsonpath='{.data.tls\.crt}'
 $x509 = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($pem))
 Write-Host "Certificate procure-public Ready: $($hosts -join ', '); issuer $($x509.Issuer); valid $($x509.NotBefore.ToString('yyyy-MM-dd')) to $($x509.NotAfter.ToString('yyyy-MM-dd')); renewal $($cert.status.renewalTime)."
+
+# --- 6. The bare domain and www redirect to the app (plan 09 Task 5) ------------------------------------------------------------------
+# After the certificate (the IngressRoute names its Secret, which now holds both names). A 301 to https://procure.<domain>/<path>, nothing else.
+$redirect = (Get-Content -Raw (Join-Path $PSScriptRoot 'bare-domain-redirect.yaml')).Replace('__DOMAIN__', $HostedDomain)
+if ($redirect -match '__[A-Z_]+__') { throw "bare-domain-redirect.yaml still holds a placeholder ($($Matches[0]))." }
+Write-Host (Invoke-ServerSideApply -Json $redirect -Description 'Middleware and IngressRoute ingress-tls/bare-domain-redirect')

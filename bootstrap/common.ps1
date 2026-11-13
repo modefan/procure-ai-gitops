@@ -67,6 +67,10 @@ $script:HostedDomain = 'daleabels.com'
 # The operator's own hosts (plan 08b Task 4): pgAdmin, the MongoDB UI, Redis Insight, RabbitMQ's management UI, the break-glass dashboard. Keep
 # infra/hosted/variables.tf dns_hosts equal; every name is on the one public certificate (install-cert-manager.ps1).
 $script:HostedDnsHosts = @('procure', 'auth', 'dashboard', 'pgadmin', 'mongo', 'redis', 'rabbitmq', 'dashboard-direct')
+# The bare domain and www (plan 09 Task 5): A records and certificate names like the hosts above, but they serve nothing; Traefik answers every
+# request with a 301 to https://procure.<domain> (bootstrap/hosted/bare-domain-redirect.yaml). '@' is the apex. Keep infra/hosted/variables.tf
+# redirect_hosts equal.
+$script:HostedRedirectHosts = @('@', 'www')
 $script:HostedCloudflareZoneId = '93c854c6f17e0cbb8f2b7e9395f7828c'
 # The hosted ghcr-pull Secret holds a classic read-only PAT (read:packages, user modefan; DEMO PASSWORDS.txt "GitHub Container Registry
 # (GHCR)", user env var GHCR_READ_TOKEN). It expires on this date: while the packages are private an expired token makes the next hosted
@@ -139,11 +143,16 @@ function Invoke-CloudflareApi([string] $path) {
     Invoke-RestMethod -Headers @{ Authorization = "Bearer $(Get-ApiToken 'CLOUDFLARE_API_TOKEN')" } "https://api.cloudflare.com/client/v4/$path"
 }
 
+function Get-HostedFqdn([string] $HostLabel) {
+    # The DNS name of a host label: 'procure' -> procure.<domain>, '@' (the apex) -> <domain>.
+    if ($HostLabel -eq '@') { $script:HostedDomain } else { "$HostLabel.$script:HostedDomain" }
+}
+
 function Get-HostedDnsRecords {
     # The zone's A/AAAA records for the hosted host names (type, name, content, proxied).
     # Asked by exact name, one host at a time, so the answer never depends on how many other records the zone holds.
-    @(foreach ($h in $script:HostedDnsHosts) {
-        $name = "$h.$script:HostedDomain"
+    @(foreach ($h in @($script:HostedDnsHosts) + @($script:HostedRedirectHosts)) {
+        $name = Get-HostedFqdn $h
         (Invoke-CloudflareApi "zones/$script:HostedCloudflareZoneId/dns_records?name=$([uri]::EscapeDataString($name))&per_page=100").result |
             Where-Object { $_.name -eq $name -and $_.type -in 'A', 'AAAA' }
     })

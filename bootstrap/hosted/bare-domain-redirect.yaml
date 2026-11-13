@@ -1,0 +1,46 @@
+# The bare domain and www (plan 09 Task 5, Dale's builder-check answer): https://<domain>/<path> and https://www.<domain>/<path> answer
+# 301 with Location https://procure.<domain>/<path> (path and query kept) and serve nothing else. Applied by
+# bootstrap/hosted/install-cert-manager.ps1 (step 6) after it replaced __DOMAIN__ with HostedDomain (bootstrap/common.ps1).
+#  - Namespace ingress-tls (the one with the certificate, no NetworkPolicies, no workloads). The IngressRoute needs no backend:
+#    noop@internal is Traefik's built-in service; the Middleware answers first.
+#  - http:// is not routed here: Traefik's web entry point already redirects every http:// request to https:// (traefik-config.yaml), so
+#    http://<domain>/p reaches this route in two permanent hops (http -> https on the same host, then this one).
+#  - TLS: the procure-public Secret (the certificate lists both names; install-cert-manager.ps1 builds dnsNames from common.ps1).
+#  - priority 1: cert-manager's HTTP-01 solver Ingress (Host && PathPrefix /.well-known/acme-challenge/) must win over this catch-all for
+#    the same host, or a renewal of the certificate for these two names would be redirected instead of answered.
+#  - Current Traefik CRD group traefik.io/v1alpha1 (the containo.us group is gone).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: bare-domain-redirect
+  namespace: ingress-tls
+  labels:
+    app.kubernetes.io/managed-by: procure-bootstrap
+spec:
+  redirectRegex:
+    # Matched against the full request URL (scheme, host, path, query); the replacement keeps path and query.
+    regex: '^https?://[^/]+(.*)$'
+    replacement: 'https://procure.__DOMAIN__${1}'
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: bare-domain-redirect
+  namespace: ingress-tls
+  labels:
+    app.kubernetes.io/managed-by: procure-bootstrap
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`__DOMAIN__`) || Host(`www.__DOMAIN__`)
+      priority: 1
+      middlewares:
+        - name: bare-domain-redirect
+      services:
+        - kind: TraefikService
+          name: noop@internal
+  tls:
+    secretName: procure-public-tls

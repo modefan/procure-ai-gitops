@@ -120,7 +120,7 @@ resource "contabo_firewall" "public" {
 # address where 80/443 do not answer (controller ruling 2026-11-07; Task 12 kept IPv4 only). Only these three records are
 # managed here; the apex and anything else in the zone are not touched.
 locals {
-  dns_records = { for host in var.dns_hosts : "${host}-A" => { name = "${host}.${var.domain}", type = "A", content = local.ipv4 } }
+  dns_records = { for host in concat(var.dns_hosts, var.redirect_hosts) : "${host}-A" => { name = host == "@" ? var.domain : "${host}.${var.domain}", type = "A", content = local.ipv4 } }
 }
 
 resource "cloudflare_dns_record" "host" {
