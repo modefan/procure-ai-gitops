@@ -15,8 +15,8 @@
       3. Argo CD's own chart (apps/values.yaml chartRepo/chartVersion, OCI) with argocd/values.yaml, envs/<env>/argocd.yaml and the
          environment's switches; for an environment with argocd.ingressEnabled and a hostname other than the local one (hosted, plan 08c
          Task 1) also the public host's edge: the Ingress for that host with the middlewares rate limit, headers and the Keycloak gate
-         (in that order), each Middleware rendered, the IngressRoute argocd-edge (403 for POST /api/v1/session and the gRPC-web session
-         create, the cross-site guard, /oauth2/ to the gate) and the gate's Deployment (pinned image, memory limit, group argocd-admins).
+         (in that order), each Middleware rendered, the IngressRoute argocd-edge (403 for POST /api/v1/session in any spelling and the
+         gRPC-web session create, 403 for the gate's static files, the cross-site guard, /oauth2/ to the gate) and the gate's Deployment (pinned image, memory limit, group argocd-admins).
     Every render goes through `kubeconform -strict`: Kubernetes schemas, and custom resources (Traefik's Middleware, Argo CD's) against the
     community CRD schema catalog (datreeio/CRDs-catalog); a custom resource neither knows is skipped and counted. Exit code 1 when a
     render or a validation fails.
@@ -112,10 +112,14 @@ function Test-ArgocdEdgeDocs([string] $label, [string] $yaml) {
     $route = Find 'IngressRoute' 'argocd-edge'
     if (-not $route) { Fail "$label`: IngressRoute argocd-edge missing"; return }
     $routes = @($route.spec.routes)
-    $session = @($routes | Where-Object { $_.match -match [regex]::Escape("Host(``$hostName``)") -and $_.match -match 'Method\(`POST`\) && PathRegexp\(`\^/api/v1/session/\?\$`\)' -and $_.match -match 'PathPrefix\(`/session\.SessionService/`\)' })
+    # The session path as a case-insensitive prefix that also takes encoded slashes (final review M1); printf's %% must render as one %.
+    $session = @($routes | Where-Object { $_.match.Contains("Host(``$hostName``)") -and $_.match.Contains('Method(`POST`) && PathRegexp(`(?i)^/+api(/|%2f)+v1(/|%2f)+session`)') -and $_.match.Contains('PathPrefix(`/session.SessionService/`)') })
     $denies = { param($r) @($r.middlewares | ForEach-Object { $_.name }) -contains 'edge-deny' -and $r.services[0].name -eq 'noop@internal' }
     if ($session.Count -eq 1 -and (& $denies $session[0]) -and [int] $session[0].priority -gt 10000) { Pass "$label`: POST /api/v1/session and the gRPC-web session create answer 403 (edge-deny, priority $($session[0].priority))" }
     else { Fail "$label`: no high-priority 403 route for POST /api/v1/session and /session.SessionService/" }
+    $static = @($routes | Where-Object { $_.match.Contains("Host(``$hostName``)") -and $_.match.Contains('PathRegexp(`(?i)^/+oauth2(/|%2f)+static`)') })
+    if ($static.Count -eq 1 -and (& $denies $static[0]) -and [int] $static[0].priority -gt 10000) { Pass "$label`: the gate's static files (/oauth2/static/) answer 403 (edge-deny, priority $($static[0].priority))" }
+    else { Fail "$label`: no high-priority 403 route for the gate's static files (/oauth2/static/)" }
     $origin = @($routes | Where-Object { $_.match -match 'HeaderRegexp\(`Origin`' -and $_.match -match [regex]::Escape("!Header(``Origin``, ``https://$hostName``)") })
     if ($origin.Count -eq 1 -and (& $denies $origin[0])) { Pass "$label`: cross-site requests (foreign Origin) answer 403" } else { Fail "$label`: no cross-site guard route" }
     $oauth = @($routes | Where-Object { $_.match -match 'PathPrefix\(`/oauth2/`\)' })

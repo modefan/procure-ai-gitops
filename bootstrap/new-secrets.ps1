@@ -34,8 +34,8 @@
       procure-ai-provider        api-key: hosted only (plan 08 Task 12), the Azure Foundry key of the Assistant (AI__ApiKey, envs/hosted/
                                  procure-ai.yaml), from the user env var AZURE_FOUNDRY_API_KEY on every run (rotate: change the env var, rerun,
                                  restart assistant-api); the local cluster runs the Fake provider and has no such Secret
-      ghcr-pull                  kubernetes.io/dockerconfigjson for ghcr.io, local only, from `gh auth token` (plan 07 ruling 7). Hosted:
-                                 none; the GHCR packages are public (plan 08c Task 2) and a run removes an old hosted ghcr-pull Secret
+      ghcr-pull                  none any more: the GHCR packages are public (plan 08c), so both clusters pull anonymously and a run
+                                 removes the ghcr-pull Secret of older bootstraps (local and hosted)
     In namespace observability (a pod reads Secrets of its own namespace only):
       procure-keycloak           dashboard-secret only (the Aspire dashboard's Keycloak client aspire-dashboard)
       aspire-dashboard-direct-basic-auth  kubernetes.io/basic-auth: username operator, password operator-dashboard-token (the break-glass
@@ -53,7 +53,9 @@
 
     Argo CD's public host (hosted only, plan 08c Task 1, ruling R9): the Keycloak gate in front of it (oauth2-proxy, envs/hosted/argocd.yaml)
     encrypts its session cookie with
-      argocd (namespace)         argocd-gate (cookie-secret: 32 letters and digits, the AES-256 key; parameter argocd-gate-cookie-secret)
+      argocd (namespace)         argocd-gate (cookie-secret: 32 letters and digits; parameter argocd-gate-cookie-secret). Such a value
+                                 is valid base64, so oauth2-proxy decodes it to 24 bytes: an AES-192 key, not AES-256 (final review M7;
+                                 kept so the live value stays valid; 32 random bytes as base64 would give AES-256 at the next rotation)
     Rotating it signs everyone out of the gate (they sign in again with Keycloak); restart deploy/argocd-gate after a new value.
 
     -Environment hosted (plan 08 ruling 11): the same Secrets on the hosted VM (bootstrap/hosted/, through the SSH tunnel), from a separate
@@ -71,8 +73,6 @@ param(
     # local: the k3d cluster and the AppHost user secrets. hosted: the VM through the SSH tunnel and the procure-ai-hosted user secrets.
     [ValidateSet('local', 'hosted')]
     [string] $Environment = 'local',
-    # The GitHub account whose token pulls the GHCR images.
-    [string] $GhcrUser = 'modefan',
     # Remove the keys (and Secrets) this script no longer writes. Only after Argo CD synced and rolled every pod that used them.
     [switch] $Prune
 )
@@ -333,24 +333,12 @@ if ($Prune) {
     if ($stale) { $results.Add("$stale") }
 }
 
-# --- GHCR pull secret. Local (plan 07 ruling 7): the token in Dale's gh keyring. Hosted: none since plan 08c Task 2 (the packages are
-# public, envs/hosted sets global.imagePullSecrets to []); the Secret of older bootstraps (a read-only PAT) is removed. ---
-if ($hosted) {
-    $stale = & kubectl @KubectlArgs -n procure delete secret ghcr-pull --ignore-not-found 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "kubectl delete secret ghcr-pull failed: $stale" }
-    if ($stale) { $results.Add("$stale") }
-} else {
-    $gh = (Get-Command gh -ErrorAction SilentlyContinue)?.Source ?? 'C:\Program Files\GitHub CLI\gh.exe'
-    $token = (& $gh auth token 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) { throw "'gh auth token' returned no token; sign in with 'gh auth login' first." }
-    $token = $token.Trim()
-    $dockerConfig = [ordered]@{ auths = [ordered]@{ 'ghcr.io' = [ordered]@{
-        username = $GhcrUser
-        password = $token
-        auth     = ConvertTo-Base64 "${GhcrUser}:$token"
-    } } } | ConvertTo-Json -Depth 5 -Compress
-    Set-ProcureSecret ghcr-pull ([ordered]@{ '.dockerconfigjson' = $dockerConfig }) 'kubernetes.io/dockerconfigjson'
-}
+# --- No GHCR pull secret since plan 08c (the packages are public; envs/*/ set global.imagePullSecrets to []). The Secret of older
+# bootstraps (hosted: a read-only PAT; local: the token of Dale's gh keyring, plan 07 ruling 7, final review M5) is removed, in both
+# environments. ---
+$stale = & kubectl @KubectlArgs -n procure delete secret ghcr-pull --ignore-not-found 2>&1
+if ($LASTEXITCODE -ne 0) { throw "kubectl delete secret ghcr-pull failed: $stale" }
+if ($stale) { $results.Add("$stale") }
 
 # --- The operator's web UIs (namespace operator, procure-ai deploy/charts/procure-ops; plan 08b Task 4). ---
 $results.Add((Invoke-Apply (New-NamespaceObject 'operator')))

@@ -211,10 +211,23 @@ extraObjects:
       routes:
         # R2: no username/password login on the public host (the break-glass admin signs in through the tunnel only), also not behind a
         # valid gate session: Argo CD's REST login (POST /api/v1/session; DELETE there is the UI's logout and passes) and its gRPC-web twin
-        # (the CLI's --grpc-web login). Traefik cleans the path (dot segments, double slashes) before it matches.
+        # (the CLI's --grpc-web login). Traefik cleans the path (dot segments, double slashes) before it matches, but matches the raw path
+        # when it holds an encoded slash, so the rule is a case-insensitive prefix that also takes %2F, repeated slashes and any suffix
+        # (/session/, ;x, %00, %2F; final review M1). %% is printf's literal %.
         - kind: Rule
-          match: {{ printf "Host(`%s`) && ((Method(`POST`) && PathRegexp(`^/api/v1/session/?$`)) || PathPrefix(`/session.SessionService/`))" $host | quote }}
+          match: {{ printf "Host(`%s`) && ((Method(`POST`) && PathRegexp(`(?i)^/+api(/|%%2f)+v1(/|%%2f)+session`)) || PathPrefix(`/session.SessionService/`))" $host | quote }}
           priority: 100001
+          middlewares:
+            - name: edge-headers
+            - name: edge-deny
+          services:
+            - name: noop@internal
+              kind: TraefikService
+        # The gate's static files (its sign-in page's CSS and images) answer 403: --skip-provider-button means that page is never shown,
+        # and they only fingerprint the gate's version (final review M2).
+        - kind: Rule
+          match: {{ printf "Host(`%s`) && PathRegexp(`(?i)^/+oauth2(/|%%2f)+static`)" $host | quote }}
+          priority: 100002
           middlewares:
             - name: edge-headers
             - name: edge-deny

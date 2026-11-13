@@ -1,59 +1,71 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Mirrors everything the hosted (and local) setup needs that exists only on Dale's PC into two folders off the Desktop, plain files (no
-    encryption: Dale's decision 2026-11-08), then hash-compares every copy with its original. -Check only compares.
+    Mirrors the items listed in the private backup-items.json to the destinations listed there (plain files, the operator's decision),
+    then hash-compares every copy with its original. -Check only compares.
 .DESCRIPTION
-    Losing the PC (or %USERPROFILE%\.procure-ai) would otherwise leave only destructive ways back: without the SSH key only the Contabo VNC
-    console reaches the VM, without the Terraform state only a reinstall adopts it, and the hosted Secrets would be gone (plan 08 final
-    review B I4). The copies go to BOTH
-      C:\Users\User\OneDrive\procure-ai secrets      (OneDrive: off the PC)
-      C:\Users\User\Documents\procure-ai secrets     (a second local copy)
-    each with this layout:
-      DEMO PASSWORDS.txt                  <- %USERPROFILE%\Desktop\DEMO PASSWORDS.txt
-      hosted\                             <- %USERPROFILE%\.procure-ai\hosted (not its run-time files: tunnel.pid, argocd-opened-tunnel,
-                                             *.log, WAL-test scripts and folders)
-      deploy-keys\                        <- %USERPROFILE%\.procure-ai\deploy-keys
-      local-ca\                           <- %USERPROFILE%\.procure-ai\local-ca
-      user-secrets\procure-ai-hosted\     <- %APPDATA%\Microsoft\UserSecrets\procure-ai-hosted
-      user-secrets\procure-ai-apphost\    <- %APPDATA%\Microsoft\UserSecrets\procure-ai-apphost
-      contabo-recovery-codes.txt          <- %USERPROFILE%\Downloads\contabo-recovery-codes.txt
-      github-recovery-codes.txt           <- %USERPROFILE%\Downloads\github-recovery-codes.txt
-      README.txt                          what each item is and where its original lives (written by this script)
+    Some of what the hosted (and local) setup needs exists only on the operator's PC: losing it would leave only destructive ways back
+    (plan 08 final review B I4). This script copies those items off the PC.
+    What is copied, and where to, is NOT in this repository: it is read from a private file outside every repo,
+      %USERPROFILE%\.procure-ai\backup-items.json
+    with this shape (placeholder values):
+      {
+        "destinations": [ "D:\\example\\backup-1", "E:\\example\\backup-2" ],
+        "items": [
+          { "name": "some-file.txt", "source": "%USERPROFILE%\\example\\some-file.txt", "what": "what it is" },
+          { "name": "some-folder",   "source": "%USERPROFILE%\\example\\some-folder",   "what": "what it is", "skipRunTimeFiles": true }
+        ]
+      }
+    "name" is the path of the copy inside each destination; "source" may use %VAR% environment variables; "skipRunTimeFiles" leaves out
+    run-time files of a folder (tunnel.pid, argocd-opened-tunnel, tfplan, *.log, WAL-test scripts and folders). The operator's private
+    runbook says what the file lists.
     A mirror: a file in a copied folder that the original no longer has is deleted from the copy (named in the output). Nothing outside
     these items is touched. Then every original file is compared with each copy by SHA-256: OK, MISMATCH, MISSING, or EXTRA (in a copied
     folder only), per destination. Exit code 1 when anything is not OK. Prints names and counts only, never contents.
-    Access: before copying, each destination folder gets the same ACL as %USERPROFILE%\.procure-ai (Set-CurrentUserOnlyAcl in
+    Access: before copying, each destination folder gets the same ACL as %USERPROFILE%\.procure-ai\hosted (Set-CurrentUserOnlyAcl in
     common.ps1: only the current user, inheritance off at the folder, every file and subfolder inheriting that one rule), so no other
     account of the PC can read the copies; both modes then check every item under each destination and report any other identity as a
-    problem. OneDrive syncs as the current user, so syncing still works. A destination inside a git repository is refused.
-    The copies are plain files on purpose (Dale's decision 2026-11-08, with the risk explained: OneDrive holds them unencrypted; the
-    Contabo and GitHub recovery codes sit in the same folder, as Dale asked).
-    Run it after any secret, key, state or DEMO PASSWORDS.txt change (procure-ai docs/hosting.md, "Backup copies and recovery").
+    problem. A destination inside a git repository is refused, and so is one that overlaps an original.
+    Run it after any change to a listed item.
 #>
 [CmdletBinding()]
 param(
     # Only compare the copies with the originals; copy nothing.
     [switch] $Check,
-    # The two destination folders (defaults: Dale's choice, 2026-11-08).
-    [string[]] $Destination = @((Join-Path $env:USERPROFILE 'OneDrive\procure-ai secrets'), (Join-Path $env:USERPROFILE 'Documents\procure-ai secrets'))
+    # The private list of destinations and items (kept outside every repository).
+    [string] $ItemsFile = (Join-Path $env:USERPROFILE '.procure-ai\backup-items.json')
 )
 
 . (Join-Path $PSScriptRoot '..\common.ps1')
 
-$procure = Join-Path $env:USERPROFILE '.procure-ai'
+$exampleShape = @'
+{
+  "destinations": [ "D:\\example\\backup-1", "E:\\example\\backup-2" ],
+  "items": [
+    { "name": "some-file.txt", "source": "%USERPROFILE%\\example\\some-file.txt", "what": "what it is" },
+    { "name": "some-folder", "source": "%USERPROFILE%\\example\\some-folder", "what": "what it is", "skipRunTimeFiles": true }
+  ]
+}
+'@
+if (-not (Test-Path -LiteralPath $ItemsFile -PathType Leaf)) {
+    throw "The private backup list $ItemsFile is missing. Nothing copied. Create it (outside every repository) with this shape:`n$exampleShape"
+}
+try { $config = Get-Content -LiteralPath $ItemsFile -Raw | ConvertFrom-Json }
+catch { throw "$ItemsFile is not valid JSON ($($_.Exception.Message)). Nothing copied. Expected shape:`n$exampleShape" }
+$Destination = @($config.PSObject.Properties['destinations']?.Value | Where-Object { $_ } | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) })
 # Copy name -> original, with what it is (the README lines).
-$items = @(
-    [pscustomobject]@{ Name = 'DEMO PASSWORDS.txt'; Source = $DemoPasswordsFile; What = 'all demo accounts, tokens, passwords' }
-    [pscustomobject]@{ Name = 'hosted'; Source = (Join-Path $procure 'hosted'); What = 'SSH key, known_hosts, Terraform state, host.json, kubeconfig, internal CA' }
-    [pscustomobject]@{ Name = 'deploy-keys'; Source = (Join-Path $procure 'deploy-keys'); What = 'Argo CD and CI deploy keys' }
-    [pscustomobject]@{ Name = 'local-ca'; Source = (Join-Path $procure 'local-ca'); What = 'local cluster CA' }
-    [pscustomobject]@{ Name = 'user-secrets\procure-ai-hosted'; Source = (Join-Path $env:APPDATA "Microsoft\UserSecrets\$HostedUserSecretsId"); What = 'hosted app secrets (secrets.json)' }
-    [pscustomobject]@{ Name = 'user-secrets\procure-ai-apphost'; Source = (Join-Path $env:APPDATA "Microsoft\UserSecrets\$AppHostUserSecretsId"); What = 'local AppHost secrets (secrets.json)' }
-    [pscustomobject]@{ Name = 'contabo-recovery-codes.txt'; Source = (Join-Path $env:USERPROFILE 'Downloads\contabo-recovery-codes.txt'); What = 'Contabo account MFA recovery codes' }
-    [pscustomobject]@{ Name = 'github-recovery-codes.txt'; Source = (Join-Path $env:USERPROFILE 'Downloads\github-recovery-codes.txt'); What = 'GitHub account (modefan) 2FA recovery codes' }
-)
-# Run-time files of the hosted folder: no secret, and they change while scripts run (a tunnel's PID, logs, the WAL test's working files).
+$items = @($config.PSObject.Properties['items']?.Value | ForEach-Object {
+    [pscustomobject]@{
+        Name = $_.PSObject.Properties['name']?.Value
+        Source = [Environment]::ExpandEnvironmentVariables("$($_.PSObject.Properties['source']?.Value)")
+        What = "$($_.PSObject.Properties['what']?.Value)"
+        SkipRunTimeFiles = [bool] $_.PSObject.Properties['skipRunTimeFiles']?.Value
+    }
+})
+if (-not $Destination -or -not $items -or @($items | Where-Object { -not $_.Name -or -not $_.Source })) {
+    throw "$ItemsFile needs at least one destination and items that each have a name and a source. Nothing copied. Expected shape:`n$exampleShape"
+}
+# Run-time files of a folder item (skipRunTimeFiles): no secret, and they change while scripts run (a tunnel's PID, logs, the WAL test's working files).
 function Test-Skipped([string] $relative) {
     $relative -match '^(tunnel\.pid|argocd-opened-tunnel|tfplan)$' -or $relative -like '*.log' -or $relative -match '^(run-wal-[^\\]*\.ps1|wal-run(\\.*)?)$'
 }
@@ -65,7 +77,7 @@ function Get-SourceFiles($item) {
     $root = (Get-Item -LiteralPath $item.Source).FullName.TrimEnd('\')
     foreach ($f in Get-ChildItem -LiteralPath $root -Recurse -File -Force) {
         $relative = $f.FullName.Substring($root.Length + 1)
-        if ($item.Name -eq 'hosted' -and (Test-Skipped $relative)) { continue }
+        if ($item.SkipRunTimeFiles -and (Test-Skipped $relative)) { continue }
         $files[$relative] = $f.FullName
     }
     $files
@@ -97,6 +109,7 @@ function Assert-NotInRepository([string] $dir) {
 $missingSources = @($items | Where-Object { -not (Test-Path -LiteralPath $_.Source) })
 if ($missingSources) { throw "Originals not found: $(($missingSources | ForEach-Object Source) -join ', '). Nothing copied." }
 
+Assert-NotInRepository (Split-Path ([IO.Path]::GetFullPath($ItemsFile)))
 $problems = 0
 foreach ($dest in $Destination) {
     $dest = [IO.Path]::GetFullPath($dest).TrimEnd([char]92)
@@ -147,20 +160,21 @@ foreach ($dest in $Destination) {
     }
     if (-not $Check) {
         $readme = @(
-            'procure-ai secrets copy (plain files, no encryption: Dale''s decision 2026-11-08)'
+            'procure-ai backup copy (plain files, the operator''s decision)'
             'Everything needed to manage or rebuild the procure-ai demo if the PC is lost.'
             'Originals live on the PC; this folder is a mirror written by procure-ai-gitops bootstrap/hosted/backup-hosted.ps1'
-            "(last run $(Get-Date -Format 'yyyy-MM-dd HH:mm')). Run it again after any secret, key, state or DEMO PASSWORDS.txt change."
+            "from the private list $($ItemsFile.Replace($env:USERPROFILE, '%USERPROFILE%'))"
+            "(last run $(Get-Date -Format 'yyyy-MM-dd HH:mm')). Run it again after any change to a listed item."
             ''
         ) + @($items | ForEach-Object {
             $original = $_.Source.Replace($env:APPDATA, '%APPDATA%').Replace($env:USERPROFILE, '%USERPROFILE%')
             '{0,-34} {1,-62} (original: {2})' -f ($_.Name + $(if (Test-Path -LiteralPath $_.Source -PathType Container) { '\' } else { '' })), $_.What, $original
         }) + @(
             ''
-            'hosted\ leaves out run-time files (tunnel.pid, argocd-opened-tunnel, *.log, WAL-test scripts).'
+            'Folders marked skipRunTimeFiles leave out run-time files (tunnel.pid, argocd-opened-tunnel, *.log, WAL-test scripts).'
             'Restore: copy each item back to its original location (the SSH key and the folders under %USERPROFILE%\.procure-ai keep'
-            'current-user-only permissions: new-hosted-cluster.ps1 -KubeconfigOnly resets them for hosted). procure-ai'
-            'docs/hosting.md, "Backup copies and recovery", has the steps, incl. new-hosted-cluster.ps1 -Import.'
+            'current-user-only permissions: new-hosted-cluster.ps1 -KubeconfigOnly resets them for hosted). The operator''s private'
+            'runbook has the steps, incl. new-hosted-cluster.ps1 -Import.'
         )
         Set-Content -LiteralPath (Join-Path $dest 'README.txt') -Value $readme -Encoding utf8NoBOM
     }

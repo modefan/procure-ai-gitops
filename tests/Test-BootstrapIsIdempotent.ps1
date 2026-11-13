@@ -180,7 +180,6 @@ $expectedSecrets = [ordered]@{
     'procure-api-keys'           = @('admin-api-key', 'admin-api-key-sha256', 'simulator-api-key', 'supplier-webhook-secret')
     'procure-connection-strings' = @('requestsdb', 'accessdb', 'budgetsdb', 'approvalsdb', 'auditdb', 'purchasingdb', 'invoicingdb',
                                      'assistantdb', 'suppliersdb', 'assistantchatdb', 'rabbitmq', 'redis', 'auditlog')
-    'ghcr-pull'                  = @('.dockerconfigjson')
     'procure-tls'                = @('tls.crt', 'tls.key')
     'mongo-tls'                  = @('tls.crt', 'tls.key', 'ca.crt', 'mongo.pem')
 }
@@ -205,8 +204,11 @@ else {
         Fail "secret observability/procure-keycloak must hold only a non-empty dashboard-secret (has: $($keys -join ', '))"
     } else { Pass 'secret observability/procure-keycloak (dashboard-secret only)' }
 }
-$ghcrType = & kubectl --context $KubeContext -n procure get secret ghcr-pull -o jsonpath='{.type}' 2>$null
-if ($ghcrType -ne 'kubernetes.io/dockerconfigjson') { Fail "secret ghcr-pull has type '$ghcrType', expected kubernetes.io/dockerconfigjson" }
+# No GHCR pull Secret any more (the packages are public, plan 08c final review M5): the bootstrap removes the one older runs created.
+$ghcrPull = & kubectl --context $KubeContext -n procure get secret ghcr-pull --ignore-not-found -o name 2>&1
+if ($LASTEXITCODE -ne 0) { Fail "could not look up secret procure/ghcr-pull: $ghcrPull" }
+elseif ($ghcrPull) { Fail 'secret procure/ghcr-pull still exists (the bootstrap must remove it; the GHCR packages are public)' }
+else { Pass 'no secret procure/ghcr-pull (the GHCR packages are public)' }
 
 $caHash = (& (Get-OpenSsl) x509 -subject_hash -noout -in (Join-Path $LocalCaDir 'ca.crt')).Trim()
 foreach ($ns in 'procure', 'observability') {

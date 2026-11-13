@@ -25,7 +25,8 @@
        session every path (the UI, /api/*, /auth/*, /swagger-ui, /healthz, path tricks through /oauth2/) answers a redirect to realm ops'
        sign-in (https://<Keycloak host>/realms/ops/..., client argocd-gate) or 400/401/403/404 (an API call: 401), never Argo CD content
        and never a software version; POST /api/v1/session (the username/password login) answers 403, also with a made-up gate cookie,
-       and so does the gRPC-web session create; a cross-site request (foreign Origin) answers 403. DNS, http -> https, certificate and
+       and so does the gRPC-web session create and every encoded or suffixed spelling of the session path (%69, %2F, ;x, %00, case);
+       the gate's static files (/oauth2/static/...) answer 403; a cross-site request (foreign Origin) answers 403. DNS, http -> https, certificate and
        HSTS as for every host (steps 1, 4, 5, 9). Who gets through the gate (members of argocd-admins only): tests/Test-AddArgocdAdmin.ps1.
     8. The dashboard redirects to Keycloak's sign-in for client aspire-dashboard, and its telemetry API answers 404.
     9. The app (https://procure.<domain>/) answers 200. Every host sends Strict-Transport-Security (max-age at least 180 days, no preload),
@@ -274,13 +275,19 @@ try {
         if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent -and $r.Body -notmatch 'token') { Pass "$($case.Name) -> 403 (the admin login is tunnel-only)" }
         else { Fail "$($case.Name) on https://$ArgocdHost answered $($r.Status): $($r.Body.Substring(0, [Math]::Min(160, $r.Body.Length)))" }
     }
-    # Encoded and odd spellings (review minor 5): Traefik matches the decoded path, so %69/%73 hit the deny route (403); an encoded slash or
-    # another case is not the session path for the deny route and lands on the gate (302 to realm ops or 401). Never a session.
-    foreach ($path in '/api/v1/sess%69on', '/api/v1/%73ession', '/api/v1/session%2F', '/api/v1/Session') {
+    # Encoded and odd spellings (review minor 5, final review M1): the deny route is a case-insensitive prefix that also takes an encoded
+    # slash, so every one of these is 403 at the edge, before the gate. Never a session.
+    foreach ($path in '/api/v1/sess%69on', '/api/v1/%73ession', '/api/v1/session%2F', '/api/v1/Session', '/api%2Fv1%2Fsession',
+        '/api/v1/session;x', '/api/v1/session%00') {
         $r = Invoke-Http "https://$ArgocdHost$path" -Method POST -Extra (@('--path-as-is') + $json)
-        $toOps = $r.Status -eq 302 -and "$($r.Location)".StartsWith($opsAuth)
-        if (($r.Status -in 401, 403 -or $toOps) -and $r.Body -notmatch $argoContent -and $r.Body -notmatch 'token') { Pass "POST $path -> $($r.Status)$(if ($toOps) { " to realm ops' sign-in" }), no session" }
-        else { Fail "POST $path on https://$ArgocdHost answered $($r.Status): $($r.Body.Substring(0, [Math]::Min(160, $r.Body.Length)))" }
+        if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent -and $r.Body -notmatch 'token') { Pass "POST $path -> 403 (the admin login is tunnel-only)" }
+        else { Fail "POST $path on https://$ArgocdHost answered $($r.Status), expected 403: $($r.Body.Substring(0, [Math]::Min(160, $r.Body.Length)))" }
+    }
+    # The gate's static files fingerprint its version and are never needed (--skip-provider-button): 403 at the edge (final review M2).
+    foreach ($path in '/oauth2/static/css/bulma.min.css', '/oauth2/static/', '/OAUTH2/static/css/bulma.min.css', '/oauth2%2Fstatic/css/bulma.min.css') {
+        $r = Invoke-Http "https://$ArgocdHost$path" -Extra @('--path-as-is')
+        if ($r.Status -in 403, 404 -and $r.Body -notmatch 'bulma') { Pass "$path -> $($r.Status) (the gate's static files are not served)" }
+        else { Fail "https://$ArgocdHost$path answered $($r.Status), expected 403 or 404$(if ($r.Body -match 'bulma') { ' (it served the gate''s CSS)' })" }
     }
     $r = Invoke-Http "https://$ArgocdHost/api/v1/applications" -Method POST -Extra @('-H', 'Origin: https://evil.example', '-H', 'Content-Type: text/plain', '--data-binary', 'x')
     if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent) { Pass 'a cross-site POST (foreign Origin) -> 403' } else { Fail "a cross-site POST to https://$ArgocdHost answered $($r.Status), expected 403" }

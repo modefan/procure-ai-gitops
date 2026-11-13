@@ -14,7 +14,7 @@ interfaces (checked by `new-cluster.ps1`, `Test-BootstrapIsIdempotent.ps1` and `
 ```powershell
 ./bootstrap/new-cluster.ps1     # k3d cluster `procure` (1 server, 10 GiB), CoreDNS rewrite, namespaces procure/observability/argocd
 ./bootstrap/new-local-ca.ps1    # local CA + certificates in %USERPROFILE%\.procure-ai\local-ca\, TLS Secrets, ConfigMap procure-ca
-./bootstrap/new-secrets.ps1     # Secrets in `procure` from the AppHost user secrets (+ ghcr-pull from `gh auth token`)
+./bootstrap/new-secrets.ps1     # Secrets in `procure` from the AppHost user secrets
 ./tests/Test-BootstrapIsIdempotent.ps1   # second run changes nothing, every Secret exists, DNS rewrite and TLS work
 ./bootstrap/install-argocd.ps1  # deploy keys, Argo CD, repository Secrets, the root Application: from here Argo CD brings everything up
 ./tests/Test-FreshCluster.ps1   # DELETES the cluster, runs the four scripts, waits until all is Synced/Healthy/Ready, then Test-Smoke.ps1
@@ -29,7 +29,7 @@ still use them); after Argo CD synced and rolled a revision that dropped keys, r
 |---|---|
 | `bootstrap/new-cluster.ps1` | Creates or starts the cluster (k3s image pinned in `bootstrap/common.ps1`), applies `coredns-custom.yaml`, creates the namespaces, waits for Traefik. |
 | `bootstrap/new-local-ca.ps1` | CA (10 years, name-constrained to `localtest.me`, MongoDB's in-cluster names and 127.0.0.1: it cannot vouch for any other site; an older unconstrained CA is replaced), wildcard `*.procure.localtest.me` and a MongoDB server certificate; Secrets `procure-tls` (Traefik's default certificate through the `default` TLSStore) and `mongo-tls`; ConfigMap `procure-ca` (`<subject hash>.0`, `ca.crt`) in `procure` and `observability`. |
-| `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-db-roles` (every service's own database role and user, plan 08 Task 4), `procure-api-keys`, `procure-connection-strings` (one key per AppHost connection name, each database as its service's own role), `ghcr-pull` (local only; the GHCR packages are public, the hosted VM pulls anonymously); in `observability` `procure-keycloak` with only `dashboard-secret` (the Aspire dashboard's client). Generates missing new values into the user secrets first. |
+| `bootstrap/new-secrets.ps1` | `procure-postgres`, `procure-rabbitmq`, `procure-redis`, `procure-mongo`, `procure-keycloak`, `procure-debezium`, `procure-db-roles` (every service's own database role and user, plan 08 Task 4), `procure-api-keys`, `procure-connection-strings` (one key per AppHost connection name, each database as its service's own role) (no `ghcr-pull` any more: the GHCR packages are public, both clusters pull anonymously and a run removes an old one); in `observability` `procure-keycloak` with only `dashboard-secret` (the Aspire dashboard's client). Generates missing new values into the user secrets first. |
 | `bootstrap/install-argocd.ps1` | Deploy keys (read-only for Argo CD on both repos, write on this repo for procure-ai's publish workflow, whose Actions secret `GITOPS_DEPLOY_KEY` it sets) in `%USERPROFILE%\.procure-ai\deploy-keys\`; Argo CD by Helm (chart version in `apps/values.yaml`, values `argocd/values.yaml`); repository Secrets; the root Application. |
 | `bootstrap/remove-cluster.ps1` | Deletes the cluster and all its data (asks first). Keeps the CA. |
 | `bootstrap/trust-local-ca.ps1` | Optional, run by hand: trusts the local CA for the current Windows user so browsers accept the certificates (`-Remove` undoes it). |
@@ -59,9 +59,9 @@ private, plan 08 fix wave ruling R2).
 Maintenance of the VM (procure-ai `docs/hosting.md` has the runbooks): `bootstrap/hosted/upgrade-k3s.ps1` (plans a k3s patch upgrade: the
 embedded containerd, runc and Traefik versions; `-Apply` upgrades, re-fetches the kubeconfig and reruns the baseline),
 `new-hosted-cluster.ps1 -KubeconfigOnly`, `new-hosted-cluster.ps1 -Import` (adopts the existing VM, firewall, key and DNS records into a
-lost Terraform state without a reinstall) and `bootstrap/hosted/backup-hosted.ps1` (a plain mirror, Dale's decision 2026-11-08, of the SSH key,
-the state, the deploy keys, the CAs, both user-secrets stores, the Contabo recovery codes and DEMO PASSWORDS.txt into
-`%USERPROFILE%\OneDrive\procure-ai secrets` and `%USERPROFILE%\Documents\procure-ai secrets`, SHA-256-checked; `-Check` only compares).
+lost Terraform state without a reinstall) and `bootstrap/hosted/backup-hosted.ps1` (an off-PC backup copy of the secrets exists; its location and
+contents are in the operator's private runbook, and the script reads them from a private file outside every repo; it mirrors and
+SHA-256-checks the copy, `-Check` only compares).
 
 **Before every push here that changes `envs/`, `apps/` or `argocd/`: `./tests/Test-RenderEnvs.ps1`.** This repo has no CI, so nothing
 else renders the values before Argo CD does on the cluster (for `envs/hosted`, the public demo). It renders the app of apps, procure-ai's
