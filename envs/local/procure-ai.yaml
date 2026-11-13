@@ -33,3 +33,6 @@ web:
       dashboardUrl: https://dashboard.procure.localtest.me
     devPanel:
       enabled: true
+    # The repos are public (plan 08c Task 2); merged into the chart's portfolio defaults (demos and links stay).
+    portfolio:
+      reposPublic: true

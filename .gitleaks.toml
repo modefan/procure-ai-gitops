@@ -1,0 +1,22 @@
+# gitleaks configuration: the default rules plus narrow allowlists for known false positives in this repo's history.
+# Each entry needs its rule, its path and its value shape or exact value, so a real secret in the same file still fails.
+# Scan: docker run --rm -v "<repo>:/repo:ro" zricethezav/gitleaks:v8.30.1 git /repo --redact --log-opts="--all"
+
+[extend]
+useDefault = true
+
+# envs/*/release.yaml pins platform images by tag: `keycloak: "<40 hex>"` is the git tree hash of infra/keycloak, not a key.
+[[allowlists]]
+description = "Platform image tags (git tree hashes) in release.yaml"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^envs/[a-z]+/release\.yaml$''']
+regexes = ['''^[0-9a-f]{40}$''']
+
+# Dashboard checks send the public sample Sec-WebSocket-Key from RFC 6455 section 1.3 ("the sample nonce").
+[[allowlists]]
+description = "RFC 6455 sample Sec-WebSocket-Key in dashboard checks"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^tests/Test-(Dashboard|OperatorTools)\.ps1$''']
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']

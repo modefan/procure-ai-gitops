@@ -53,3 +53,7 @@ web:
       dashboardUrl: https://dashboard.daleabels.com
     devPanel:
       enabled: true
+    # The repos are public (plan 08c Task 2): Welcome and How it is built link the source instead of "private for now".
+    # Helm merges this map into the chart's portfolio defaults, so the demos and links lists stay as they are.
+    portfolio:
+      reposPublic: true
