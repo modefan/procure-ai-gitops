@@ -1,8 +1,7 @@
 # Uptime check of the public live demo (plan 08 Task 13). The only workflow in this repo: the GitOps repo has no CI (Argo CD reads it).
 #
-# While the repos are private a scheduled run uses the account's free Actions minutes (2 000 a month, procure-ai's CI needs them), so
-# the schedule runs once a day (about 30 minutes a month; plan 08 fix wave ruling R2). Plan 08 Task 17 (go public) moves it to every
-# 30 minutes; public repos run Actions for free. `workflow_dispatch` stays, for a manual run (about one minute).
+# Every 30 minutes since the repos went public (plan 08c Task 2; public repos run Actions for free). While they were private it ran once a
+# day to save the account's free Actions minutes (plan 08 fix wave ruling R2). `workflow_dispatch` stays, for a manual run (about one minute).
 #
 # Besides the hosts answering, it checks the Let's Encrypt certificate of every public host: fewer than 21 days left fails the run.
 # cert-manager renews at 30 days, so a failure here means renewal has been failing for 9 days and there is still a week to fix it before
@@ -14,8 +13,8 @@ name: uptime
 
 on:
   schedule:
-    # Daily while private (ruling R2). Task 17 (go public): "7,37 * * * *", every 30 minutes, off the full hour (GitHub delays :00 most).
-    - cron: "17 5 * * *" # 07:17 in South Africa (UTC+2)
+    # Every 30 minutes, off the full hour (GitHub delays :00 most).
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions: {}
