@@ -3,6 +3,9 @@
 # -Environment hosted creates (procure-ai-provider holds the Azure Foundry key).
 global:
   imageRegistry: ghcr.io/modefan
+  # The GHCR packages are public since plan 08c Task 2 (2026-11-13): the VM pulls anonymously, no ghcr-pull Secret (the chart's default
+  # list names it for the local cluster).
+  imagePullSecrets: []
   # No deploymentStrategy: the chart's default rollout (a new pod next to the old one, then the switch). The 24 GB VM has room for it, so a
   # deploy does not take an API away for its restart as on the 10 GB local node. Postgres connections during a surge (Task 12 review I4):
   # 61 idle, 85 at the peak of a restart of all 13 app Deployments at once, of max_connections 200 (procure-ai docs/hosting.md). If a

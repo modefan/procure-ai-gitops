@@ -3,6 +3,9 @@
 # either: every Ingress gets Traefik's default certificate, the Let's Encrypt one of bootstrap/hosted/install-cert-manager.ps1.
 global:
   imageRegistry: ghcr.io/modefan
+  # The GHCR packages are public since plan 08c Task 2 (2026-11-13): the VM pulls anonymously, no ghcr-pull Secret (the chart's default
+  # list names it for the local cluster).
+  imagePullSecrets: []
 
 storageClassName: local-path
 ingressClassName: traefik

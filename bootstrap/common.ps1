@@ -73,12 +73,6 @@ $script:HostedDnsHosts = @('procure', 'auth', 'dashboard', 'pgadmin', 'mongo', '
 # redirect_hosts equal.
 $script:HostedRedirectHosts = @('@', 'www')
 $script:HostedCloudflareZoneId = '93c854c6f17e0cbb8f2b7e9395f7828c'
-# The hosted ghcr-pull Secret holds a classic read-only PAT (read:packages, user modefan; DEMO PASSWORDS.txt "GitHub Container Registry
-# (GHCR)", user env var GHCR_READ_TOKEN). It expires on this date: while the packages are private an expired token makes the next hosted
-# deploy fail with ImagePullBackOff (running pods keep their cached images). Test-HostBaseline.ps1 warns 21 days before and fails after.
-# Renew: a new token with the same scope (CLAUDE.md learning 2026-11-07), DEMO PASSWORDS.txt and the env var, new-secrets.ps1 -Environment
-# hosted, then this date. Not needed once the packages are public (plan 08 Task 17).
-$script:GhcrPullTokenExpires = [datetime] '2027-02-05'
 
 # kubectl and helm arguments that select the cluster; every kubectl/helm call of the bootstrap uses them (never the current context).
 $script:KubectlArgs = @('--context', $script:KubeContext)

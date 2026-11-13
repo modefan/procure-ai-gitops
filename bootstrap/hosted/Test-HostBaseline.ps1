@@ -22,7 +22,6 @@
       - Traefik (the public edge) has a memory limit (traefik-config.yaml);
       - the Let's Encrypt certificate ingress-tls/procure-public is Ready, from letsencrypt-production, with more than 21 days left
         (renewal is due at 30; fewer than 21 means renewal has been failing for 9 days);
-      - the GHCR pull token (bootstrap/common.ps1 GhcrPullTokenExpires): WARN within 21 days of its expiry, FAIL after it;
       - the PC's hosted kubeconfig: its admin client certificate has more than 30 days left.
     From the PC, against the public IPv4 (and IPv6 when the PC has a route); before host.json exists, the addresses come from the Contabo
     API, so the outside checks also run against a VM that is not set up yet:
@@ -281,15 +280,6 @@ Add-Check "the PC's hosted kubeconfig: admin client certificate valid for more t
     $left = [int] [math]::Floor(($cert.NotAfter.ToUniversalTime() - [datetime]::UtcNow).TotalDays)
     $cert.Dispose()
     if ($left -lt 30) { throw "$left days left: restart k3s at a quiet time (it renews), then new-hosted-cluster.ps1 -KubeconfigOnly" }
-    "$left days left"
-}
-
-Add-Check "GHCR pull token not expired (expires $($GhcrPullTokenExpires.ToString('yyyy-MM-dd')))" {
-    $left = [int] [math]::Floor(($GhcrPullTokenExpires - (Get-Date)).TotalDays)
-    if ($left -lt 0) { throw "expired $(-$left) days ago: hosted deploys fail with ImagePullBackOff while the packages are private (bootstrap/common.ps1 GhcrPullTokenExpires says how to renew)" }
-    if ($left -lt 21) {
-        $results.Add([pscustomobject]@{ Result = 'WARN'; Check = 'GHCR pull token expires soon'; Detail = "$left days left; renew it (bootstrap/common.ps1 GhcrPullTokenExpires)" })
-    }
     "$left days left"
 }
 
