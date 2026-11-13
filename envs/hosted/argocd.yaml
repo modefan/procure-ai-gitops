@@ -26,13 +26,24 @@ configs:
       - http://127.0.0.1:8080
     # Keycloak sign-in (see the header of argocd/values.yaml): realm ops (not the demo realm; ruling R6c) at auth.daleabels.com (Let's Encrypt certificate; the
     # server reaches it through the CoreDNS rewrite, bootstrap/hosted/coredns-custom.yaml). Public client with PKCE, no client secret.
+    # Dale 2026-11-13: Argo CD takes only Keycloak logins, and only for the two admin accounts of realm master (dale, operator).
+    # Client `argocd` in realm master (public, PKCE), made with the admin API on 2026-11-13.
     oidc.config: |
       name: Keycloak
-      issuer: https://auth.daleabels.com/realms/ops
+      issuer: https://auth.daleabels.com/realms/master
       clientID: argocd
       enablePKCEAuthentication: true
       requestedScopes: ["openid", "profile"]
       refreshTokenThreshold: 2m
+  # Only the users dale and operator (matched on preferred_username) and Claude's API token get rights; anyone else gets nothing.
+  rbac:
+    policy.default: ""
+    policy.csv: |
+      g, dale, role:admin
+      g, operator, role:admin
+      g, claude, role:admin
+    scopes: "[preferred_username]"
+    policy.matchMode: glob
 
 server:
   ingress:

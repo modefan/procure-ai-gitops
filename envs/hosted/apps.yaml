@@ -8,7 +8,7 @@ argocd:
   # NetworkPolicy rule for Traefik (envs/hosted/argocd.yaml). People sign in with Keycloak; the admin login stays on as break-glass for when
   # Keycloak is down (Dale 2026-11-08, Task 12c), and the public host refuses it (403): admin only through the tunnel
   # (bootstrap/hosted/open-argocd.ps1 -Tunnel). false: no public host, the tunnel only (as before plan 08c).
-  adminEnabled: true
+  adminEnabled: false  # Dale 2026-11-13: Keycloak logins only (dale, operator); Claude keeps its API token
   ingressEnabled: true
 platform:
   enabled: true
