@@ -20,7 +20,7 @@
     EUR 14.00 a month); it never orders or cancels one. Checked through the Contabo API before the plan: the instance exists, is product
     V155 in region EU and has no cancellation date. The plan may hold only the SSH key secret, the adopted instance (never a create without
     that existing_instance_id, never a delete), the firewall (one active rule: in tcp 22, 80, 443 from anywhere, on this instance) and
-    exactly the three DNS records (A for procure, auth, dashboard; not proxied; no AAAA, k3s is IPv4 only). Deleting one of our own DNS
+    exactly our DNS records (A for every name in $HostedDnsHosts and $HostedRedirectHosts; not proxied; no AAAA, k3s is IPv4 only). Deleting one of our own DNS
     records is allowed (e.g. the AAAA records of the first version). The check runs in every path that changes something: apply and
     -Destroy. Terraform in infra/hosted is run ONLY through this script (a raw apply skips the check).
     Adopting the instance REINSTALLS it (all data on it is lost), so a plan that adopts it is applied only with -Reinstall. The first run

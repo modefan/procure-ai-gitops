@@ -5,6 +5,8 @@
     public certificate (plan 08 Task 12).
 .DESCRIPTION
     Run after new-hosted-cluster.ps1 (through the SSH tunnel), before or after install-argocd.ps1 -Environment hosted. Safe to run again.
+    The bare domain and www share the one certificate with every other name: a DNS change on them must keep HTTP-01 renewal working (A record
+    to the VM, no AAAA, port 80 open), or the renewal of the whole certificate fails.
     1. Traefik (k3s's bundled chart): HelmChartConfig kube-system/traefik (traefik-config.yaml): http -> https redirect, HSTS, 80/443 as
        hostPorts with a ClusterIP Service (no ServiceLB, so the visitor's own address reaches X-Forwarded-For); waits for the rollout.
     2. CoreDNS: ConfigMap kube-system/coredns-custom (coredns-custom.yaml): auth.<domain> -> Traefik inside the cluster.
@@ -41,6 +43,14 @@ Select-ProcureCluster hosted
 Assert-ClusterReachable
 
 $namespace = 'ingress-tls'
+
+function Get-CertificateDnsNames([byte[]] $Der) {
+    # The DNS names in a certificate's subject alternative name extension, exactly as encoded (not the localized text of Format()).
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Der)
+    $ext = $cert.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509SubjectAlternativeNameExtension] } | Select-Object -First 1
+    if (-not $ext) { return @() }
+    @($ext.EnumerateDnsNames())
+}
 $hosts = @(@($HostedDnsHosts) + @($HostedRedirectHosts) | ForEach-Object { Get-HostedFqdn $_ })
 $Issuer = if ($Production) { 'production' } else { 'staging' }
 $issuerName = "letsencrypt-$Issuer"
@@ -153,9 +163,8 @@ while ($true) {
     $secretPem = & kubectl @KubectlArgs -n $namespace get secret procure-public-tls -o jsonpath='{.data.tls\.crt}' 2>$null
     $missingNames = @($hosts)
     if ($secretPem) {
-        $sans = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($secretPem)).Extensions |
-            Where-Object { $_.Oid.Value -eq '2.5.29.17' } | ForEach-Object { $_.Format($false) }
-        $missingNames = @($hosts | Where-Object { "$sans" -notmatch "DNS Name=$([regex]::Escape($_))(,|$)" })
+        $sans = Get-CertificateDnsNames ([Convert]::FromBase64String($secretPem))
+        $missingNames = @($hosts | Where-Object { $_ -notin $sans })
     }
     if ($ready -and $ready.status -eq 'True' -and $secretIssuer -eq $issuerName -and $missingNames.Count -eq 0) { break }
     if ((Get-Date) -gt $deadline) {

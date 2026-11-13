@@ -6,8 +6,9 @@
 #  - http:// is not routed here: Traefik's web entry point already redirects every http:// request to https:// (traefik-config.yaml), so
 #    http://<domain>/p reaches this route in two permanent hops (http -> https on the same host, then this one).
 #  - TLS: the procure-public Secret (the certificate lists both names; install-cert-manager.ps1 builds dnsNames from common.ps1).
-#  - priority 1: cert-manager's HTTP-01 solver Ingress (Host && PathPrefix /.well-known/acme-challenge/) must win over this catch-all for
-#    the same host, or a renewal of the certificate for these two names would be redirected instead of answered.
+#  - priority 1, for the certificate's renewal: an HTTP-01 challenge for these names first meets the web entry point's http -> https
+#    redirect and is then requested on websecure, where this catch-all and cert-manager's solver Ingress (Host && PathPrefix
+#    /.well-known/acme-challenge/) both match; the solver's longer rule outranks priority 1, so the challenge is answered, not redirected.
 #  - Current Traefik CRD group traefik.io/v1alpha1 (the containo.us group is gone).
 apiVersion: traefik.io/v1alpha1
 kind: Middleware

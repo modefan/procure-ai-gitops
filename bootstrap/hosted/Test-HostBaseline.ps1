@@ -351,7 +351,7 @@ Add-Check 'Contabo API: the bought instance (V155, EU, not cancelled), one activ
     "instance $HostedInstanceId $($instance.productId) $($instance.region) $($instance.status); firewall $($fw.name): $($rules -join '; ')"
 }
 
-Add-Check 'Cloudflare API: one A record each for procure, auth, dashboard to the server, not proxied; no AAAA' {
+Add-Check 'Cloudflare API: one A record each for every hosted name (the hosts, the bare domain, www) to the server, not proxied; no AAAA' {
     if (-not $hostInfo) { throw 'no VM (host.json missing)' }
     $records = Get-HostedDnsRecords
     $problems = @()

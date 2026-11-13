@@ -251,7 +251,7 @@ try {
     if ($r.Status -eq 200) { Pass "https://$AppHost/ answers 200" } else { Fail "https://$AppHost/ answered $($r.Status)" }
 
     Write-Step 'HSTS and Server headers'
-    foreach ($url in "https://$AppHost/", "https://$KeycloakHost/realms/procure/.well-known/openid-configuration", "https://$DashboardHost/") {
+    foreach ($url in @("https://$AppHost/", "https://$KeycloakHost/realms/procure/.well-known/openid-configuration", "https://$DashboardHost/") + @($RedirectHosts | ForEach-Object { "https://$_/" })) {
         $r = Invoke-Http $url
         $sts = @($r.Headers | Where-Object { $_ -match '^strict-transport-security:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() })
         $maxAge = if ("$($sts | Select-Object -First 1)" -match 'max-age=(\d+)') { [long] $Matches[1] } else { 0 }
