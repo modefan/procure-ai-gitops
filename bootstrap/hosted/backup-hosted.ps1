@@ -18,6 +18,7 @@
       user-secrets\procure-ai-hosted\     <- %APPDATA%\Microsoft\UserSecrets\procure-ai-hosted
       user-secrets\procure-ai-apphost\    <- %APPDATA%\Microsoft\UserSecrets\procure-ai-apphost
       contabo-recovery-codes.txt          <- %USERPROFILE%\Downloads\contabo-recovery-codes.txt
+      github-recovery-codes.txt           <- %USERPROFILE%\Downloads\github-recovery-codes.txt
       README.txt                          what each item is and where its original lives (written by this script)
     A mirror: a file in a copied folder that the original no longer has is deleted from the copy (named in the output). Nothing outside
     these items is touched. Then every original file is compared with each copy by SHA-256: OK, MISMATCH, MISSING, or EXTRA (in a copied
@@ -27,7 +28,7 @@
     account of the PC can read the copies; both modes then check every item under each destination and report any other identity as a
     problem. OneDrive syncs as the current user, so syncing still works. A destination inside a git repository is refused.
     The copies are plain files on purpose (Dale's decision 2026-11-08, with the risk explained: OneDrive holds them unencrypted; the
-    Contabo recovery codes sit in the same folder, as Dale asked).
+    Contabo and GitHub recovery codes sit in the same folder, as Dale asked).
     Run it after any secret, key, state or DEMO PASSWORDS.txt change (procure-ai docs/hosting.md, "Backup copies and recovery").
 #>
 [CmdletBinding()]
@@ -50,6 +51,7 @@ $items = @(
     [pscustomobject]@{ Name = 'user-secrets\procure-ai-hosted'; Source = (Join-Path $env:APPDATA "Microsoft\UserSecrets\$HostedUserSecretsId"); What = 'hosted app secrets (secrets.json)' }
     [pscustomobject]@{ Name = 'user-secrets\procure-ai-apphost'; Source = (Join-Path $env:APPDATA "Microsoft\UserSecrets\$AppHostUserSecretsId"); What = 'local AppHost secrets (secrets.json)' }
     [pscustomobject]@{ Name = 'contabo-recovery-codes.txt'; Source = (Join-Path $env:USERPROFILE 'Downloads\contabo-recovery-codes.txt'); What = 'Contabo account MFA recovery codes' }
+    [pscustomobject]@{ Name = 'github-recovery-codes.txt'; Source = (Join-Path $env:USERPROFILE 'Downloads\github-recovery-codes.txt'); What = 'GitHub account (modefan) 2FA recovery codes' }
 )
 # Run-time files of the hosted folder: no secret, and they change while scripts run (a tunnel's PID, logs, the WAL test's working files).
 function Test-Skipped([string] $relative) {
