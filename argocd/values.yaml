@@ -41,8 +41,8 @@ configs:
   cm:
     # Claude's account (see the header): API keys only, no password login.
     accounts.claude: apiKey
-    # How often Argo CD looks for new commits (the publish workflow's revision bump): every 2 minutes, plus up to 1 minute jitter.
-    timeout.reconciliation: 120s
+    # How often Argo CD looks for new commits (the publish workflow's revision bump): every minute, plus jitter (Dale 2026-11-13: deploy in under 10 min).
+    timeout.reconciliation: 60s
     # Health of an Application as a resource of the root Application (app of apps). Argo CD has no built-in check for it, so without
     # this the root would not wait for one wave of Applications before the next. An Application counts as Progressing until its sync
     # at the revisions its spec asks for has finished: Argo CD may call a just-created Application Healthy before its first sync, and
