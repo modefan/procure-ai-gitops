@@ -240,7 +240,8 @@ try {
     Write-Step "Argo CD behind its Keycloak gate (https://$ArgocdHost)"
     $opsAuth = "https://$KeycloakHost/realms/ops/protocol/openid-connect/auth?"
     # Argo CD content: its UI's title, or JSON fields of its API (lists, version, settings, user info), or its API docs.
-    $argoContent = '<title>Argo CD</title>|"Version"\s*:|"items"\s*:|"metadata"\s*:|"loggedIn"\s*:|"oidcConfig"\s*:|swagger'
+    # "swagger" not after %2F: the gate's own 302 body echoes the URL-encoded return path (state=...%2Fswagger-ui), which is no Argo CD content.
+    $argoContent = '<title>Argo CD</title>|"Version"\s*:|"items"\s*:|"metadata"\s*:|"loggedIn"\s*:|"oidcConfig"\s*:|(?<!%2F)swagger'
     $versioned = 'v\d+\.\d+\.\d+|oauth2.proxy'
     foreach ($path in '/', '/applications', '/applications/argocd/root', '/settings', '/api/v1/applications', '/api/v1/settings', '/api/version',
         '/api/v1/session/userinfo', '/auth/login', '/auth/callback?code=x&state=y', '/swagger-ui', '/swagger.json', '/healthz',
@@ -272,6 +273,14 @@ try {
         $r = Invoke-Http "https://$ArgocdHost$($case.Path)" -Method POST -Extra (@('--path-as-is') + $case.Extra)
         if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent -and $r.Body -notmatch 'token') { Pass "$($case.Name) -> 403 (the admin login is tunnel-only)" }
         else { Fail "$($case.Name) on https://$ArgocdHost answered $($r.Status): $($r.Body.Substring(0, [Math]::Min(160, $r.Body.Length)))" }
+    }
+    # Encoded and odd spellings (review minor 5): Traefik matches the decoded path, so %69/%73 hit the deny route (403); an encoded slash or
+    # another case is not the session path for the deny route and lands on the gate (302 to realm ops or 401). Never a session.
+    foreach ($path in '/api/v1/sess%69on', '/api/v1/%73ession', '/api/v1/session%2F', '/api/v1/Session') {
+        $r = Invoke-Http "https://$ArgocdHost$path" -Method POST -Extra (@('--path-as-is') + $json)
+        $toOps = $r.Status -eq 302 -and "$($r.Location)".StartsWith($opsAuth)
+        if (($r.Status -in 401, 403 -or $toOps) -and $r.Body -notmatch $argoContent -and $r.Body -notmatch 'token') { Pass "POST $path -> $($r.Status)$(if ($toOps) { " to realm ops' sign-in" }), no session" }
+        else { Fail "POST $path on https://$ArgocdHost answered $($r.Status): $($r.Body.Substring(0, [Math]::Min(160, $r.Body.Length)))" }
     }
     $r = Invoke-Http "https://$ArgocdHost/api/v1/applications" -Method POST -Extra @('-H', 'Origin: https://evil.example', '-H', 'Content-Type: text/plain', '--data-binary', 'x')
     if ($r.Status -eq 403 -and $r.Body -notmatch $argoContent) { Pass 'a cross-site POST (foreign Origin) -> 403' } else { Fail "a cross-site POST to https://$ArgocdHost answered $($r.Status), expected 403" }
